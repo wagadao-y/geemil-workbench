@@ -1,0 +1,59 @@
+use anyhow::{Result, bail};
+use geemil_core::{ImportOptions, JobControl, Project, interchange};
+use std::path::Path;
+fn main() -> Result<()> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    let job = JobControl {
+        progress: std::sync::Arc::new(|stage, done, total| eprintln!("{stage}: {done}/{total}")),
+        ..Default::default()
+    };
+    match args.first().map(String::as_str) {
+        Some("demo") if args.len() == 2 => interchange::create_demo(Path::new(&args[1]))?,
+        Some("import") if args.len() >= 3 => {
+            let root = Path::new(&args[1]);
+            let mut project = if root.exists() {
+                Project::load(root)?
+            } else {
+                Project::create(
+                    root,
+                    root.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .as_ref(),
+                )?
+            };
+            for file in &args[2..] {
+                project.import_file(Path::new(file), ImportOptions::default(), &job)?;
+            }
+            println!(
+                "{} scans, {} images",
+                project.scans().count(),
+                project.manifest.images.len()
+            );
+        }
+        Some("inspect") if args.len() == 2 => {
+            let p = Project::load(Path::new(&args[1]))?;
+            println!("{} — revision {}", p.manifest.name, p.manifest.current);
+            for s in p.scans() {
+                println!(
+                    "{}: {} records, {} valid, {} chunks",
+                    s.name,
+                    s.records,
+                    s.valid_points,
+                    s.chunks.len()
+                );
+            }
+            println!("{} images", p.manifest.images.len());
+        }
+        Some("export") if args.len() == 3 => {
+            Project::load(Path::new(&args[1]))?.export_e57(Path::new(&args[2]), &job)?
+        }
+        Some("compress") if args.len() == 2 => {
+            Project::load(Path::new(&args[1]))?.compress_storage(&job)?;
+        }
+        _ => bail!(
+            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | compress PROJECT"
+        ),
+    }
+    Ok(())
+}

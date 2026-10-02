@@ -1,0 +1,18 @@
+[package]
+name = "geemil-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+glam.workspace = true
+e57.workspace = true
+las.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
