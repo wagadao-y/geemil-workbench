@@ -62,8 +62,11 @@ fn las_and_laz_keep_attributes_transforms_exclusions_and_crs() {
     };
     p.set_transform(id, pose).unwrap();
     // 10 cm grid, 20 cm voxels: one point of four survives.
-    let excluded = p.subsample(0.2, &[id], &JobControl::default()).unwrap();
-    assert_eq!(excluded, 300);
+    let target = p.layer_named("Subsampled");
+    let moved = p
+        .subsample(0.2, &[id], &target, &JobControl::default())
+        .unwrap();
+    assert_eq!(moved, 300);
     for ext in ["las", "laz"] {
         let out = dir.path().join(format!("out.{ext}"));
         let written = p.export_las(&out, &JobControl::default()).unwrap();

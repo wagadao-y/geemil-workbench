@@ -1,15 +1,10 @@
+use crate::layers::{LabelWriter, is_set};
 use crate::storage::{position, valid};
-use crate::{
-    Bounds, ChunkMask, JobControl, Layer, LayerKind, Pose, Project, Sample, Scan, Stage, ViewCache,
-};
+use crate::{Bounds, JobControl, LayerTarget, Pose, Project, Sample, Scan, Stage, ViewCache};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3, DVec4};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeSet, BinaryHeap},
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
-};
+use std::collections::{BTreeSet, BinaryHeap};
 use uuid::Uuid;
 
 /// Samples of a view in the common project frame, with the transforms they
@@ -175,7 +170,7 @@ impl Projector {
         ))
     }
 }
-/// Which side of the selection a manual exclusion removes.
+/// Which side of the selection a range move takes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionMode {
@@ -254,11 +249,11 @@ impl PreparedSelection<'_> {
         let ndc = clip.truncate() / clip.w;
         self.inside_polygon([(ndc.x + 1.) * 0.5, (1. - ndc.y) * 0.5])
     }
-    /// Whether this exclusion needs the nearest selected depth as its base.
+    /// Whether this selection needs the nearest selected depth as its base.
     pub fn depth_limited(&self) -> bool {
         self.mode == SelectionMode::ExcludeInside && self.depth.is_some()
     }
-    /// Whether an exclusion removes `p`. When `depth_limited`, `limit` is the
+    /// Whether the selection takes `p`. When `depth_limited`, `limit` is the
     /// nearest selected depth plus `depth_meters` (see `Project::selection_nearest`);
     /// otherwise it is ignored.
     pub fn excludes(&self, p: DVec3, limit: f64) -> bool {
@@ -339,156 +334,15 @@ fn validate(selection: &Selection) -> Result<()> {
     );
     Ok(())
 }
-pub(crate) fn is_excluded(mask: &[u8], i: usize) -> bool {
-    mask[i / 8] & (1 << (i % 8)) != 0
-}
-
-/// Writes the chunk masks of a new exclusion layer to staging, then adds the
-/// layer and turns it on in the working state.
-pub(crate) struct LayerWriter {
-    id: Uuid,
-    tmp: std::path::PathBuf,
-    file: File,
-    masks: Vec<ChunkMask>,
-    offset: u64,
-    total: u64,
-}
-impl LayerWriter {
-    pub(crate) fn new(project: &Project) -> Result<Self> {
-        let id = Uuid::new_v4();
-        let tmp = project.root.join("staging").join(format!("{id}.mask"));
-        Ok(Self {
-            id,
-            file: File::create(&tmp)?,
-            tmp,
-            masks: vec![],
-            offset: 0,
-            total: 0,
-        })
-    }
-    /// Adds the newly excluded points of one chunk; `count` set bits in `mask`.
-    pub(crate) fn push(&mut self, scan: Uuid, chunk: u32, mask: &[u8], count: u64) -> Result<()> {
-        if count == 0 {
-            return Ok(());
-        }
-        self.file.write_all(mask)?;
-        self.masks.push(ChunkMask {
-            scan,
-            chunk,
-            offset: self.offset,
-            bytes: mask.len() as u32,
-            excluded: count,
-        });
-        self.offset += mask.len() as u64;
-        self.total += count;
-        Ok(())
-    }
-    /// Commits the layer as one edit described by `operation`, to which the
-    /// layer id and point count are added. Excluding nothing changes nothing.
-    pub(crate) fn finish(
-        self,
-        project: &mut Project,
-        kind: LayerKind,
-        mut operation: serde_json::Value,
-    ) -> Result<u64> {
-        let Self {
-            id,
-            tmp,
-            file,
-            masks,
-            total,
-            ..
-        } = self;
-        file.sync_all()?;
-        drop(file);
-        if total == 0 {
-            fs::remove_file(tmp)?;
-            return Ok(0);
-        }
-        let relative = format!("layers/{id}.mask");
-        fs::rename(tmp, project.path(&relative)?)?;
-        let mut next = project.clone();
-        next.manifest.layers.push(Layer {
-            id,
-            name: match kind {
-                LayerKind::Manual => format!("Manual exclusion ({total} points)"),
-                LayerKind::Subsample {
-                    size,
-                    merged: false,
-                } => format!("Voxel subsampling {size} m"),
-                LayerKind::Subsample { size, merged: true } => {
-                    format!("Merged voxel subsampling {size} m")
-                }
-                LayerKind::Noise {
-                    radius,
-                    min_neighbours,
-                } => format!("Noise filter {radius} m, {min_neighbours} neighbours"),
-                LayerKind::Box { inside: true } => format!("Box: inside ({total} points)"),
-                LayerKind::Box { inside: false } => format!("Box: outside ({total} points)"),
-                LayerKind::Statistical {
-                    neighbours,
-                    deviations,
-                } => format!("Statistical outliers {neighbours} neighbours, {deviations} sigma"),
-            },
-            mask_file: relative,
-            masks,
-            excluded: total,
-            kind,
-        });
-        operation["layer"] = serde_json::json!(id);
-        operation["excluded"] = serde_json::json!(total);
-        next.edit(operation, |s| {
-            s.layers.push(id);
-            Ok(())
-        })?;
-        *project = next;
-        Ok(total)
-    }
-}
-
 impl Project {
-    pub fn exclusion_mask(&self, scan: &Scan, chunk: u32) -> Result<Vec<u8>> {
-        let count = scan
-            .chunks
-            .get(chunk as usize)
-            .ok_or_else(|| anyhow::anyhow!("Invalid chunk"))?
-            .count as usize;
-        let mut mask = vec![0; count.div_ceil(8)];
-        for layer in self
-            .manifest
-            .layers
-            .iter()
-            .filter(|l| self.current().layers.contains(&l.id))
-        {
-            for entry in layer
-                .masks
-                .iter()
-                .filter(|m| m.scan == scan.id && m.chunk == chunk)
-            {
-                ensure!(entry.bytes as usize == mask.len(), "Invalid mask length");
-                let mut f = File::open(self.path(&layer.mask_file)?)?;
-                ensure!(
-                    entry.offset + entry.bytes as u64 <= f.metadata()?.len(),
-                    "Truncated mask"
-                );
-                f.seek(SeekFrom::Start(entry.offset))?;
-                let mut bytes = vec![0; mask.len()];
-                f.read_exact(&mut bytes)?;
-                for (a, b) in mask.iter_mut().zip(bytes) {
-                    *a |= b;
-                }
-            }
-        }
-        Ok(mask)
-    }
-    /// The valid, not excluded original points of a chunk in scan coordinates.
+    /// The valid original points of a chunk in visible layers, in scan coordinates.
     pub fn points(&self, scan: &Scan, chunk: u32) -> Result<Vec<Sample>> {
         let data = self.read_chunk(scan, chunk)?;
-        let mask = self.exclusion_mask(scan, chunk)?;
+        let hidden = self.hidden_mask(scan, chunk)?;
         Ok(data
             .chunks_exact(scan.stride)
             .enumerate()
-            .filter(|(i, p)| valid(p) && !is_excluded(&mask, *i))
+            .filter(|(i, p)| valid(p) && !is_set(&hidden, *i))
             .map(|(i, p)| Sample {
                 chunk,
                 index: i as u32,
@@ -497,7 +351,7 @@ impl Project {
             })
             .collect())
     }
-    /// Depth of the nearest surviving original point inside the polygon among
+    /// Depth of the nearest visible original point inside the polygon among
     /// `scan_ids`, which `ExcludeInside` measures `depth_meters` from.
     pub fn selection_nearest(
         &self,
@@ -536,13 +390,13 @@ impl Project {
                     continue;
                 }
                 let data = self.read_chunk(scan, id as u32)?;
-                let mask = self.exclusion_mask(scan, id as u32)?;
+                let hidden = self.hidden_mask(scan, id as u32)?;
                 for (i, p) in data.chunks_exact(scan.stride).enumerate() {
                     if i % 8192 == 0 {
                         job.check()?;
                     }
                     if valid(p)
-                        && !is_excluded(&mask, i)
+                        && !is_set(&hidden, i)
                         && let Some(depth) =
                             test.contains(world.transform_point3(DVec3::from(position(p))))
                     {
@@ -554,16 +408,19 @@ impl Project {
         }
         Ok(result)
     }
-    pub fn delete_selection(
+    /// Moves the visible original points of `scan_ids` the selection takes to
+    /// `target`. Returns the number of moved points.
+    pub fn move_selection(
         &mut self,
         selection: &Selection,
         scan_ids: &[Uuid],
+        target: &LayerTarget,
         job: &JobControl,
     ) -> Result<u64> {
         validate(selection)?;
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let test = selection.prepare();
-        // A depth-limited exclusion first finds the nearest surviving ORIGINAL
+        // A depth-limited selection first finds the nearest visible ORIGINAL
         // point, independent of LOD. Chunks keep their own nearest depth so the
         // second pass can skip them. Without a depth there is no first pass.
         let (nearest, limit, chunk_nearest) = match (selection.mode, selection.depth_meters) {
@@ -581,16 +438,12 @@ impl Project {
             }
             _ => (None, f64::INFINITY, None),
         };
-        let mut layer = LayerWriter::new(self)?;
+        let mut labels = LabelWriter::new(self, target)?;
         for (index, scan) in scans.iter().enumerate() {
             let world = self.world_matrix(scan);
             for (chunk, c) in scan.chunks.iter().enumerate() {
                 job.check()?;
-                job.report(
-                    Stage::SelectionExclusionMask,
-                    chunk as u64,
-                    scan.chunks.len() as u64,
-                );
+                job.report(Stage::SelectionMove, chunk as u64, scan.chunks.len() as u64);
                 let skip = match (&chunk_nearest, selection.mode) {
                     (Some(depths), _) => depths[index][chunk] > limit,
                     (None, SelectionMode::ExcludeInside) => !test.may_cover(&c.bounds, world),
@@ -601,7 +454,7 @@ impl Project {
                     continue;
                 }
                 let data = self.read_chunk(scan, chunk as u32)?;
-                let old = self.exclusion_mask(scan, chunk as u32)?;
+                let hidden = self.hidden_mask(scan, chunk as u32)?;
                 let mut mask = vec![0; (c.count as usize).div_ceil(8)];
                 let mut count = 0;
                 for (i, p) in data.chunks_exact(scan.stride).enumerate() {
@@ -609,39 +462,23 @@ impl Project {
                         job.check()?;
                     }
                     if valid(p)
-                        && !is_excluded(&old, i)
+                        && !is_set(&hidden, i)
                         && test.excludes(world.transform_point3(DVec3::from(position(p))), limit)
                     {
                         mask[i / 8] |= 1 << (i % 8);
                         count += 1;
                     }
                 }
-                layer.push(scan.id, chunk as u32, &mask, count)?;
+                labels.push(self, scan, chunk as u32, &mask, count)?;
             }
         }
         job.check()?;
-        layer.finish(
+        labels.commit(
             self,
-            LayerKind::Manual,
             serde_json::json!({"kind": "selection", "selection": selection, "scans": scan_ids,
                 "nearest": nearest}),
-        )
-    }
-    /// Turns an exclusion layer on or off in the working state.
-    pub fn set_layer_enabled(&mut self, id: Uuid, enabled: bool) -> Result<()> {
-        ensure!(
-            self.manifest.layers.iter().any(|l| l.id == id),
-            "Missing layer"
-        );
-        self.edit(
-            serde_json::json!({"kind": "layer", "id": id, "enabled": enabled}),
-            |s| {
-                s.layers.retain(|v| *v != id);
-                if enabled {
-                    s.layers.push(id);
-                }
-                Ok(())
-            },
+            |_| Ok(()),
+            false,
         )
     }
     /// Sets the additional transform of a scan or folder, relative to its folder.
@@ -663,22 +500,12 @@ impl Project {
         )
     }
 
-    /// The fraction of each node's points (by index) that no active exclusion
-    /// layer removes, from the layers' per-chunk counts.
+    /// The fraction of each node's points (by index) in visible layers, from
+    /// the per-chunk layer counts.
     fn surviving_fractions(&self, scan: &Scan) -> Vec<f64> {
-        let mut excluded = vec![0u64; scan.chunks.len()];
-        for layer in self
-            .manifest
-            .layers
-            .iter()
-            .filter(|l| self.current().layers.contains(&l.id))
-        {
-            for m in layer.masks.iter().filter(|m| m.scan == scan.id) {
-                if let Some(e) = excluded.get_mut(m.chunk as usize) {
-                    *e += m.excluded;
-                }
-            }
-        }
+        let excluded: Vec<_> = (0..scan.chunks.len() as u32)
+            .map(|chunk| self.hidden_count(scan, chunk))
+            .collect();
         // (surviving, total) points below each node.
         fn count(scan: &Scan, excluded: &[u64], node: usize, out: &mut [(f64, f64)]) -> (f64, f64) {
             let n = &scan.nodes[node];
@@ -725,8 +552,8 @@ impl Project {
         cache.prepare(self);
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
-        // Budget only the samples that survive the active exclusions, so a
-        // heavily cropped or thinned scan is shown from deeper, denser levels.
+        // Budget only the samples in visible layers, so a heavily cropped or
+        // thinned scan is shown from deeper, denser levels.
         let surviving: Vec<_> = scans.iter().map(|s| self.surviving_fractions(s)).collect();
         let lod = |si: usize, ni: u32| {
             let node = &scans[si].nodes[ni as usize];

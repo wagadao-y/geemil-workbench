@@ -1,4 +1,4 @@
-use geemil_core::{ImportOptions, JobControl, LayerKind, Project};
+use geemil_core::{ImportOptions, JobControl, Project};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -66,7 +66,7 @@ fn project(dir: &Path, name: &str, chunk_points: u32) -> Project {
     p
 }
 
-/// Surviving points of every scan in scan coordinates.
+/// Points of every scan in visible layers, in scan coordinates.
 fn surviving(p: &Project) -> Vec<[f64; 3]> {
     let mut result = vec![];
     for scan in p.scans() {
@@ -108,7 +108,13 @@ fn noise_filter_matches_brute_force_regardless_of_chunking() {
         }
         let before = surviving(&p);
         let removed = p
-            .remove_noise(radius, min_neighbours, &ids(&p), &JobControl::default())
+            .remove_noise(
+                radius,
+                min_neighbours,
+                &ids(&p),
+                &p.layer_named("Noise"),
+                &JobControl::default(),
+            )
             .unwrap();
         let after = surviving(&p);
         let expected: Vec<_> = before
@@ -130,16 +136,11 @@ fn noise_filter_matches_brute_force_regardless_of_chunking() {
         assert_eq!(sorted_bits(&after), sorted_bits(&expected));
         assert_eq!(removed as usize, before.len() - after.len());
         assert!(removed > 30, "only {removed} isolated points removed");
-        let layer = p.manifest.layers.last().unwrap();
-        assert_eq!(
-            layer.kind,
-            LayerKind::Noise {
-                radius,
-                min_neighbours
-            }
-        );
-        // The layer is an ordinary exclusion: turning it off restores everything.
-        p.set_layer_enabled(layer.id, false).unwrap();
+        // The points went to a new, hidden layer; showing it brings them back.
+        let layer = p.current().layers.last().unwrap().clone();
+        assert_eq!((layer.name.as_str(), layer.visible), ("Noise", false));
+        assert_eq!(p.layer_counts()[&layer.code], removed);
+        p.set_layer_visible(layer.code, true).unwrap();
         assert_eq!(surviving(&p).len(), before.len());
         results.push(sorted_bits(&after));
     }
@@ -154,7 +155,13 @@ fn subsampling_keeps_the_point_nearest_each_voxel_centre_regardless_of_chunking(
     for (name, chunk_points) in [("small", 64), ("large", 65_536)] {
         let mut p = project(dir.path(), name, chunk_points);
         let before = surviving(&p);
-        p.subsample(size, &ids(&p), &JobControl::default()).unwrap();
+        p.subsample(
+            size,
+            &ids(&p),
+            &p.layer_named("Subsampled"),
+            &JobControl::default(),
+        )
+        .unwrap();
         let after = surviving(&p);
         let centre_distance = |q: [f64; 3]| {
             let v = voxel(q, size);
@@ -176,16 +183,16 @@ fn subsampling_keeps_the_point_nearest_each_voxel_centre_regardless_of_chunking(
         for q in &after {
             assert_eq!(centre_distance(*q), nearest[&voxel(*q, size)]);
         }
-        assert_eq!(
-            p.manifest.layers.last().unwrap().kind,
-            LayerKind::Subsample {
-                size,
-                merged: false
-            }
-        );
-        // Filtering what is left only considers surviving points.
+        assert_eq!(p.current().layers.last().unwrap().name, "Subsampled");
+        // Filtering what is left only considers points in visible layers.
         let removed = p
-            .remove_noise(size * 0.1, 1, &ids(&p), &JobControl::default())
+            .remove_noise(
+                size * 0.1,
+                1,
+                &ids(&p),
+                &p.layer_named("Noise"),
+                &JobControl::default(),
+            )
             .unwrap();
         assert_eq!(removed as usize, after.len() - surviving(&p).len());
         results.push(sorted_bits(&after));
@@ -199,19 +206,17 @@ fn filters_reject_invalid_parameters_and_cancel_without_a_layer() {
     let mut p = project(dir.path(), "p", 64);
     let scans = ids(&p);
     let state = p.current().id;
-    assert!(p.subsample(0., &scans, &JobControl::default()).is_err());
-    assert!(
-        p.subsample(f64::NAN, &scans, &JobControl::default())
-            .is_err()
-    );
-    assert!(
-        p.remove_noise(0.1, 0, &scans, &JobControl::default())
-            .is_err()
-    );
+    let target = p.layer_named("Noise");
     let job = JobControl::default();
+    assert!(p.subsample(0., &scans, &target, &job).is_err());
+    assert!(p.subsample(f64::NAN, &scans, &target, &job).is_err());
+    assert!(p.remove_noise(0.1, 0, &scans, &target, &job).is_err());
+    let missing = geemil_core::LayerTarget::Existing(7);
+    assert!(p.remove_noise(0.1, 2, &scans, &missing, &job).is_err());
     job.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    assert!(p.remove_noise(0.1, 2, &scans, &job).is_err());
-    assert!(p.manifest.layers.is_empty());
+    assert!(p.remove_noise(0.1, 2, &scans, &target, &job).is_err());
+    assert!(p.manifest.patches.is_empty());
+    assert_eq!(p.current().layers.len(), 1);
     assert_eq!(p.current().id, state);
 }
 
@@ -245,7 +250,13 @@ fn box_crop_matches_brute_force_and_inside_complements_outside() {
         assert!(expected_inside > 100 && expected_inside < all.len() as u64 / 2);
         let state = p.manifest.draft.clone();
         let removed = p
-            .exclude_box(&crop, true, &[scan.id], &JobControl::default())
+            .move_box(
+                &crop,
+                true,
+                &[scan.id],
+                &p.layer_named("Deleted"),
+                &JobControl::default(),
+            )
             .unwrap();
         assert_eq!(removed, expected_inside);
         assert!(
@@ -255,13 +266,16 @@ fn box_crop_matches_brute_force_and_inside_complements_outside() {
         );
         p.restore_working_state(state).unwrap();
         let removed = p
-            .exclude_box(&crop, false, &[scan.id], &JobControl::default())
+            .move_box(
+                &crop,
+                false,
+                &[scan.id],
+                &p.layer_named("Deleted"),
+                &JobControl::default(),
+            )
             .unwrap();
         assert_eq!(removed, all.len() as u64 - expected_inside);
-        assert_eq!(
-            p.manifest.layers.last().unwrap().kind,
-            LayerKind::Box { inside: false }
-        );
+        assert_eq!(p.current().layers.last().unwrap().name, "Deleted");
     }
 }
 
@@ -306,6 +320,7 @@ fn statistical_outliers_match_brute_force_regardless_of_chunking() {
                 deviations,
                 reach,
                 &ids(&p),
+                &p.layer_named("Noise"),
                 &JobControl::default(),
             )
             .unwrap();
@@ -313,20 +328,14 @@ fn statistical_outliers_match_brute_force_regardless_of_chunking() {
         assert_eq!(removed as usize, before.len() - after.len());
         assert_eq!(sorted_bits(&after), sorted_bits(&expected));
         assert!(removed > 30, "only {removed} removed");
-        assert_eq!(
-            p.manifest.layers.last().unwrap().kind,
-            LayerKind::Statistical {
-                neighbours: k as u32,
-                deviations
-            }
-        );
+        assert_eq!(p.current().layers.last().unwrap().name, "Noise");
         results.push(sorted_bits(&after));
     }
     assert_eq!(results[0], results[1]);
 }
 
 #[test]
-fn heavy_exclusions_still_fill_the_view_budget() {
+fn heavily_thinned_scans_still_fill_the_view_budget() {
     let dir = tempfile::tempdir().unwrap();
     let mut p = project(dir.path(), "p", 64);
     let scans = ids(&p);
@@ -342,14 +351,20 @@ fn heavy_exclusions_still_fill_the_view_budget() {
         .len();
     assert!(before > budget * 3 / 4, "{before} of {budget}");
     // Keep about a tenth of the points.
-    p.subsample(0.12, &scans, &JobControl::default()).unwrap();
+    p.subsample(
+        0.12,
+        &scans,
+        &p.layer_named("Subsampled"),
+        &JobControl::default(),
+    )
+    .unwrap();
     let survivors = surviving(&p).len();
     assert!(survivors > budget && survivors < 2000, "{survivors}");
     let after = p
         .load_view(&camera, budget, &scans, &JobControl::default())
         .unwrap()
         .len();
-    // Excluded samples no longer use up the budget (before: about a quarter).
+    // Hidden samples no longer use up the budget (before: about a quarter).
     assert!(after > budget * 9 / 10, "{after} of {budget}");
 }
 
@@ -396,8 +411,13 @@ fn merged_subsampling_keeps_one_point_per_voxel_over_overlapping_scans() {
             out
         };
         let before = world_points(&p);
-        p.subsample_merged(size, &scans, &JobControl::default())
-            .unwrap();
+        p.subsample_merged(
+            size,
+            &scans,
+            &p.layer_named("Subsampled"),
+            &JobControl::default(),
+        )
+        .unwrap();
         let after = world_points(&p);
         let centre_distance = |q: [f64; 3]| {
             let v = voxel(q, size);
@@ -421,10 +441,7 @@ fn merged_subsampling_keeps_one_point_per_voxel_over_overlapping_scans() {
         }
         // Fewer than per-scan subsampling would keep: the overlap counts once.
         assert!(after.len() < before.len() / 2);
-        assert_eq!(
-            p.manifest.layers.last().unwrap().kind,
-            LayerKind::Subsample { size, merged: true }
-        );
+        assert_eq!(p.current().layers.last().unwrap().name, "Subsampled");
         results.push(sorted_bits(&after));
     }
     assert_eq!(results[0], results[1]);

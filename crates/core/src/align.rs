@@ -4,7 +4,7 @@
 //!
 //! Both produce a motion in the common project frame. [`Project::moved_pose`]
 //! turns it into the own transform of the moved scan or folder.
-use crate::edit::is_excluded;
+use crate::layers::is_set;
 use crate::{Bounds, JobControl, Pose, Project, Scan, Stage};
 use anyhow::{Result, bail, ensure};
 use glam::{DMat4, DQuat, DVec3};
@@ -347,18 +347,15 @@ impl Project {
                     }
                 }
                 _ => {
-                    let mask = |chunk| self.exclusion_mask(scan, chunk);
                     let mut masks: HashMap<u32, Vec<u8>> = HashMap::new();
                     for sample in self.read_lod(scan, node_id)? {
-                        if !self.current().layers.is_empty() {
-                            if let std::collections::hash_map::Entry::Vacant(e) =
-                                masks.entry(sample.chunk)
-                            {
-                                e.insert(mask(sample.chunk)?);
-                            }
-                            if is_excluded(&masks[&sample.chunk], sample.index as usize) {
-                                continue;
-                            }
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            masks.entry(sample.chunk)
+                        {
+                            e.insert(self.hidden_mask(scan, sample.chunk)?);
+                        }
+                        if is_set(&masks[&sample.chunk], sample.index as usize) {
+                            continue;
                         }
                         let p = world.transform_point3(DVec3::from(sample.position));
                         if keep(p) {

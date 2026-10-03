@@ -1,5 +1,6 @@
 //! Modal dialogs. At most one is open; `Workbench::dialog` holds its state.
-use super::{Settings, Workbench, revisions::RevisionsState};
+use super::{Settings, Workbench, layers::destination_combo, revisions::RevisionsState};
+use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::Project;
@@ -26,7 +27,13 @@ pub(super) enum Dialog {
         id: Uuid,
         name: String,
     },
-    Filter(Filter),
+    /// Names a new layer (`code` none) or renames one.
+    RenameLayer {
+        code: Option<u8>,
+        name: String,
+    },
+    /// A filter, and the layer it moves points to; none for its default layer.
+    Filter(Filter, Option<u8>),
     ExportLas {
         per_scan: bool,
         laz: bool,
@@ -50,6 +57,15 @@ pub(super) enum Filter {
         deviations: f64,
         reach: f64,
     },
+}
+impl Filter {
+    /// The layer the filter moves points to unless another is chosen.
+    pub(super) fn default_layer(&self, t: &'static Strings) -> &'static str {
+        match self {
+            Filter::Subsample { .. } => t.layer_subsampled,
+            Filter::Noise { .. } | Filter::Statistical { .. } => t.layer_noise,
+        }
+    }
 }
 #[derive(Clone, Copy)]
 pub(super) enum AfterDiscard {
@@ -89,7 +105,8 @@ enum Outcome {
     Discard(AfterDiscard),
     Cleanup,
     RenameGroup(Uuid, String),
-    Filter(Filter),
+    RenameLayer(Option<u8>, String),
+    Filter(Filter, Option<u8>),
     ExportLas { per_scan: bool, laz: bool },
 }
 
@@ -123,6 +140,7 @@ impl Workbench {
         let id = egui::Id::new("dialog");
         let mut outcome = Outcome::Keep;
         let visible = self.visible.len();
+        let project = self.project.clone();
         let response = egui::Modal::new(id).show(ctx, |ui| {
             ui.set_max_width(520.);
             match dialog {
@@ -218,7 +236,28 @@ impl Workbench {
                         outcome = Outcome::Close;
                     }
                 }
-                Dialog::Filter(filter) => {
+                Dialog::RenameLayer { code, name } => {
+                    let heading = match code {
+                        Some(_) => format!("{} {}", icon::PENCIL_SIMPLE, t.rename),
+                        None => format!("{} {}", icon::STACK, t.new_layer_title),
+                    };
+                    ui.heading(heading);
+                    let edit = ui.add(egui::TextEdit::singleline(name).desired_width(320.));
+                    edit.request_focus();
+                    let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let valid = !name.trim().is_empty();
+                    let label = if code.is_some() { t.apply } else { t.create };
+                    if buttons(ui, t.cancel, |ui| {
+                        if ui.add_enabled(valid, egui::Button::new(label)).clicked()
+                            || (enter && valid)
+                        {
+                            outcome = Outcome::RenameLayer(*code, name.trim().to_owned());
+                        }
+                    }) {
+                        outcome = Outcome::Close;
+                    }
+                }
+                Dialog::Filter(filter, destination) => {
                     let (heading, message) = match filter {
                         Filter::Subsample { .. } => (
                             format!("{} {}", icon::DOTS_NINE, t.subsample),
@@ -280,10 +319,16 @@ impl Workbench {
                                 ui.end_row();
                             }
                         });
+                    if let Some(p) = &project {
+                        ui.horizontal(|ui| {
+                            let default = filter.default_layer(t);
+                            destination_combo(ui, t, p, "filter destination", default, destination);
+                        });
+                    }
                     ui.small((t.filter_targets)(visible));
                     if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.run).clicked() {
-                            outcome = Outcome::Filter(*filter);
+                            outcome = Outcome::Filter(*filter, *destination);
                         }
                     }) {
                         outcome = Outcome::Close;
@@ -375,9 +420,16 @@ impl Workbench {
                 self.dialog = None;
                 self.apply_edit(|p| p.rename_group(id, name));
             }
-            Outcome::Filter(filter) => {
+            Outcome::RenameLayer(code, name) => {
                 self.dialog = None;
-                self.run_filter(ctx, filter);
+                match code {
+                    Some(code) => self.apply_edit(|p| p.rename_layer(code, name)),
+                    None => self.apply_edit(|p| p.create_layer(name).map(|_| ())),
+                };
+            }
+            Outcome::Filter(filter, destination) => {
+                self.dialog = None;
+                self.run_filter(ctx, filter, destination);
             }
             Outcome::ExportLas { per_scan, laz } => {
                 self.dialog = None;

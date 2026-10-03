@@ -10,11 +10,8 @@ use std::{
 };
 use uuid::Uuid;
 
-/// 3 adds the unsaved working state (`Manifest::draft`) and the scan tree.
-/// 4 moves scan and layer metadata, which never change once written, out of
-/// `project.json` into files of their own; saving an edit then writes only
-/// the small history. Versions up to 3 still load and are saved as 4.
-pub const FORMAT_VERSION: u32 = 4;
+/// The first format. It changes in place until a release needs compatibility.
+pub const FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Bounds {
@@ -105,15 +102,12 @@ pub struct Chunk {
     pub offset: u64,
     pub count: u32,
     pub bounds: Bounds,
-    #[serde(default)]
     pub codec: BlockCodec,
-    #[serde(default)]
     pub stored_bytes: u32,
 }
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockCodec {
-    #[default]
     Raw,
     ZstdShuffle,
 }
@@ -125,9 +119,7 @@ pub struct Node {
     pub lod_offset: u64,
     pub lod_count: u32,
     pub point_count: u64,
-    #[serde(default)]
     pub lod_codec: BlockCodec,
-    #[serde(default)]
     pub lod_bytes: u32,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -156,38 +148,52 @@ pub struct ImageInfo {
     pub pose: Option<Pose>,
     pub projection: String,
 }
+/// The layer every point starts in. It cannot be removed.
+pub const DEFAULT_LAYER: u8 = 0;
+
+/// A layer of a state. Every point belongs to exactly one; work applies to
+/// the points of visible layers only.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Layer {
+    /// What point labels store; unique within a state.
+    pub code: u8,
+    pub name: String,
+    pub visible: bool,
+}
+/// Where an operation moves points: an existing layer, or a new one it creates.
+#[derive(Clone, Debug, PartialEq)]
+pub enum LayerTarget {
+    Existing(u8),
+    New(String),
+}
+/// The layer codes of one chunk's points, in point order.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ChunkMask {
+pub struct LabelBlock {
     pub scan: Uuid,
     pub chunk: u32,
     pub offset: u64,
+    /// Zstd frame of one byte per point; 0 when every point is in the default layer.
     pub bytes: u32,
-    pub excluded: u64,
+    /// Points per layer other than the default one, by ascending code.
+    pub counts: Vec<(u8, u64)>,
 }
-/// What produced an exclusion layer.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum LayerKind {
-    /// A range exclusion drawn in the viewport.
-    #[default]
-    Manual,
-    /// Voxel subsampling: one original point kept per voxel of `size` metres,
-    /// per scan in scan coordinates, or with `merged` over all the scans
-    /// together in the project frame (where scans overlap, one point in all).
-    Subsample {
-        size: f64,
-        #[serde(default)]
-        merged: bool,
-    },
-    /// Isolated point removal: points with fewer than `min_neighbours` other
-    /// points within `radius` metres.
-    Noise { radius: f64, min_neighbours: u32 },
-    /// A 3D box crop: the points inside the box, or outside it.
-    Box { inside: bool },
-    /// Statistical outlier removal: points whose mean distance to their
-    /// `neighbours` nearest points exceeds the scan's mean by `deviations`
-    /// standard deviations.
-    Statistical { neighbours: u32, deviations: f64 },
+/// The labels of the chunks one operation changed. Never changes once
+/// written; a state lists the patches it applies, and for each chunk the
+/// last patch listing it holds its labels.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LabelPatch {
+    pub id: Uuid,
+    pub file: String,
+    /// Sorted by scan and chunk.
+    pub blocks: Vec<LabelBlock>,
+}
+impl LabelPatch {
+    pub fn block(&self, scan: Uuid, chunk: u32) -> Option<&LabelBlock> {
+        self.blocks
+            .binary_search_by(|b| (b.scan, b.chunk).cmp(&(scan, chunk)))
+            .ok()
+            .map(|i| &self.blocks[i])
+    }
 }
 /// A box in the project frame, turned about the vertical axis.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -225,16 +231,6 @@ impl CropBox {
         })
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Layer {
-    pub id: Uuid,
-    pub name: String,
-    pub mask_file: String,
-    pub masks: Vec<ChunkMask>,
-    pub excluded: u64,
-    #[serde(default)]
-    pub kind: LayerKind,
-}
 /// A folder in the scan tree. Its transform, kept in `Revision::transforms`
 /// under its id, moves everything below it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -252,13 +248,13 @@ pub struct Revision {
     /// What led here; for saved revisions `{"kind":"edits","operations":[...]}`.
     pub operation: serde_json::Value,
     pub scans: Vec<Uuid>,
-    pub layers: Vec<Uuid>,
+    pub layers: Vec<Layer>,
+    /// Label patches, applied in order.
+    pub labels: Vec<Uuid>,
     /// Additional rigid transforms of scans and groups.
     pub transforms: BTreeMap<Uuid, Pose>,
-    #[serde(default)]
     pub groups: Vec<Group>,
     /// The folder of each scan in `groups`; absent scans are at the top level.
-    #[serde(default)]
     pub scan_groups: BTreeMap<Uuid, Uuid>,
     /// Unix seconds when the user saved this revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -270,7 +266,7 @@ pub struct Manifest {
     pub name: String,
     pub scans: Vec<Scan>,
     pub images: Vec<ImageInfo>,
-    pub layers: Vec<Layer>,
+    pub patches: Vec<LabelPatch>,
     pub revisions: Vec<Revision>,
     /// The saved revision the project shows, or the working state is based on.
     pub current: Uuid,
@@ -279,15 +275,16 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<Revision>,
 }
-/// `project.json` from format 4: scans and layers are referenced by the
-/// project-relative paths of their metadata files.
+/// `project.json`: scans and label patches, which never change once written,
+/// are referenced by the project-relative paths of their metadata files, so
+/// an edit rewrites only the small history.
 #[derive(Serialize, Deserialize)]
 struct ManifestFile {
     format_version: u32,
     name: String,
     scans: Vec<String>,
     images: Vec<ImageInfo>,
-    layers: Vec<String>,
+    labels: Vec<String>,
     revisions: Vec<Revision>,
     current: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,12 +298,9 @@ pub(crate) fn scan_metadata_path(scan: &Scan) -> String {
         .unwrap_or(&scan.points_file);
     format!("{stem}.scan.json")
 }
-/// Where a layer's metadata lives: next to its mask.
-pub(crate) fn layer_metadata_path(layer: &Layer) -> String {
-    let stem = layer
-        .mask_file
-        .strip_suffix(".mask")
-        .unwrap_or(&layer.mask_file);
+/// Where a label patch's metadata lives: next to its labels.
+pub(crate) fn patch_metadata_path(patch: &LabelPatch) -> String {
+    let stem = patch.file.strip_suffix(".labels").unwrap_or(&patch.file);
     format!("{stem}.json")
 }
 
@@ -319,7 +313,7 @@ impl Project {
     pub fn create(root: &Path, name: &str) -> Result<Self> {
         ensure!(!root.exists(), CoreError::ProjectExists(root.to_owned()));
         fs::create_dir_all(root)?;
-        for dir in ["data", "layers", "staging"] {
+        for dir in ["data", "labels", "staging"] {
             fs::create_dir(root.join(dir))?;
         }
         let id = Uuid::new_v4();
@@ -330,14 +324,19 @@ impl Project {
                 name: name.into(),
                 scans: vec![],
                 images: vec![],
-                layers: vec![],
+                patches: vec![],
                 revisions: vec![Revision {
                     id,
                     parent: None,
                     name: "Project created".into(),
                     operation: serde_json::json!({"kind":"create"}),
                     scans: vec![],
-                    layers: vec![],
+                    layers: vec![Layer {
+                        code: DEFAULT_LAYER,
+                        name: "Points".into(),
+                        visible: true,
+                    }],
+                    labels: vec![],
                     transforms: BTreeMap::new(),
                     groups: vec![],
                     scan_groups: BTreeMap::new(),
@@ -364,53 +363,56 @@ impl Project {
             .and_then(|v| v.as_u64())
             .context("Invalid project metadata")? as u32;
         ensure!(
-            (1..=FORMAT_VERSION).contains(&version),
+            version == FORMAT_VERSION,
             CoreError::UnsupportedProjectFormat(version)
         );
-        let manifest = if version < 4 {
-            serde_json::from_value(value).context("Invalid project metadata")?
-        } else {
-            let file: ManifestFile =
-                serde_json::from_value(value).context("Invalid project metadata")?;
-            let read = |relative: &str| -> Result<Vec<u8>> {
-                let p = Path::new(relative);
-                ensure!(
-                    !p.as_os_str().is_empty()
-                        && p.components().all(|c| matches!(c, Component::Normal(_))),
-                    "Invalid project asset path"
-                );
-                fs::read(root.join(p)).with_context(|| format!("Reading {relative}"))
-            };
-            let mut scans = vec![];
-            for path in &file.scans {
-                let scan: Scan = serde_json::from_slice(&read(path)?)
-                    .with_context(|| format!("Invalid scan metadata {path}"))?;
-                ensure!(
-                    scan_metadata_path(&scan) == *path,
-                    "Misplaced scan metadata"
-                );
-                scans.push(scan);
-            }
-            let mut layers = vec![];
-            for path in &file.layers {
-                let layer: Layer = serde_json::from_slice(&read(path)?)
-                    .with_context(|| format!("Invalid layer metadata {path}"))?;
-                ensure!(
-                    layer_metadata_path(&layer) == *path,
-                    "Misplaced layer metadata"
-                );
-                layers.push(layer);
-            }
-            Manifest {
-                format_version: version,
-                name: file.name,
-                scans,
-                images: file.images,
-                layers,
-                revisions: file.revisions,
-                current: file.current,
-                draft: file.draft,
-            }
+        let file: ManifestFile =
+            serde_json::from_value(value).context("Invalid project metadata")?;
+        let read = |relative: &str| -> Result<Vec<u8>> {
+            let p = Path::new(relative);
+            ensure!(
+                !p.as_os_str().is_empty()
+                    && p.components().all(|c| matches!(c, Component::Normal(_))),
+                "Invalid project asset path"
+            );
+            fs::read(root.join(p)).with_context(|| format!("Reading {relative}"))
+        };
+        let mut scans = vec![];
+        for path in &file.scans {
+            let scan: Scan = serde_json::from_slice(&read(path)?)
+                .with_context(|| format!("Invalid scan metadata {path}"))?;
+            ensure!(
+                scan_metadata_path(&scan) == *path,
+                "Misplaced scan metadata"
+            );
+            scans.push(scan);
+        }
+        let mut patches = vec![];
+        for path in &file.labels {
+            let patch: LabelPatch = serde_json::from_slice(&read(path)?)
+                .with_context(|| format!("Invalid label metadata {path}"))?;
+            ensure!(
+                patch_metadata_path(&patch) == *path,
+                "Misplaced label metadata"
+            );
+            ensure!(
+                patch
+                    .blocks
+                    .windows(2)
+                    .all(|w| (w[0].scan, w[0].chunk) < (w[1].scan, w[1].chunk)),
+                "Unsorted label blocks"
+            );
+            patches.push(patch);
+        }
+        let manifest = Manifest {
+            format_version: version,
+            name: file.name,
+            scans,
+            images: file.images,
+            patches,
+            revisions: file.revisions,
+            current: file.current,
+            draft: file.draft,
         };
         ensure!(
             manifest.revisions.iter().any(|r| r.id == manifest.current),
@@ -426,6 +428,9 @@ impl Project {
             p.path(&s.points_file)?;
             p.path(&s.lod_file)?;
         }
+        for patch in &p.manifest.patches {
+            p.path(&patch.file)?;
+        }
         Ok(p)
     }
     pub fn path(&self, relative: &str) -> Result<PathBuf> {
@@ -440,25 +445,25 @@ impl Project {
         }
         Ok(result)
     }
-    /// Writes `project.json`, after the metadata of any scan or layer that has
-    /// no file yet. Those never change once written, so an edit writes only
+    /// Writes `project.json`, after the metadata of any scan or label patch
+    /// that has no file yet. Those never change once written, so an edit writes only
     /// the history.
     pub fn save(&self) -> Result<()> {
         let m = &self.manifest;
         let scans: Vec<_> = m.scans.iter().map(scan_metadata_path).collect();
-        let layers: Vec<_> = m.layers.iter().map(layer_metadata_path).collect();
+        let labels: Vec<_> = m.patches.iter().map(patch_metadata_path).collect();
         for (scan, path) in m.scans.iter().zip(&scans) {
             self.write_once(path, scan)?;
         }
-        for (layer, path) in m.layers.iter().zip(&layers) {
-            self.write_once(path, layer)?;
+        for (patch, path) in m.patches.iter().zip(&labels) {
+            self.write_once(path, patch)?;
         }
         let file = ManifestFile {
             format_version: FORMAT_VERSION,
             name: m.name.clone(),
             scans,
             images: m.images.clone(),
-            layers,
+            labels,
             revisions: m.revisions.clone(),
             current: m.current,
             draft: m.draft.clone(),

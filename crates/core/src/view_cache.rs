@@ -1,6 +1,6 @@
 use crate::{JobControl, Project, Sample, Scan};
 use crate::{
-    edit::is_excluded,
+    layers::is_set,
     storage::{point_color, position, valid},
 };
 use anyhow::Result;
@@ -25,11 +25,15 @@ struct Entry {
     bytes: usize,
 }
 
-/// LRU of decoded, masked node samples in scan-local coordinates. Camera and
-/// transform changes reuse them; a different project or set of active
-/// exclusion layers invalidates them. Layer masks never change once written.
+/// What decides which samples of a node are shown: the project, the label
+/// patches in effect and the visible layers.
+type Epoch = (PathBuf, Vec<Uuid>, Vec<u8>);
+
+/// LRU of decoded node samples in visible layers, in scan-local coordinates.
+/// Camera and transform changes reuse them; a different project, labels or
+/// set of visible layers invalidates them. Labels never change once written.
 pub struct ViewCache {
-    epoch: Option<(PathBuf, Vec<Uuid>)>,
+    epoch: Option<Epoch>,
     entries: HashMap<Key, Entry>,
     limit: usize,
     clock: u64,
@@ -49,7 +53,14 @@ impl ViewCache {
         self.stats
     }
     pub(crate) fn prepare(&mut self, project: &Project) {
-        let epoch = (project.root.clone(), project.current().layers.clone());
+        let state = project.current();
+        let visible = state
+            .layers
+            .iter()
+            .filter(|l| l.visible)
+            .map(|l| l.code)
+            .collect();
+        let epoch = (project.root.clone(), state.labels.clone(), visible);
         if self.epoch.as_ref() != Some(&epoch) {
             self.entries.clear();
             self.stats.resident_bytes = 0;
@@ -99,20 +110,24 @@ impl ViewCache {
             if i % 8192 == 0 {
                 job.check()?;
             }
-            if !project.current().layers.is_empty() {
-                if let std::collections::hash_map::Entry::Vacant(entry) = masks.entry(sample.chunk)
-                {
-                    entry.insert(project.exclusion_mask(scan, sample.chunk)?);
-                }
-                if is_excluded(&masks[&sample.chunk], sample.index as usize) {
-                    continue;
-                }
+            if let std::collections::hash_map::Entry::Vacant(entry) = masks.entry(sample.chunk) {
+                // None: nothing of the chunk is hidden.
+                let hidden = (project.hidden_count(scan, sample.chunk) > 0)
+                    .then(|| project.hidden_mask(scan, sample.chunk))
+                    .transpose()?;
+                entry.insert(hidden);
+            }
+            if masks[&sample.chunk]
+                .as_ref()
+                .is_some_and(|hidden| is_set(hidden, sample.index as usize))
+            {
+                continue;
             }
             result.push(sample);
         }
         job.check()?;
         let samples: Arc<[Sample]> = result.into();
-        // Charge entry/Arc/hash-table overhead too, including empty masked nodes.
+        // Charge entry/Arc/hash-table overhead too, including nodes left empty.
         let bytes = std::mem::size_of_val(samples.as_ref()) + 128;
         if bytes <= self.limit {
             while self.stats.resident_bytes + bytes > self.limit {

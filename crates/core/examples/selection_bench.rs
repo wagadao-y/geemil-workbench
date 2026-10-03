@@ -1,4 +1,4 @@
-//! Times a depth-limited selection exclusion. It commits a layer, so run it on
+//! Times moving a depth-limited selection to a layer. It commits the move, so run it on
 //! a copy of a project: selection_bench PROJECT [HALF_WIDTH] [DEPTH_METERS] [inside|outside]
 //! HALF_WIDTH is the half size of a centred square in viewport units (0.5 = all).
 use anyhow::{Result, ensure};
@@ -38,9 +38,14 @@ fn main() -> Result<()> {
     };
     let chunks: usize = project.scans().map(|s| s.chunks.len()).sum();
     let start = Instant::now();
-    let excluded = project.delete_selection(&selection, &ids, &JobControl::default())?;
+    let excluded = project.move_selection(
+        &selection,
+        &ids,
+        &project.layer_named("Deleted"),
+        &JobControl::default(),
+    )?;
     println!(
-        "chunks={chunks} excluded={excluded} elapsed_ms={:.1}",
+        "chunks={chunks} moved={excluded} elapsed_ms={:.1}",
         start.elapsed().as_secs_f64() * 1000.
     );
     Ok(())

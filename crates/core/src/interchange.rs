@@ -836,12 +836,12 @@ impl Project {
                     job.check()?;
                     job.report(Stage::WritingE57, id as u64, scan.chunks.len() as u64);
                     let data = self.read_chunk(scan, id as u32)?;
-                    let mask = self.exclusion_mask(scan, id as u32)?;
+                    let hidden = self.hidden_mask(scan, id as u32)?;
                     for (i, record) in data.chunks_exact(scan.stride).enumerate() {
                         if i % 8192 == 0 {
                             job.check()?;
                         }
-                        if !crate::edit::is_excluded(&mask, i) {
+                        if !crate::layers::is_set(&hidden, i) {
                             out.add_point(decode(&record[32..], &pc.prototype)?)?;
                         }
                     }

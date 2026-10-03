@@ -2,10 +2,11 @@
 //! subsampling and isolated point removal. Both run per scan in scan
 //! coordinates, chunk by chunk, reading neighbouring chunks as far as the filter
 //! looks, so the result does not depend on where chunks split the scan. They
-//! add an exclusion layer instead of rewriting points.
-use crate::edit::{LayerWriter, is_excluded};
+//! judge the points of visible layers and move the points they pick to
+//! another layer instead of rewriting points.
+use crate::layers::{LabelWriter, is_set};
 use crate::storage::{position, valid};
-use crate::{Bounds, CropBox, JobControl, LayerKind, Project, Scan, Stage};
+use crate::{Bounds, CropBox, JobControl, LayerTarget, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3};
 use std::{
@@ -20,7 +21,7 @@ use uuid::Uuid;
 /// Decoded neighbour chunks kept per scan while filtering.
 const CACHE_BYTES: usize = 512 * 1024 * 1024;
 
-/// The points of a chunk that are valid and not excluded, in scan coordinates.
+/// The valid points of a chunk in visible layers, in scan coordinates.
 struct ChunkPoints {
     indices: Vec<u32>,
     positions: Vec<DVec3>,
@@ -68,7 +69,7 @@ impl<'a> ChunkCache<'a> {
         }
         // Decode outside the lock; two workers may decode the same chunk once.
         let data = self.project.read_chunk(self.scan, chunk)?;
-        let mask = self.project.exclusion_mask(self.scan, chunk)?;
+        let hidden = self.project.hidden_mask(self.scan, chunk)?;
         let mut points = ChunkPoints {
             indices: vec![],
             positions: vec![],
@@ -77,7 +78,7 @@ impl<'a> ChunkCache<'a> {
             if i % 8192 == 0 {
                 job.check()?;
             }
-            if valid(p) && !is_excluded(&mask, i) {
+            if valid(p) && !is_set(&hidden, i) {
                 points.indices.push(i as u32);
                 points.positions.push(DVec3::from(position(p)));
             }
@@ -107,7 +108,7 @@ impl<'a> ChunkCache<'a> {
         }
         Ok(points)
     }
-    /// Surviving points of the other chunks that lie in the box `[lo, hi]`.
+    /// Visible points of the other chunks that lie in the box `[lo, hi]`.
     fn neighbours(
         &self,
         own: u32,
@@ -220,7 +221,7 @@ impl KdTree {
     }
 }
 
-/// Mean distance from each surviving point of `chunk` to its `k` nearest
+/// Mean distance from each visible point of `chunk` to its `k` nearest
 /// other points of the scan within `radius`; `None` where fewer are in reach.
 fn mean_neighbour_distances(
     cache: &ChunkCache,
@@ -258,7 +259,7 @@ fn mean_neighbour_distances(
     Ok((own, result))
 }
 
-/// A chunk's exclusion mask and the number of points it excludes.
+/// The points of a chunk to move, one bit per point, and their number.
 type ChunkResult = (Vec<u8>, u64);
 
 /// Voxel subsampling of one chunk: within each voxel, keep the point closest
@@ -385,7 +386,7 @@ fn merged_subsample_chunk(
 }
 
 /// Isolated point removal for one chunk: a point with fewer than
-/// `min_neighbours` other points within `radius` is excluded.
+/// `min_neighbours` other points within `radius` is moved.
 fn noise_chunk(
     cache: &ChunkCache,
     chunk: u32,
@@ -444,17 +445,20 @@ fn noise_chunk(
 
 impl Project {
     /// Keeps one original point per voxel of `size` metres in each of
-    /// `scan_ids`, in scan coordinates, and excludes the rest as a new layer.
-    /// Returns the number of excluded points.
-    pub fn subsample(&mut self, size: f64, scan_ids: &[Uuid], job: &JobControl) -> Result<u64> {
+    /// `scan_ids`, in scan coordinates, and moves the rest to `target`.
+    /// Returns the number of moved points.
+    pub fn subsample(
+        &mut self,
+        size: f64,
+        scan_ids: &[Uuid],
+        target: &LayerTarget,
+        job: &JobControl,
+    ) -> Result<u64> {
         ensure!(size.is_finite() && size > 0., "Invalid voxel size");
         self.filter(
             scan_ids,
             Stage::Subsampling,
-            LayerKind::Subsample {
-                size,
-                merged: false,
-            },
+            target,
             serde_json::json!({"kind": "subsample", "size": size, "scans": scan_ids}),
             job,
             |cache, chunk, job| subsample_chunk(cache, chunk, size, job),
@@ -470,6 +474,7 @@ impl Project {
         &mut self,
         size: f64,
         scan_ids: &[Uuid],
+        target: &LayerTarget,
         job: &JobControl,
     ) -> Result<u64> {
         ensure!(size.is_finite() && size > 0., "Invalid voxel size");
@@ -500,30 +505,32 @@ impl Project {
             })
             .collect();
         let progress = Progress::new(Stage::Subsampling, &scans, 1);
-        let mut layer = LayerWriter::new(self)?;
+        let mut labels = LabelWriter::new(self, target)?;
         for (si, scan) in scans.iter().enumerate() {
             let masks = each_chunk(&caches[si], job, &progress, &|_, chunk, job| {
                 merged_subsample_chunk(&caches, &worlds, &boxes, si, chunk, size, job)
             })?;
             for (chunk, (mask, count)) in masks.into_iter().enumerate() {
-                layer.push(scan.id, chunk as u32, &mask, count)?;
+                labels.push(self, scan, chunk as u32, &mask, count)?;
             }
         }
         job.check()?;
-        layer.finish(
+        labels.commit(
             self,
-            LayerKind::Subsample { size, merged: true },
             serde_json::json!({"kind": "subsample", "size": size, "merged": true,
                 "scans": scan_ids}),
+            |_| Ok(()),
+            false,
         )
     }
-    /// Excludes points of `scan_ids` with fewer than `min_neighbours` other
-    /// points of the same scan within `radius` metres, as a new layer.
+    /// Moves points of `scan_ids` with fewer than `min_neighbours` other
+    /// points of the same scan within `radius` metres to `target`.
     pub fn remove_noise(
         &mut self,
         radius: f64,
         min_neighbours: u32,
         scan_ids: &[Uuid],
+        target: &LayerTarget,
         job: &JobControl,
     ) -> Result<u64> {
         ensure!(radius.is_finite() && radius > 0., "Invalid search radius");
@@ -531,24 +538,22 @@ impl Project {
         self.filter(
             scan_ids,
             Stage::NoiseFilter,
-            LayerKind::Noise {
-                radius,
-                min_neighbours,
-            },
+            target,
             serde_json::json!({"kind": "noise_filter", "radius": radius,
                 "min_neighbours": min_neighbours, "scans": scan_ids}),
             job,
             |cache, chunk, job| noise_chunk(cache, chunk, radius, min_neighbours, job),
         )
     }
-    /// Excludes the points of `scan_ids` inside `crop` (or outside it, for
-    /// cropping to it) as a new layer. Chunks entirely on the kept side are
-    /// not read.
-    pub fn exclude_box(
+    /// Moves the points of `scan_ids` inside `crop` (or outside it, for
+    /// cropping to it) to `target`. Chunks entirely on the kept side are not
+    /// read.
+    pub fn move_box(
         &mut self,
         crop: &CropBox,
         inside: bool,
         scan_ids: &[Uuid],
+        target: &LayerTarget,
         job: &JobControl,
     ) -> Result<u64> {
         ensure!(
@@ -560,7 +565,7 @@ impl Project {
         self.filter(
             scan_ids,
             Stage::BoxCrop,
-            LayerKind::Box { inside },
+            target,
             serde_json::json!({"kind": "box", "box": crop, "inside": inside, "scans": scan_ids}),
             job,
             |cache, chunk, job| {
@@ -592,17 +597,18 @@ impl Project {
             },
         )
     }
-    /// Statistical outlier removal, per scan: a point is excluded when its mean
+    /// Statistical outlier removal, per scan: a point moves to `target` when its mean
     /// distance to its `neighbours` nearest points is more than `deviations`
     /// standard deviations above the scan's mean, or when fewer than
     /// `neighbours` points are within `max_distance` (which bounds how far
-    /// neighbouring chunks are read). Two passes: statistics, then the mask.
+    /// neighbouring chunks are read). Two passes: statistics, then the moves.
     pub fn remove_outliers(
         &mut self,
         neighbours: u32,
         deviations: f64,
         max_distance: f64,
         scan_ids: &[Uuid],
+        target: &LayerTarget,
         job: &JobControl,
     ) -> Result<u64> {
         ensure!((1..=256).contains(&neighbours), "Invalid neighbour count");
@@ -618,7 +624,7 @@ impl Project {
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let statistics = Progress::new(Stage::OutlierStatistics, &scans, 1);
         let filtering = Progress::new(Stage::OutlierFilter, &scans, 1);
-        let mut layer = LayerWriter::new(self)?;
+        let mut labels = LabelWriter::new(self, target)?;
         for scan in &scans {
             let cache = ChunkCache::new(self, scan);
             let sums = each_chunk(&cache, job, &statistics, &|cache, chunk, job| {
@@ -649,43 +655,41 @@ impl Project {
                 Ok((mask, count))
             })?;
             for (chunk, (mask, count)) in masks.into_iter().enumerate() {
-                layer.push(scan.id, chunk as u32, &mask, count)?;
+                labels.push(self, scan, chunk as u32, &mask, count)?;
             }
         }
         job.check()?;
-        layer.finish(
+        labels.commit(
             self,
-            LayerKind::Statistical {
-                neighbours,
-                deviations,
-            },
             serde_json::json!({"kind": "outlier_filter", "neighbours": neighbours,
                 "deviations": deviations, "max_distance": max_distance, "scans": scan_ids}),
+            |_| Ok(()),
+            false,
         )
     }
-    /// Runs `judge` on every chunk of the scans on worker threads and writes
-    /// the results, in chunk order, as one layer.
+    /// Runs `judge` on every chunk of the scans on worker threads and moves
+    /// the points it picks to `target` in one edit.
     fn filter(
         &mut self,
         scan_ids: &[Uuid],
         stage: Stage,
-        kind: LayerKind,
+        target: &LayerTarget,
         operation: serde_json::Value,
         job: &JobControl,
         judge: impl Fn(&ChunkCache, u32, &JobControl) -> Result<ChunkResult> + Sync,
     ) -> Result<u64> {
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let progress = Progress::new(stage, &scans, 1);
-        let mut layer = LayerWriter::new(self)?;
+        let mut labels = LabelWriter::new(self, target)?;
         for scan in &scans {
             let cache = ChunkCache::new(self, scan);
             let results = each_chunk(&cache, job, &progress, &judge)?;
             for (chunk, (mask, count)) in results.into_iter().enumerate() {
-                layer.push(scan.id, chunk as u32, &mask, count)?;
+                labels.push(self, scan, chunk as u32, &mask, count)?;
             }
         }
         job.check()?;
-        layer.finish(self, kind, operation)
+        labels.commit(self, operation, |_| Ok(()), false)
     }
 }
 

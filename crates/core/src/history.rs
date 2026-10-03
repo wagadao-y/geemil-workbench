@@ -3,8 +3,8 @@
 //! Edits change only the working state (`Manifest::draft`), which is written to
 //! disk after every edit but becomes a revision only when the user saves. Undo
 //! and redo replace the working state with an earlier snapshot of it; point
-//! data and masks are immutable, so this never rewrites them.
-use crate::{FORMAT_VERSION, Manifest, Project, Revision};
+//! data and labels are immutable, so this never rewrites them.
+use crate::{DEFAULT_LAYER, FORMAT_VERSION, Manifest, Project, Revision};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -20,7 +20,8 @@ pub(crate) fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Checks that a state only refers to scans, layers and folders that exist and
+/// Checks that a state only refers to scans, label patches and folders that
+/// exist, that its layers have distinct codes including the default one, and
 /// that folders form a tree.
 pub(crate) fn validate_state(manifest: &Manifest, state: &Revision) -> Result<()> {
     for id in &state.scans {
@@ -29,12 +30,15 @@ pub(crate) fn validate_state(manifest: &Manifest, state: &Revision) -> Result<()
             "State refers to a missing scan"
         );
     }
-    for id in &state.layers {
+    for id in &state.labels {
         ensure!(
-            manifest.layers.iter().any(|l| l.id == *id),
-            "State refers to a missing layer"
+            manifest.patches.iter().any(|p| p.id == *id),
+            "State refers to missing labels"
         );
     }
+    let codes: BTreeSet<_> = state.layers.iter().map(|l| l.code).collect();
+    ensure!(codes.len() == state.layers.len(), "Duplicate layer");
+    ensure!(codes.contains(&DEFAULT_LAYER), "Missing default layer");
     let groups: BTreeSet<_> = state.groups.iter().map(|g| g.id).collect();
     ensure!(groups.len() == state.groups.len(), "Duplicate folder");
     for group in &state.groups {
@@ -60,7 +64,8 @@ pub(crate) fn validate_state(manifest: &Manifest, state: &Revision) -> Result<()
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CleanupReport {
     pub scans: usize,
-    pub layers: usize,
+    /// Label patches no longer used.
+    pub labels: usize,
     pub files: usize,
     pub bytes: u64,
 }
@@ -191,7 +196,7 @@ impl Project {
         *self = next;
         Ok(())
     }
-    /// Deletes scans, layers and files that no saved revision and not the
+    /// Deletes scans, label patches and files that no saved revision and not the
     /// working state refer to, and leftovers of interrupted jobs. Undo history
     /// kept elsewhere may refer to removed data and must be dropped.
     pub fn cleanup(&mut self) -> Result<CleanupReport> {
@@ -202,17 +207,17 @@ impl Project {
             .chain(&self.manifest.draft)
             .collect();
         let scans: BTreeSet<_> = states.iter().flat_map(|s| &s.scans).copied().collect();
-        let layers: BTreeSet<_> = states.iter().flat_map(|s| &s.layers).copied().collect();
+        let labels: BTreeSet<_> = states.iter().flat_map(|s| &s.labels).copied().collect();
         // Metadata first, so an interruption leaves only unreferenced files.
         let mut next = self.clone();
         next.manifest.scans.retain(|s| scans.contains(&s.id));
         next.manifest
             .images
             .retain(|i| i.scan_id.is_none_or(|id| scans.contains(&id)));
-        next.manifest.layers.retain(|l| layers.contains(&l.id));
+        next.manifest.patches.retain(|p| labels.contains(&p.id));
         let mut report = CleanupReport {
             scans: self.manifest.scans.len() - next.manifest.scans.len(),
-            layers: self.manifest.layers.len() - next.manifest.layers.len(),
+            labels: self.manifest.patches.len() - next.manifest.patches.len(),
             ..Default::default()
         };
         next.save()?;
@@ -223,9 +228,9 @@ impl Project {
             referenced.extend([&s.template, &s.points_file, &s.lod_file].map(|p| p.clone()));
             referenced.insert(crate::model::scan_metadata_path(s));
         }
-        for l in &self.manifest.layers {
-            referenced.insert(l.mask_file.clone());
-            referenced.insert(crate::model::layer_metadata_path(l));
+        for p in &self.manifest.patches {
+            referenced.insert(p.file.clone());
+            referenced.insert(crate::model::patch_metadata_path(p));
         }
         let remove = |path: &std::path::Path, report: &mut CleanupReport| -> Result<()> {
             let (files, bytes) = measure(path)?;
@@ -263,10 +268,10 @@ impl Project {
                 }
             }
         }
-        for entry in fs::read_dir(self.root.join("layers"))? {
+        for entry in fs::read_dir(self.root.join("labels"))? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
-            if !referenced.contains(&format!("layers/{name}")) {
+            if !referenced.contains(&format!("labels/{name}")) {
                 remove(&entry.path(), &mut report)?;
             }
         }

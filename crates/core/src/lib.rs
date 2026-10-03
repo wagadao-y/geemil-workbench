@@ -8,6 +8,7 @@ mod filter;
 mod history;
 pub mod interchange;
 mod las_export;
+mod layers;
 mod model;
 mod parallel;
 mod storage;

@@ -30,7 +30,7 @@ impl Workbench {
                                 format!("{} {}", icon::PENCIL_SIMPLE, t.status_unsaved),
                             );
                         }
-                        let name = revision_title(t, p, p.base());
+                        let name = revision_title(t, p.base());
                         ui.label(format!(
                             "{} {}",
                             icon::GIT_BRANCH,

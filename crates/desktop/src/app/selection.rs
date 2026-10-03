@@ -1,10 +1,15 @@
-//! Screen-space selection tools, the exclusion preview and running exclusions.
+//! Screen-space selection tools, the preview of what a move takes and moving
+//! the selected points to another layer.
 //!
-//! The preview marks the displayed points an exclusion would remove. Displayed
-//! points are original points, so once the nearest original depth is known
-//! (computed in the background, like the exclusion's first pass) the marks match
-//! the committed result exactly; until then the nearest displayed point stands in.
-use super::{Workbench, jobs::Notice, jobs::is_cancelled};
+//! The preview marks the displayed points a move would take. Displayed points
+//! are original points, so once the nearest original depth is known (computed
+//! in the background, like the move's first pass) the marks match the committed
+//! result exactly; until then the nearest displayed point stands in.
+use super::{
+    Workbench,
+    jobs::{Notice, is_cancelled},
+    layers::{destination, destination_combo},
+};
 use eframe::egui;
 use geemil_core::{Camera, JobControl, Project, Selection, SelectionMode};
 use std::{
@@ -49,9 +54,11 @@ impl Tool {
 pub(super) struct SelectionState {
     pub(super) tool: Tool,
     mode: SelectionMode,
-    /// Limit an inside exclusion to `depth` behind the nearest point.
+    /// Limit an inside selection to `depth` behind the nearest point.
     limit_depth: bool,
     depth: f64,
+    /// The layer moves go to; none for the "deleted" layer.
+    destination: Option<u8>,
     polygon: Vec<egui::Pos2>,
     /// A closed polygon takes no more vertices; the next click starts a new one.
     closed: bool,
@@ -71,6 +78,7 @@ impl Default for SelectionState {
             // the user limits the depth.
             limit_depth: false,
             depth: 0.5,
+            destination: None,
             polygon: vec![],
             closed: false,
             drag_start: None,
@@ -88,7 +96,7 @@ impl SelectionState {
         self.camera = None;
         self.preview = Preview::default();
     }
-    /// Whether there is a selection to exclude.
+    /// Whether there is a selection to move.
     pub(super) fn is_ready(&self) -> bool {
         self.selection().is_some()
     }
@@ -165,7 +173,7 @@ struct Preview {
     search: Option<NearestSearch>,
     /// Inputs of `marks`; a change recomputes them.
     marks_for: Option<MarksInput>,
-    /// Parallel to the displayed points; true for points the exclusion removes.
+    /// Parallel to the displayed points; true for points the move takes.
     marks: Vec<bool>,
     marked: usize,
 }
@@ -238,8 +246,22 @@ impl Workbench {
                 .suffix(" m"),
         );
         ui.separator();
+        if let Some(p) = &self.project {
+            destination_combo(
+                ui,
+                t,
+                p,
+                "selection destination",
+                t.layer_deleted,
+                &mut self.selection.destination,
+            );
+        }
         let ready = self.job.is_none() && self.selection.is_ready();
-        let exclude = format!("{} {}", egui_phosphor::regular::ERASER, t.exclude_selection);
+        let exclude = format!(
+            "{} {}",
+            egui_phosphor::regular::ARROW_BEND_DOWN_RIGHT,
+            t.exclude_selection
+        );
         if ui.add_enabled(ready, egui::Button::new(exclude)).clicked() {
             self.exclude(ctx);
         }
@@ -381,7 +403,7 @@ impl Workbench {
             let limit = match (selection.depth_meters, preview.nearest) {
                 _ if !test.depth_limited() => f64::INFINITY,
                 (Some(depth), Nearest::Displayed(d) | Nearest::Exact(Some(d))) => d + depth,
-                // Nothing inside the polygon: nothing to exclude.
+                // Nothing inside the polygon: nothing to move.
                 _ => f64::NEG_INFINITY,
             };
             preview.marks = self
@@ -425,8 +447,9 @@ impl Workbench {
         }
         painter.add(egui::Shape::line(points, stroke));
     }
-    /// Excludes the selection from the visible scans, judged on original points
-    /// with the camera captured when the selection started.
+    /// Moves the selected points of the visible scans to the chosen layer,
+    /// judged on original points with the camera captured when the selection
+    /// started.
     pub(super) fn exclude(&mut self, ctx: &egui::Context) {
         let (Some(selection), Some(p)) = (self.selection.selection(), &self.project) else {
             return;
@@ -434,10 +457,11 @@ impl Workbench {
         if self.job.is_some() {
             return;
         }
+        let target = destination(p, self.selection.destination, self.t.layer_deleted);
         let mut project = (**p).clone();
         let ids = self.visible.iter().copied().collect::<Vec<_>>();
         self.start(ctx, true, move |job| {
-            project.delete_selection(&selection, &ids, &job)?;
+            project.move_selection(&selection, &ids, &target, &job)?;
             Ok(project)
         });
     }

@@ -1,6 +1,7 @@
 //! The working state, saved revisions, undo snapshots, the scan tree and cleanup.
 use geemil_core::{
-    Camera, ImportOptions, JobControl, Pose, Project, Selection, SelectionMode, interchange,
+    Camera, CoreError, ImportOptions, JobControl, Pose, Project, Selection, SelectionMode,
+    interchange,
 };
 use glam::{DMat4, DVec3};
 use std::path::Path;
@@ -21,6 +22,7 @@ fn shift(x: f64) -> Pose {
     }
 }
 
+/// Moves every point to a new, hidden "Deleted" layer.
 fn exclude_everything(p: &mut Project) -> u64 {
     let ids: Vec<_> = p.scans().map(|s| s.id).collect();
     let selection = Selection {
@@ -33,7 +35,8 @@ fn exclude_everything(p: &mut Project) -> u64 {
         depth_meters: None,
         mode: SelectionMode::ExcludeInside,
     };
-    p.delete_selection(&selection, &ids, &JobControl::default())
+    let target = p.layer_named("Deleted");
+    p.move_selection(&selection, &ids, &target, &JobControl::default())
         .unwrap()
 }
 
@@ -57,14 +60,14 @@ fn edits_stay_unsaved_until_saved_and_survive_reopening() {
     assert!(saved.saved_at.is_some());
     assert_eq!(saved.operation["operations"][0]["kind"], "import");
 
-    // Toggling a layer back and forth adds no revisions.
+    // Showing and hiding a layer adds no revisions.
     exclude_everything(&mut p);
-    let layer = p.current().layers[0];
-    for enabled in [false, true, false] {
-        p.set_layer_enabled(layer, enabled).unwrap();
+    let layer = p.current().layers.last().unwrap().code;
+    for visible in [true, false, true] {
+        p.set_layer_visible(layer, visible).unwrap();
     }
     assert_eq!(p.manifest.revisions.len(), 2);
-    assert!(p.current().layers.is_empty());
+    assert!(p.layer(layer).unwrap().visible);
     let ops = p.current().operation["operations"]
         .as_array()
         .unwrap()
@@ -94,7 +97,8 @@ fn undo_snapshots_restore_states_with_their_identity() {
     // Undo twice, then redo once.
     p.restore_working_state(snapshots[1].clone()).unwrap();
     assert_eq!(p.current().id, moved);
-    assert!(p.current().layers.is_empty());
+    assert!(p.current().labels.is_empty());
+    assert_eq!(p.current().layers.len(), 1);
     assert_eq!(p.current().transforms[&scan], shift(1.));
     p.restore_working_state(snapshots[0].clone()).unwrap();
     assert!(!p.has_unsaved_changes());
@@ -188,7 +192,7 @@ fn cleanup_removes_only_data_no_state_refers_to() {
     let dir = tempfile::tempdir().unwrap();
     let mut p = imported(dir.path());
     let kept = p.save_revision("Imported".into()).unwrap();
-    // A second import, an exclusion and a staging leftover, all abandoned.
+    // A second import, moved points and a staging leftover, all abandoned.
     let source = dir.path().join("demo.e57");
     p.import_file(&source, ImportOptions::default(), &JobControl::default())
         .unwrap();
@@ -200,16 +204,16 @@ fn cleanup_removes_only_data_no_state_refers_to() {
     assert_eq!(dirs(&p), 2);
     // The unsaved state still refers to everything: nothing scan-related goes.
     let report = p.cleanup().unwrap();
-    assert_eq!((report.scans, report.layers), (0, 0));
+    assert_eq!((report.scans, report.labels), (0, 0));
     assert_eq!(report.files, 1);
     assert_eq!(dirs(&p), 2);
 
     p.switch(kept).unwrap();
     let report = p.cleanup().unwrap();
-    assert_eq!((report.scans, report.layers), (2, 1));
+    assert_eq!((report.scans, report.labels), (2, 1));
     assert!(report.files > 3 && report.bytes > 0);
     assert_eq!(dirs(&p), 1);
-    assert_eq!(std::fs::read_dir(p.root.join("layers")).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(p.root.join("labels")).unwrap().count(), 0);
     // The kept revision still reads all of its points.
     let p = Project::load(&p.root).unwrap();
     for scan in p.scans() {
@@ -221,7 +225,7 @@ fn cleanup_removes_only_data_no_state_refers_to() {
 }
 
 #[test]
-fn edits_rewrite_only_the_history_and_format_3_still_opens() {
+fn edits_rewrite_only_the_history_and_other_formats_are_refused() {
     let dir = tempfile::tempdir().unwrap();
     let mut p = imported(dir.path());
     let root = p.root.clone();
@@ -242,8 +246,10 @@ fn edits_rewrite_only_the_history_and_format_3_still_opens() {
     let id = p.scans().next().unwrap().id;
     p.set_transform(id, shift(0.5)).unwrap();
     exclude_everything(&mut p);
-    let layer = p.manifest.layers[0].clone();
-    assert!(root.join(format!("layers/{}.json", layer.id)).is_file());
+    let patch = p.manifest.patches[0].clone();
+    let patch_file = root.join(format!("labels/{}.json", patch.id));
+    assert!(patch_file.is_file());
+    assert!(!manifest.contains("\"blocks\""));
     for (file, stamp) in scan_files.iter().zip(&stamps) {
         assert_eq!(std::fs::metadata(file).unwrap().modified().unwrap(), *stamp);
     }
@@ -253,31 +259,20 @@ fn edits_rewrite_only_the_history_and_format_3_still_opens() {
         serde_json::to_value(&p.manifest).unwrap()
     );
 
-    // A format 3 project keeps everything inline; it opens and saves as 4.
-    let mut legacy = serde_json::to_value(&p.manifest).unwrap();
-    legacy["format_version"] = 3.into();
-    std::fs::write(root.join("project.json"), legacy.to_string()).unwrap();
-    for file in &scan_files {
-        std::fs::remove_file(file).unwrap();
-    }
-    let mut old = Project::load(&root).unwrap();
-    assert_eq!(old.manifest.scans.len(), p.manifest.scans.len());
-    old.save().unwrap();
-    assert!(scan_files.iter().all(|f| f.is_file()));
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(
-            &std::fs::read_to_string(root.join("project.json")).unwrap()
-        )
-        .unwrap()["format_version"],
-        4
-    );
-
     // Cleanup removes the metadata of data nothing uses any more.
-    old.set_layer_enabled(layer.id, false).unwrap();
-    old.discard_changes().unwrap();
-    let layer_file = root.join(format!("layers/{}.json", layer.id));
-    assert!(layer_file.is_file());
-    old.cleanup().unwrap();
-    assert!(!layer_file.is_file());
+    p.discard_changes().unwrap();
+    p.cleanup().unwrap();
+    assert!(!patch_file.is_file());
     assert!(Project::load(&root).is_ok());
+
+    // Only the current format opens.
+    let mut other: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("project.json")).unwrap()).unwrap();
+    other["format_version"] = 2.into();
+    std::fs::write(root.join("project.json"), other.to_string()).unwrap();
+    let error = Project::load(&root).unwrap_err();
+    assert_eq!(
+        CoreError::find(&error),
+        Some(&CoreError::UnsupportedProjectFormat(2))
+    );
 }

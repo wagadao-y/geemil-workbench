@@ -45,7 +45,6 @@ pub(super) enum Action {
     Revisions,
     Discard,
     Cleanup,
-    CompressStorage,
     Subsample,
     RemoveNoise,
     RemoveOutliers,
@@ -79,7 +78,6 @@ impl Action {
             Self::Revisions => icon::GIT_BRANCH,
             Self::Discard => icon::ARROW_COUNTER_CLOCKWISE,
             Self::Cleanup => icon::BROOM,
-            Self::CompressStorage => icon::ARCHIVE,
             Self::Subsample => icon::DOTS_NINE,
             Self::RemoveNoise => icon::FUNNEL,
             Self::RemoveOutliers => icon::CHART_SCATTER,
@@ -119,7 +117,6 @@ impl Action {
             Self::Revisions => t.revisions.into(),
             Self::Discard => t.discard.into(),
             Self::Cleanup => t.cleanup.into(),
-            Self::CompressStorage => t.compress_storage.into(),
             Self::Subsample => t.subsample.into(),
             Self::RemoveNoise => t.remove_noise.into(),
             Self::RemoveOutliers => t.remove_outliers.into(),
@@ -216,7 +213,6 @@ impl Workbench {
             Action::Exclude => idle && self.selection.is_ready(),
             Action::Save | Action::SaveAs | Action::Discard => idle && unsaved,
             Action::Revisions | Action::Cleanup => idle && project.is_some(),
-            Action::CompressStorage => idle && project.is_some_and(|p| p.has_legacy_storage()),
             Action::Subsample | Action::RemoveNoise | Action::RemoveOutliers => {
                 idle && !self.visible.is_empty()
             }
@@ -360,31 +356,33 @@ impl Workbench {
                 })
             }
             Action::Cleanup => self.dialog = Some(Dialog::Cleanup),
-            Action::CompressStorage => {
-                let mut project = (**self.project.as_ref().unwrap()).clone();
-                self.start(ctx, false, move |job| {
-                    project.compress_storage(&job)?;
-                    Ok(project)
-                });
-            }
             Action::Subsample => {
-                self.dialog = Some(Dialog::Filter(Filter::Subsample {
-                    size: self.settings.subsample_size,
-                    merged: self.settings.subsample_merged,
-                }))
+                self.dialog = Some(Dialog::Filter(
+                    Filter::Subsample {
+                        size: self.settings.subsample_size,
+                        merged: self.settings.subsample_merged,
+                    },
+                    None,
+                ))
             }
             Action::RemoveNoise => {
-                self.dialog = Some(Dialog::Filter(Filter::Noise {
-                    radius: self.settings.noise_radius,
-                    min_neighbours: self.settings.noise_neighbours,
-                }))
+                self.dialog = Some(Dialog::Filter(
+                    Filter::Noise {
+                        radius: self.settings.noise_radius,
+                        min_neighbours: self.settings.noise_neighbours,
+                    },
+                    None,
+                ))
             }
             Action::RemoveOutliers => {
-                self.dialog = Some(Dialog::Filter(Filter::Statistical {
-                    neighbours: self.settings.outlier_neighbours,
-                    deviations: self.settings.outlier_deviations,
-                    reach: self.settings.outlier_reach,
-                }))
+                self.dialog = Some(Dialog::Filter(
+                    Filter::Statistical {
+                        neighbours: self.settings.outlier_neighbours,
+                        deviations: self.settings.outlier_deviations,
+                        reach: self.settings.outlier_reach,
+                    },
+                    None,
+                ))
             }
             Action::Tool(tool) => {
                 self.selection.tool = tool;
@@ -422,9 +420,16 @@ impl Workbench {
             });
         }
     }
-    /// Runs a point filter on the visible scans and remembers its parameters.
-    pub(super) fn run_filter(&mut self, ctx: &egui::Context, filter: Filter) {
+    /// Runs a point filter on the visible scans, moving the points it picks to
+    /// the chosen layer or its default one, and remembers its parameters.
+    pub(super) fn run_filter(
+        &mut self,
+        ctx: &egui::Context,
+        filter: Filter,
+        destination: Option<u8>,
+    ) {
         let Some(p) = &self.project else { return };
+        let target = super::layers::destination(p, destination, filter.default_layer(self.t));
         let mut project = (**p).clone();
         let ids: Vec<_> = self.visible.iter().copied().collect();
         match filter {
@@ -454,19 +459,19 @@ impl Workbench {
                 Filter::Subsample {
                     size,
                     merged: false,
-                } => project.subsample(size, &ids, &job)?,
+                } => project.subsample(size, &ids, &target, &job)?,
                 Filter::Subsample { size, merged: true } => {
-                    project.subsample_merged(size, &ids, &job)?
+                    project.subsample_merged(size, &ids, &target, &job)?
                 }
                 Filter::Noise {
                     radius,
                     min_neighbours,
-                } => project.remove_noise(radius, min_neighbours, &ids, &job)?,
+                } => project.remove_noise(radius, min_neighbours, &ids, &target, &job)?,
                 Filter::Statistical {
                     neighbours,
                     deviations,
                     reach,
-                } => project.remove_outliers(neighbours, deviations, reach, &ids, &job)?,
+                } => project.remove_outliers(neighbours, deviations, reach, &ids, &target, &job)?,
             };
             Ok(project)
         });
@@ -622,9 +627,7 @@ impl Workbench {
                 self.undo.clear();
                 self.install(p, true);
                 self.remember(&path);
-                if imports.is_empty() {
-                    self.perform(ctx, Action::Import);
-                } else {
+                if !imports.is_empty() {
                     self.import(ctx, imports);
                 }
             }

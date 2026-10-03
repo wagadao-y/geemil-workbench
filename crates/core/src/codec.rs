@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 pub(crate) const MAX_BLOCK_BYTES: usize = 32 * 1024 * 1024;
 
 /// Byte-column transposition preserves every bit, including IEEE floating-point
-/// representations and the original order used by PointRef/exclusion masks.
+/// representations and the original order used by PointRef/point labels.
 pub(crate) fn pack(data: &[u8], stride: usize) -> Result<(BlockCodec, Vec<u8>)> {
     ensure!(
         stride > 0 && data.len().is_multiple_of(stride),
@@ -76,6 +76,21 @@ pub(crate) fn read_block(
             Ok(data)
         }
     }
+}
+
+/// One Zstd frame of point labels; long runs of one layer shrink to almost nothing.
+pub(crate) fn pack_labels(labels: &[u8]) -> Result<Vec<u8>> {
+    ensure!(labels.len() <= MAX_BLOCK_BYTES, "Block exceeds budget");
+    let mut compressor = zstd::bulk::Compressor::new(3)?;
+    compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
+    Ok(compressor.compress(labels)?)
+}
+
+pub(crate) fn unpack_labels(bytes: &[u8], count: usize) -> Result<Vec<u8>> {
+    ensure!(count <= MAX_BLOCK_BYTES, "Block exceeds budget");
+    let labels = zstd::bulk::decompress(bytes, count)?;
+    ensure!(labels.len() == count, "Decoded label count differs");
+    Ok(labels)
 }
 
 #[cfg(test)]

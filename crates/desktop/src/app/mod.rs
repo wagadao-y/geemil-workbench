@@ -5,6 +5,7 @@ mod align;
 mod crop;
 mod dialogs;
 mod jobs;
+mod layers;
 mod measure;
 mod menu;
 mod navigation;
@@ -103,6 +104,7 @@ pub struct Workbench {
     visible: BTreeSet<Uuid>,
     /// The scan or folder selected in the tree.
     selected: Option<Uuid>,
+    layer_counts: layers::LayerCounts,
     settings: Settings,
 
     // Background work and status bar.
@@ -168,6 +170,7 @@ impl Workbench {
             camera: Camera::default(),
             visible: BTreeSet::new(),
             selected: None,
+            layer_counts: None,
             settings,
             job: None,
             status: t.status_start.into(),

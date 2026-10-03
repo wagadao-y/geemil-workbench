@@ -139,23 +139,19 @@ impl Workbench {
                 let fit = before
                     .as_ref()
                     .is_none_or(|b| b.scans != project.current().scans);
-                // An edit job that added a layer reports it; one that changed
-                // nothing says so.
-                let added = project
-                    .current()
-                    .layers
-                    .last()
-                    .filter(|id| before.as_ref().is_some_and(|b| !b.layers.contains(id)))
-                    .and_then(|id| project.manifest.layers.iter().find(|l| l.id == *id))
-                    .map(|l| (self.t.layer_added)(&super::revisions::layer_label(self.t, l)));
+                // An edit job that moved points says how many and where; one
+                // that changed nothing says so.
                 let unchanged =
                     undo_before.is_some() && before.is_some_and(|b| b.id == project.current().id);
+                let moved = (undo_before.is_some() && !unchanged)
+                    .then(|| self.moved_status(&project))
+                    .flatten();
                 self.install(project, fit);
-                // The selection was used up by the job (e.g. an exclusion).
+                // The selection was used up by the job (e.g. a move).
                 self.selection.clear();
                 self.record_job_edit(undo_before);
                 if self.cleanup_report.is_none() {
-                    self.status = match added {
+                    self.status = match moved {
                         Some(text) => text,
                         None if unchanged => self.t.status_no_change.into(),
                         None => self.t.status_done.into(),

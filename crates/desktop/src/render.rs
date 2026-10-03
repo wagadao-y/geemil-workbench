@@ -10,7 +10,7 @@ const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 // egui-wgpu (0.36) samples native textures as plain Rgba8Unorm holding sRGB
 // code values, so edl.wgsl encodes its linear result before writing here.
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-/// sRGB colour of points an exclusion would remove.
+/// sRGB colour of points a move would take.
 const HIGHLIGHT: [u8; 4] = [255, 48, 48, 255];
 /// Per-pixel view depth for EDL; 0 marks background.
 const VIEW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;

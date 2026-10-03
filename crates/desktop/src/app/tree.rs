@@ -1,6 +1,6 @@
 //! The left panel: the scan tree, properties of the selected item and the
-//! exclusion layers. Tree operations are queued while drawing and applied after.
-use super::{Workbench, dialogs::Dialog, revisions::layer_label};
+//! layers. Tree operations are queued while drawing and applied after.
+use super::{Workbench, dialogs::Dialog};
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::{Group, Pose, Project};
@@ -98,6 +98,7 @@ impl Workbench {
                     return;
                 };
                 let mut actions = vec![];
+                let mut layer_actions = vec![];
                 ui.horizontal(|ui| {
                     ui.strong(format!("{} {}", icon::TREE_STRUCTURE, p.manifest.name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -140,12 +141,16 @@ impl Workbench {
                         egui::CollapsingHeader::new(format!("{} {}", icon::INFO, t.properties))
                             .default_open(true)
                             .show(ui, |ui| self.properties(ui, &p, &mut actions));
-                        egui::CollapsingHeader::new(format!("{} {}", icon::ERASER, t.layers))
+                        egui::CollapsingHeader::new(format!("{} {}", icon::STACK, t.layers))
                             .default_open(true)
-                            .show(ui, |ui| self.layers(ui, &p));
+                            .show(ui, |ui| self.layers(ui, &p, &mut layer_actions));
                     });
                 for action in actions {
                     self.tree_action(action);
+                }
+                let ctx = ui.ctx().clone();
+                for action in layer_actions {
+                    self.layer_action(&ctx, action);
                 }
             });
     }
@@ -506,28 +511,5 @@ impl Workbench {
         let edit = &self.transform_edit;
         (edit.loaded == Some((id, project.current().id)) && edit.changed())
             .then(|| (id, edit.pose()))
-    }
-    fn layers(&mut self, ui: &mut egui::Ui, p: &Project) {
-        let t = self.t;
-        let active = &p.current().layers;
-        if p.manifest.layers.is_empty() {
-            ui.weak(t.no_layers);
-            return;
-        }
-        // Active layers first, newest first.
-        let mut layers: Vec<_> = p.manifest.layers.iter().collect();
-        layers.reverse();
-        layers.sort_by_key(|l| !active.contains(&l.id));
-        for layer in layers {
-            let mut enabled = active.contains(&layer.id);
-            let label = layer_label(t, layer);
-            if ui
-                .add_enabled(self.job.is_none(), egui::Checkbox::new(&mut enabled, label))
-                .changed()
-            {
-                let id = layer.id;
-                self.apply_edit(|p| p.set_layer_enabled(id, enabled));
-            }
-        }
     }
 }

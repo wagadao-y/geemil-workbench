@@ -176,7 +176,12 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
     let min = all_depths.iter().copied().fold(f64::INFINITY, f64::min);
     let expected = all_depths.iter().filter(|d| **d <= min + 0.1).count() as u64;
     let count = project
-        .delete_selection(&selection, &ids, &JobControl::default())
+        .move_selection(
+            &selection,
+            &ids,
+            &project.layer_named("Deleted"),
+            &JobControl::default(),
+        )
         .unwrap();
     assert_eq!(count, expected);
     assert!(count > 0 && count < 32768);
@@ -193,7 +198,7 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
     );
     // Saving from an older revision starts a branch.
     project.switch(base).unwrap();
-    assert!(project.current().layers.is_empty());
+    assert!(project.current().labels.is_empty());
     let first = project.scans().next().unwrap().id;
     project
         .set_transform(
@@ -211,7 +216,7 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
         assert_eq!(r.unwrap().parent, Some(base));
     }
     project.switch(branch_a).unwrap();
-    assert_eq!(project.current().layers.len(), 1);
+    assert_eq!(project.current().labels.len(), 1);
     let reloaded = Project::load(&project.root).unwrap();
     assert_eq!(reloaded.manifest.current, branch_a);
     assert!(reloaded.manifest.revisions.iter().any(|r| r.id == branch_b));
@@ -504,7 +509,9 @@ fn cropping_excludes_everything_outside_the_polygon_at_any_depth() {
     // Points beyond the far plane are kept when seen through the polygon.
     let far = DVec3::from(camera.target) + (DVec3::from(camera.target) - camera.eye()) * 1e6;
     assert!(test.covers(far) && crop.contains(far).is_none());
-    let excluded = project.delete_selection(&crop, &ids, &job).unwrap();
+    let excluded = project
+        .move_selection(&crop, &ids, &project.layer_named("Deleted"), &job)
+        .unwrap();
     assert_eq!(excluded, outside);
     // The recorded operation names the mode; older records default to inside.
     let op = &last_operation(&project);
@@ -515,7 +522,12 @@ fn cropping_excludes_everything_outside_the_polygon_at_any_depth() {
     let legacy: Selection = serde_json::from_value(legacy).unwrap();
     assert_eq!(legacy.mode, SelectionMode::ExcludeInside);
     // Cropping again removes nothing more.
-    assert_eq!(project.delete_selection(&crop, &ids, &job).unwrap(), 0);
+    assert_eq!(
+        project
+            .move_selection(&crop, &ids, &project.layer_named("Deleted"), &job)
+            .unwrap(),
+        0
+    );
 }
 
 #[test]
@@ -544,7 +556,12 @@ fn selection_nearest_matches_the_recorded_exclusion() {
         .selection_nearest(&selection, &ids, &job)
         .unwrap()
         .unwrap();
-    assert!(project.delete_selection(&selection, &ids, &job).unwrap() > 0);
+    assert!(
+        project
+            .move_selection(&selection, &ids, &project.layer_named("Deleted"), &job)
+            .unwrap()
+            > 0
+    );
     assert_eq!(last_operation(&project)["nearest"], nearest);
 }
 
@@ -605,13 +622,15 @@ fn preview_of_displayed_points_matches_the_committed_exclusion() {
                 .collect();
             previews.push((*id, samples, marks));
         }
-        let excluded = project.delete_selection(&selection, &ids, &job).unwrap();
+        let excluded = project
+            .move_selection(&selection, &ids, &project.layer_named("Deleted"), &job)
+            .unwrap();
         assert!(excluded > 0, "{mode:?} {depth_meters:?}");
         let (mut marked, mut checked) = (0, 0);
         for (id, samples, marks) in previews {
             let scan = project.scans().find(|s| s.id == id).unwrap();
             for (sample, mark) in samples.iter().zip(marks) {
-                let mask = project.exclusion_mask(scan, sample.chunk).unwrap();
+                let mask = project.hidden_mask(scan, sample.chunk).unwrap();
                 let bit = mask[sample.index as usize / 8] & (1 << (sample.index % 8)) != 0;
                 assert_eq!(
                     bit, mark,
@@ -663,7 +682,9 @@ fn unlimited_inside_exclusion_is_the_complement_of_cropping() {
         };
         let total: u64 = project.scans().map(|s| s.records).sum();
         counts.push((
-            project.delete_selection(&selection, &ids, &job).unwrap(),
+            project
+                .move_selection(&selection, &ids, &project.layer_named("Deleted"), &job)
+                .unwrap(),
             total,
         ));
         assert!(last_operation(&project)["nearest"].is_null());

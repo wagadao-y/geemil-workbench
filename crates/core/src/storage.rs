@@ -461,115 +461,6 @@ pub(crate) fn index(
 }
 
 impl Project {
-    /// Whether any scan still uses the uncompressed format of early projects.
-    pub fn has_legacy_storage(&self) -> bool {
-        self.manifest
-            .scans
-            .iter()
-            .any(|s| s.chunks.iter().any(|c| c.stored_bytes == 0))
-    }
-    /// Repack legacy assets without changing point references, layers or revisions.
-    /// Old files are retained until all new blocks have been read back and the
-    /// manifest has been committed. A cancelled conversion keeps the old manifest.
-    pub fn compress_storage(&mut self, job: &JobControl) -> Result<()> {
-        let id = Uuid::new_v4();
-        let stage_prefix = format!("staging/{id}");
-        let stage = self.path(&stage_prefix)?;
-        fs::create_dir(&stage)?;
-        let mut next = self.clone();
-        let mut retired = vec![];
-        for scan in &self.manifest.scans {
-            job.check()?;
-            if scan.chunks.iter().all(|c| c.stored_bytes > 0) {
-                continue;
-            }
-            let mut updated = scan.clone();
-            let point_name = format!("{}.points", scan.id);
-            let lod_name = format!("{}.lod", scan.id);
-            updated.points_file = format!("{stage_prefix}/{point_name}");
-            updated.lod_file = format!("{stage_prefix}/{lod_name}");
-            let mut points = BufWriter::new(File::create(stage.join(&point_name))?);
-            let mut lod = BufWriter::new(File::create(stage.join(&lod_name))?);
-            let mut offset = 0;
-            for (i, chunk) in updated.chunks.iter_mut().enumerate() {
-                job.report(Stage::CompressingPoints, i as u64, scan.chunks.len() as u64);
-                job.check()?;
-                let bytes = self.read_chunk(scan, i as u32)?;
-                let (codec, stored_bytes) = write_block(&mut points, &bytes, scan.stride)?;
-                chunk.offset = offset;
-                chunk.codec = codec;
-                chunk.stored_bytes = stored_bytes;
-                offset += stored_bytes as u64;
-            }
-            offset = 0;
-            for (i, node) in updated.nodes.iter_mut().enumerate() {
-                job.report(Stage::CompressingLod, i as u64, scan.nodes.len() as u64);
-                job.check()?;
-                let samples = self.read_lod(scan, i as u32)?;
-                let mut bytes = Vec::with_capacity(samples.len() * SAMPLE_BYTES);
-                for sample in &samples {
-                    write_sample(&mut bytes, sample)?;
-                }
-                let (codec, stored) = write_block(&mut lod, &bytes, SAMPLE_BYTES)?;
-                node.lod_offset = offset;
-                node.lod_codec = codec;
-                node.lod_bytes = stored;
-                offset += stored as u64;
-            }
-            points.flush()?;
-            lod.flush()?;
-            points.get_ref().sync_all()?;
-            lod.get_ref().sync_all()?;
-            drop(points);
-            drop(lod);
-            for i in 0..scan.chunks.len() {
-                job.check()?;
-                job.report(
-                    Stage::VerifyingCompressedPoints,
-                    i as u64,
-                    scan.chunks.len() as u64,
-                );
-                ensure!(
-                    self.read_chunk(scan, i as u32)? == self.read_chunk(&updated, i as u32)?,
-                    "Compressed point verification failed"
-                );
-            }
-            for i in 0..scan.nodes.len() {
-                job.check()?;
-                ensure!(
-                    self.read_lod(scan, i as u32)? == self.read_lod(&updated, i as u32)?,
-                    "Compressed LOD verification failed"
-                );
-            }
-            retired.extend([scan.points_file.clone(), scan.lod_file.clone()]);
-            let prefix = format!("data/{id}");
-            updated.points_file = format!("{prefix}/{point_name}");
-            updated.lod_file = format!("{prefix}/{lod_name}");
-            *next
-                .manifest
-                .scans
-                .iter_mut()
-                .find(|s| s.id == scan.id)
-                .unwrap() = updated;
-        }
-        job.check()?;
-        if retired.is_empty() {
-            fs::remove_dir(&stage)?;
-            return Ok(());
-        }
-        fs::rename(&stage, self.path(&format!("data/{id}"))?)?;
-        next.manifest.format_version = crate::FORMAT_VERSION;
-        next.save()?;
-        *self = next;
-        // Content is now verified and referenced exclusively by the new manifest.
-        // Cleanup failure only leaves unused assets and does not undo the commit.
-        for file in retired {
-            if let Err(error) = fs::remove_file(self.path(&file)?) {
-                eprintln!("Unused asset retained: {file}: {error}");
-            }
-        }
-        Ok(())
-    }
     pub fn read_chunk(&self, scan: &Scan, id: u32) -> Result<Vec<u8>> {
         let c = scan
             .chunks
@@ -580,11 +471,7 @@ impl Project {
             .ok_or_else(|| anyhow::anyhow!("Chunk size overflow"))?;
         ensure!(size <= 32 * 1024 * 1024, "Chunk exceeds format budget");
         let mut f = File::open(self.path(&scan.points_file)?)?;
-        let stored = if c.codec == BlockCodec::Raw && c.stored_bytes == 0 {
-            size
-        } else {
-            c.stored_bytes as usize
-        };
+        let stored = c.stored_bytes as usize;
         ensure!(
             c.offset
                 .checked_add(stored as u64)
@@ -602,11 +489,7 @@ impl Project {
         ensure!(n.lod_count <= 65_536, "LOD exceeds format budget");
         let mut f = File::open(self.path(&scan.lod_file)?)?;
         let expected = n.lod_count as usize * SAMPLE_BYTES;
-        let stored = if n.lod_codec == BlockCodec::Raw && n.lod_bytes == 0 {
-            expected
-        } else {
-            n.lod_bytes as usize
-        };
+        let stored = n.lod_bytes as usize;
         ensure!(
             n.lod_offset
                 .checked_add(stored as u64)

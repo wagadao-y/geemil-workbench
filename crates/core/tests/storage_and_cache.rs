@@ -1,12 +1,8 @@
 use geemil_core::{
-    BlockCodec, Camera, ImportOptions, JobControl, Pose, Project, Selection, SelectionMode, Stage,
-    ViewCache, interchange,
+    Camera, ImportOptions, JobControl, Pose, Project, Selection, SelectionMode, Stage, ViewCache,
+    interchange,
 };
-use std::{
-    fs::File,
-    io::Write,
-    sync::{Arc, atomic::Ordering},
-};
+use std::sync::{Arc, atomic::Ordering};
 
 fn fixture(root: &std::path::Path) -> Project {
     let input = root.join("demo.e57");
@@ -134,134 +130,6 @@ fn parallel_import_handles_coincident_points_with_more_than_eight_children() {
     assert_same_storage(&one, &many);
 }
 
-/// Build the exact version-1 disk layout so compatibility is tested independently
-/// of the new compressor. References/order are those of the imported project.
-fn make_legacy(p: &mut Project) {
-    for i in 0..p.manifest.scans.len() {
-        let source = p.manifest.scans[i].clone();
-        let mut raw = source.clone();
-        raw.points_file += ".raw";
-        raw.lod_file += ".raw";
-        let mut file = File::create(p.path(&raw.points_file).unwrap()).unwrap();
-        let mut offset = 0;
-        for (chunk, meta) in raw.chunks.iter_mut().enumerate() {
-            let data = p.read_chunk(&source, chunk as u32).unwrap();
-            meta.offset = offset;
-            meta.codec = BlockCodec::Raw;
-            meta.stored_bytes = 0;
-            file.write_all(&data).unwrap();
-            offset += data.len() as u64;
-        }
-        drop(file);
-        let mut file = File::create(p.path(&raw.lod_file).unwrap()).unwrap();
-        offset = 0;
-        for (node, meta) in raw.nodes.iter_mut().enumerate() {
-            meta.lod_offset = offset;
-            meta.lod_codec = BlockCodec::Raw;
-            meta.lod_bytes = 0;
-            for sample in p.read_lod(&source, node as u32).unwrap() {
-                file.write_all(&sample.chunk.to_le_bytes()).unwrap();
-                file.write_all(&sample.index.to_le_bytes()).unwrap();
-                for x in sample.position {
-                    file.write_all(&x.to_le_bytes()).unwrap();
-                }
-                file.write_all(&sample.color).unwrap();
-                offset += 36;
-            }
-        }
-        p.manifest.scans[i] = raw;
-    }
-    p.manifest.format_version = 1;
-    p.save().unwrap();
-    // Version 1 had no codec/length fields at all.
-    let path = p.root.join("project.json");
-    let mut json = serde_json::to_value(&p.manifest).unwrap();
-    for scan in json["scans"].as_array_mut().unwrap() {
-        for chunk in scan["chunks"].as_array_mut().unwrap() {
-            let map = chunk.as_object_mut().unwrap();
-            map.remove("codec");
-            map.remove("stored_bytes");
-        }
-        for node in scan["nodes"].as_array_mut().unwrap() {
-            let map = node.as_object_mut().unwrap();
-            map.remove("lod_codec");
-            map.remove("lod_bytes");
-        }
-    }
-    serde_json::to_writer(File::create(path).unwrap(), &json).unwrap();
-    *p = Project::load(&p.root).unwrap();
-}
-
-#[test]
-fn legacy_conversion_preserves_references_revisions_and_masks() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut p = fixture(dir.path());
-    let ids: Vec<_> = p.scans().map(|s| s.id).collect();
-    let bounds = p.bounds();
-    let camera = Camera {
-        target: bounds.center().to_array(),
-        distance: 20.,
-        ..Camera::default()
-    };
-    p.delete_selection(
-        &Selection {
-            camera,
-            polygon: vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
-            depth_meters: Some(0.1),
-            mode: SelectionMode::ExcludeInside,
-        },
-        &ids,
-        &JobControl::default(),
-    )
-    .unwrap();
-    make_legacy(&mut p);
-    let before = p.manifest.clone();
-    let scan = p.scans().next().unwrap().clone();
-    let bytes = p.read_chunk(&scan, 0).unwrap();
-    let mask = p.exclusion_mask(&scan, 0).unwrap();
-    p.compress_storage(&JobControl::default()).unwrap();
-    let reopened = Project::load(&p.root).unwrap();
-    assert_eq!(
-        reopened.manifest.format_version,
-        geemil_core::FORMAT_VERSION
-    );
-    assert_eq!(reopened.manifest.current, before.current);
-    assert_eq!(reopened.manifest.revisions.len(), before.revisions.len());
-    let new_scan = reopened.scans().next().unwrap();
-    assert_eq!(new_scan.id, scan.id);
-    assert_eq!(reopened.read_chunk(new_scan, 0).unwrap(), bytes);
-    assert_eq!(reopened.exclusion_mask(new_scan, 0).unwrap(), mask);
-    assert_eq!(new_scan.chunks[0].codec, BlockCodec::ZstdShuffle);
-    assert!(new_scan.chunks[0].stored_bytes < bytes.len() as u32);
-    assert!(!p.path(&scan.points_file).unwrap().exists());
-    let path = new_scan.points_file.clone();
-    p.compress_storage(&JobControl::default()).unwrap();
-    assert_eq!(p.scans().next().unwrap().points_file, path);
-}
-
-#[test]
-fn cancelled_conversion_keeps_legacy_assets_and_manifest() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut p = fixture(dir.path());
-    make_legacy(&mut p);
-    let original = serde_json::to_value(&p.manifest).unwrap();
-    let mut job = JobControl::default();
-    let cancel = job.cancel.clone();
-    job.progress = Arc::new(move |stage, _, _| {
-        if stage == Stage::CompressingLod {
-            cancel.store(true, Ordering::Relaxed);
-        }
-    });
-    assert!(p.compress_storage(&job).is_err());
-    let reopened = Project::load(&p.root).unwrap();
-    assert_eq!(serde_json::to_value(&reopened.manifest).unwrap(), original);
-    assert!(
-        reopened
-            .read_chunk(reopened.scans().next().unwrap(), 0)
-            .is_ok()
-    );
-}
-
 #[test]
 fn camera_reuses_cache_and_revision_changes_invalidate_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -313,7 +181,8 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
     for (a, b) in a.iter().zip(moved) {
         assert!((a.position[0] + 0.25 - b.position[0]).abs() < 1e-12);
     }
-    p.delete_selection(
+    let target = p.layer_named("Deleted");
+    p.move_selection(
         &Selection {
             camera,
             polygon: vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
@@ -321,6 +190,7 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
             mode: SelectionMode::ExcludeInside,
         },
         &[id],
+        &target,
         &JobControl::default(),
     )
     .unwrap();

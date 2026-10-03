@@ -1,12 +1,12 @@
-//! LAS/LAZ output of the current state: excluded points are left out and
+//! LAS/LAZ output of the current state: points in hidden layers are left out and
 //! coordinates are in the common project frame, with all transforms applied.
 //!
 //! Without a coordinate system the files are LAS 1.2 (point format 2 with
 //! colour, 0 without) for the widest compatibility. A WKT coordinate system
 //! needs LAS 1.4 (formats 7 and 6). Intensity and colour come from the original
 //! attributes, rescaled from their E57 ranges to 16 bits.
-use crate::edit::is_excluded;
 use crate::interchange::decode;
+use crate::layers::is_set;
 use crate::storage::{point_color, position, valid};
 use crate::{CoreError, JobControl, Project, Scan, Stage};
 use anyhow::{Context, Result, ensure};
@@ -280,12 +280,12 @@ impl Project {
                 job.report(Stage::WritingLas, done, total);
                 done += 1;
                 let data = self.read_chunk(scan, chunk)?;
-                let mask = self.exclusion_mask(scan, chunk)?;
+                let hidden = self.hidden_mask(scan, chunk)?;
                 for (i, record) in data.chunks_exact(scan.stride).enumerate() {
                     if i % 8192 == 0 {
                         job.check()?;
                     }
-                    if !valid(record) || is_excluded(&mask, i) {
+                    if !valid(record) || is_set(&hidden, i) {
                         continue;
                     }
                     let p = world.transform_point3(DVec3::from(position(record)));

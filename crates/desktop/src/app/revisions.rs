@@ -7,7 +7,7 @@ use super::{
 use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
-use geemil_core::{Layer, LayerKind, Project, Revision};
+use geemil_core::{Project, Revision};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -135,36 +135,12 @@ fn paint_graph(
     }
 }
 
-/// A revision's title: the user's name, or for revisions from versions that
-/// committed every edit, a label from the recorded operation.
-pub(super) fn revision_title(t: &Strings, p: &Project, r: &Revision) -> String {
-    let op = &r.operation;
-    let text = |key| op.get(key).and_then(|v| v.as_str());
-    let id = |key| text(key).and_then(|s| Uuid::parse_str(s).ok());
-    let layer = |id: Uuid| p.manifest.layers.iter().find(|l| l.id == id);
-    let legacy = match text("kind") {
-        Some("edits") => None,
-        Some("create") => Some(t.revision_created.into()),
-        Some("import") => text("file").map(t.revision_import),
-        Some("selection") => r.layers.last().and_then(|id| layer(*id)).map(|l| {
-            let crop = op["selection"]["mode"] == "exclude_outside";
-            let label = if crop {
-                t.revision_crop
-            } else {
-                t.revision_exclude
-            };
-            label(&t.count(l.excluded))
-        }),
-        Some("layer") => id("id").and_then(layer).map(|l| {
-            let enabled = op.get("enabled").and_then(|v| v.as_bool());
-            (t.revision_layer)(&layer_label(t, l), enabled.unwrap_or(true))
-        }),
-        Some("transform") => id("scan")
-            .and_then(|id| p.manifest.scans.iter().find(|s| s.id == id))
-            .map(|s| (t.revision_transform)(&s.name)),
-        _ => None,
-    };
-    legacy.unwrap_or_else(|| r.name.clone())
+/// A revision's title: the user's name; the first revision's is translated.
+pub(super) fn revision_title(t: &Strings, r: &Revision) -> String {
+    match r.operation.get("kind").and_then(|k| k.as_str()) {
+        Some("create") => t.revision_created.into(),
+        _ => r.name.clone(),
+    }
 }
 
 /// Counts of the edits a revision recorded, e.g. "取り込み ×1・除外 ×3".
@@ -198,26 +174,6 @@ pub(super) fn saved_time(r: &Revision) -> String {
                 .to_string()
         })
         .unwrap_or_default()
-}
-
-pub(super) fn layer_label(t: &Strings, layer: &Layer) -> String {
-    let points = t.count(layer.excluded);
-    match layer.kind {
-        LayerKind::Manual => (t.exclusion_layer)(&points),
-        LayerKind::Subsample { size, merged } => {
-            (t.subsample_layer)(&size.to_string(), merged, &points)
-        }
-        LayerKind::Noise {
-            radius,
-            min_neighbours,
-        } => (t.noise_layer)(&radius.to_string(), min_neighbours, &points),
-        LayerKind::Box { inside: true } => (t.box_inside_layer)(&points),
-        LayerKind::Box { inside: false } => (t.box_outside_layer)(&points),
-        LayerKind::Statistical {
-            neighbours,
-            deviations,
-        } => (t.outlier_layer)(neighbours, deviations, &points),
-    }
 }
 
 impl Workbench {
@@ -328,13 +284,7 @@ impl Workbench {
                                 push(&revision_summary(t, d), 11., weak, false, false);
                             }
                             (false, Some(r), _) => {
-                                push(
-                                    &revision_title(t, &project, r),
-                                    14.,
-                                    text,
-                                    false,
-                                    r.id == current,
-                                );
+                                push(&revision_title(t, r), 14., text, false, r.id == current);
                                 if r.id == current {
                                     push(t.shown_revision, 11., text, false, true);
                                 }
@@ -381,9 +331,7 @@ impl Workbench {
                     && let Some(id) = selected
                 {
                     let r = project.manifest.revisions.iter().find(|r| r.id == id);
-                    let name = r
-                        .map(|r| revision_title(t, &project, r))
-                        .unwrap_or_default();
+                    let name = r.map(|r| revision_title(t, r)).unwrap_or_default();
                     state.renaming = Some((id, name));
                 }
                 let confirming = state.confirm_delete.is_some() && state.confirm_delete == selected;

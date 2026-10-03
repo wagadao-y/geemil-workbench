@@ -17,14 +17,15 @@ pub struct SmokeOptions {
     pub orbit: bool,
     /// Replace the view with fixed colour probes and check them in the capture.
     pub colors: bool,
-    /// Select the centre of the view after one second and preview this exclusion
-    /// (mode, whether an inside exclusion limits its depth).
+    /// Select the centre of the view after one second and preview this move
+    /// (mode, whether an inside selection limits its depth).
     pub select: Option<(SelectionMode, bool)>,
     /// Open this dialog for the capture: revisions, shortcuts, new-project,
     /// cleanup, save-as, subsample, noise or export-las. Also selects the first folder of the tree.
     pub dialog: Option<String>,
     /// Steps run one by one once the view loaded, each followed by a state
-    /// line: exclude, undo, redo, save, folder (new folder with the first scan),
+    /// line: exclude (move the selection to the "deleted" layer), undo, redo,
+    /// save, folder (new folder with the first scan),
     /// remove (take out the first scan), measure (measure two picked points),
     /// preview (edit the first scan's transform without applying it),
     /// apply-transform (apply the edited transform), subsample (5 cm voxels),
@@ -33,8 +34,9 @@ pub struct SmokeOptions {
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
     /// align-apply (apply the previewed result), ortho (parallel projection,
     /// top view), box (a 2 m slice at the median height, display clipped),
-    /// box-crop (exclude everything outside that box), color-height and
-    /// color-scan (colour modes).
+    /// box-crop (move everything outside that box to the "deleted" layer),
+    /// show-layers (show every layer), restore (move every point of the newest
+    /// layer back to the default one), color-height and color-scan (colour modes).
     pub script: Vec<String>,
 }
 
@@ -136,14 +138,20 @@ impl Workbench {
                     per_scan: false,
                     laz: true,
                 }),
-                "subsample" => Some(Dialog::Filter(super::dialogs::Filter::Subsample {
-                    size: self.settings.subsample_size,
-                    merged: self.settings.subsample_merged,
-                })),
-                "noise" => Some(Dialog::Filter(super::dialogs::Filter::Noise {
-                    radius: self.settings.noise_radius,
-                    min_neighbours: self.settings.noise_neighbours,
-                })),
+                "subsample" => Some(Dialog::Filter(
+                    super::dialogs::Filter::Subsample {
+                        size: self.settings.subsample_size,
+                        merged: self.settings.subsample_merged,
+                    },
+                    None,
+                )),
+                "noise" => Some(Dialog::Filter(
+                    super::dialogs::Filter::Noise {
+                        radius: self.settings.noise_radius,
+                        min_neighbours: self.settings.noise_neighbours,
+                    },
+                    None,
+                )),
                 "save-as" => Some(Dialog::SaveAs {
                     name: "リビジョン 2".into(),
                 }),
@@ -234,11 +242,16 @@ impl Workbench {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
-        // Without a project the start screen is the subject.
+        // Without a project the start screen is the subject, without scans the
+        // empty-project hint.
+        let empty = self
+            .project
+            .as_ref()
+            .is_none_or(|p| p.scans().next().is_none());
         if !smoke.requested
             && smoke.script.is_empty()
             && self.job.is_none()
-            && (!self.points.is_empty() || self.project.is_none())
+            && (!self.points.is_empty() || empty)
             && smoke.started.elapsed() > Duration::from_secs(3)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -334,6 +347,7 @@ impl Workbench {
                     size: 0.05,
                     merged: false,
                 },
+                None,
             ),
             "subsample-merged" => self.run_filter(
                 ctx,
@@ -341,6 +355,7 @@ impl Workbench {
                     size: 0.05,
                     merged: true,
                 },
+                None,
             ),
             "noise" => self.run_filter(
                 ctx,
@@ -348,6 +363,7 @@ impl Workbench {
                     radius: 0.1,
                     min_neighbours: 4,
                 },
+                None,
             ),
             "ortho" => {
                 self.perform(ctx, Action::ToggleOrtho);
@@ -383,7 +399,30 @@ impl Workbench {
                     deviations: 1.,
                     reach: 0.5,
                 },
+                None,
             ),
+            "restore" => {
+                // Every point of the newest layer back to the default one.
+                let newest = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.current().layers.iter().map(|l| l.code).max())
+                    .filter(|code| *code != geemil_core::DEFAULT_LAYER);
+                if let Some(from) = newest {
+                    let to = geemil_core::DEFAULT_LAYER;
+                    self.layer_action(ctx, super::layers::LayerAction::MoveAll { from, to });
+                }
+            }
+            "show-layers" => {
+                let codes: Vec<_> = self
+                    .project
+                    .as_ref()
+                    .map(|p| p.current().layers.iter().map(|l| l.code).collect())
+                    .unwrap_or_default();
+                for code in codes {
+                    self.apply_edit(|p| p.set_layer_visible(code, true));
+                }
+            }
             "apply-transform" => {
                 if let Some((id, pose)) = self.transform_preview() {
                     self.apply_edit(|p| p.set_transform(id, pose));
@@ -393,10 +432,10 @@ impl Workbench {
         }
         if let Some(p) = &self.project {
             eprintln!(
-                "Smoke step {step}: scans {}, folders {}, layers {}, revisions {}, unsaved {}, undo {}, redo {}, job {}, measure {:?}",
+                "Smoke step {step}: scans {}, folders {}, layers {:?}, revisions {}, unsaved {}, undo {}, redo {}, job {}, measure {:?}",
                 p.scans().count(),
                 p.groups().len(),
-                p.current().layers.len(),
+                p.layer_counts(),
                 p.manifest.revisions.len(),
                 p.has_unsaved_changes(),
                 self.undo_available(),

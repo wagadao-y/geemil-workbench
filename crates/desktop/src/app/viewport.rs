@@ -1,5 +1,6 @@
 use super::ColorMode;
 use super::Workbench;
+use super::actions::Action;
 use crate::render::{DrawOptions, Edl};
 use eframe::egui;
 use glam::DVec3;
@@ -61,6 +62,36 @@ impl Workbench {
             self.draw_align(ui, response.rect);
             self.draw_box(ui, response.rect);
             self.draw_pivot(ui, &response);
+            self.empty_hint(ui, response.rect);
         });
+    }
+    /// Tells how to add points while the project has none.
+    fn empty_hint(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let empty = self
+            .project
+            .as_ref()
+            .is_some_and(|p| p.scans().next().is_none());
+        if !empty || self.job.is_some() {
+            return;
+        }
+        let t = self.t;
+        let action = Action::Import;
+        let mut clicked = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space((rect.height() * 0.35).max(16.));
+                ui.label(egui::RichText::new(t.empty_project).size(15.));
+                ui.add_space(12.);
+                let text = egui::RichText::new(format!("{}  {}", action.icon(), action.label(t)))
+                    .size(16.);
+                clicked = ui
+                    .add(egui::Button::new(text).min_size(egui::vec2(220., 44.)))
+                    .clicked();
+            });
+        });
+        if clicked {
+            let ctx = ui.ctx().clone();
+            self.perform(&ctx, action);
+        }
     }
 }

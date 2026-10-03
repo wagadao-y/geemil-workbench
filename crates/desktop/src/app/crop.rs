@@ -1,7 +1,11 @@
 //! The 3D box tool: a box turned about the vertical axis that can limit the
-//! display to its inside (a live section) and exclude the points inside or
-//! outside it, judged on original points like other exclusions.
-use super::{Workbench, selection::Tool};
+//! display to its inside (a live section) and move the points inside or
+//! outside it to another layer, judged on original points like selections.
+use super::{
+    Workbench,
+    layers::{destination, destination_combo},
+    selection::Tool,
+};
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::CropBox;
@@ -15,6 +19,8 @@ pub(super) struct Crop {
     pub(super) region: Option<CropBox>,
     /// Draw only what is inside the box.
     pub(super) clip: bool,
+    /// The layer moves go to; none for the "deleted" layer.
+    destination: Option<u8>,
 }
 
 impl Workbench {
@@ -105,6 +111,18 @@ impl Workbench {
                 }
                 ui.separator();
                 ui.small((t.filter_targets)(self.visible.len()));
+                if let Some(p) = &self.project {
+                    ui.horizontal(|ui| {
+                        destination_combo(
+                            ui,
+                            t,
+                            p,
+                            "box destination",
+                            t.layer_deleted,
+                            &mut self.crop.destination,
+                        );
+                    });
+                }
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
@@ -122,7 +140,11 @@ impl Workbench {
                     if ui
                         .add_enabled(
                             idle,
-                            egui::Button::new(format!("{} {}", icon::ERASER, t.box_exclude_inside)),
+                            egui::Button::new(format!(
+                                "{} {}",
+                                icon::ARROW_BEND_DOWN_RIGHT,
+                                t.box_exclude_inside
+                            )),
                         )
                         .clicked()
                     {
@@ -135,10 +157,11 @@ impl Workbench {
         let (Some(region), Some(p)) = (self.crop.region, &self.project) else {
             return;
         };
+        let target = destination(p, self.crop.destination, self.t.layer_deleted);
         let mut project = (**p).clone();
         let ids: Vec<_> = self.visible.iter().copied().collect();
         self.start(ctx, true, move |job| {
-            project.exclude_box(&region, inside, &ids, &job)?;
+            project.move_box(&region, inside, &ids, &target, &job)?;
             Ok(project)
         });
     }
