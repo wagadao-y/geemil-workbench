@@ -39,6 +39,7 @@ pub(super) enum Action {
     FitView,
     View(ViewPreset),
     ToggleEdl,
+    ToggleOrtho,
     Save,
     SaveAs,
     Revisions,
@@ -71,6 +72,7 @@ impl Action {
             Self::View(ViewPreset::Side) => icon::ARROW_RIGHT,
             Self::View(ViewPreset::Iso) => icon::CUBE,
             Self::ToggleEdl => icon::CIRCLE_HALF,
+            Self::ToggleOrtho => icon::PERSPECTIVE,
             Self::Save => icon::FLOPPY_DISK,
             Self::SaveAs => icon::FLOPPY_DISK_BACK,
             Self::Revisions => icon::GIT_BRANCH,
@@ -108,6 +110,7 @@ impl Action {
             Self::View(ViewPreset::Side) => t.view_side.into(),
             Self::View(ViewPreset::Iso) => t.view_iso.into(),
             Self::ToggleEdl => t.edl.into(),
+            Self::ToggleOrtho => t.ortho.into(),
             Self::Save => t.save.into(),
             Self::SaveAs => t.save_as.into(),
             Self::Revisions => t.revisions.into(),
@@ -155,6 +158,7 @@ impl Action {
             Self::View(ViewPreset::Side) => Key::Num3,
             Self::View(ViewPreset::Iso) => Key::Num5,
             Self::ToggleEdl => Key::E,
+            Self::ToggleOrtho => Key::O,
             _ => return None,
         })
     }
@@ -187,6 +191,7 @@ const KEYED: &[Action] = &[
     Action::View(ViewPreset::Side),
     Action::View(ViewPreset::Iso),
     Action::ToggleEdl,
+    Action::ToggleOrtho,
 ];
 
 impl Workbench {
@@ -210,6 +215,7 @@ impl Workbench {
             Action::Quit
             | Action::ClearSelection
             | Action::ToggleEdl
+            | Action::ToggleOrtho
             | Action::Tool(_)
             | Action::Shortcuts
             | Action::About => true,
@@ -317,6 +323,11 @@ impl Workbench {
             Action::FitView => self.fit_view(),
             Action::View(preset) => self.view_preset(preset),
             Action::ToggleEdl => self.settings.edl = !self.settings.edl,
+            Action::ToggleOrtho => {
+                self.camera.ortho = !self.camera.ortho;
+                self.dirty = true;
+                self.selection.clear();
+            }
             Action::Save => {
                 let n = self
                     .project

@@ -30,7 +30,8 @@ pub struct SmokeOptions {
     /// apply-transform (apply the edited transform), subsample (5 cm voxels),
     /// noise (0.1 m radius, 4 neighbours), align-icp (ICP of the first scan
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
-    /// align-apply (apply the previewed result).
+    /// align-apply (apply the previewed result), ortho (parallel projection,
+    /// top view).
     pub script: Vec<String>,
 }
 
@@ -328,6 +329,10 @@ impl Workbench {
                     min_neighbours: 4,
                 },
             ),
+            "ortho" => {
+                self.perform(ctx, Action::ToggleOrtho);
+                self.perform(ctx, Action::View(super::actions::ViewPreset::Top));
+            }
             "align-icp" => self.smoke_icp(ctx),
             "align-pairs" => {
                 self.smoke_pairs();

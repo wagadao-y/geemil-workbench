@@ -81,6 +81,7 @@ impl Workbench {
                         self.menu_item(ui, Action::View(preset), &mut chosen);
                     }
                     ui.separator();
+                    self.menu_item(ui, Action::ToggleOrtho, &mut chosen);
                     self.menu_item(ui, Action::ToggleEdl, &mut chosen);
                     ui.add_enabled(
                         self.settings.edl,
@@ -166,6 +167,8 @@ impl Workbench {
                 ] {
                     self.tool_button(ui, Action::View(preset), false, &mut chosen);
                 }
+                let ortho = self.camera.ortho;
+                self.tool_button(ui, Action::ToggleOrtho, ortho, &mut chosen);
                 let edl = self.settings.edl;
                 self.tool_button(ui, Action::ToggleEdl, edl, &mut chosen);
                 ui.separator();

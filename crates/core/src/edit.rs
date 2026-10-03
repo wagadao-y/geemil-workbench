@@ -36,6 +36,10 @@ pub struct Camera {
     pub distance: f64,
     pub aspect: f64,
     pub fov: f64,
+    /// Parallel projection. The visible height then stays what perspective
+    /// shows at `target`, so `distance` still zooms.
+    #[serde(default)]
+    pub ortho: bool,
 }
 impl Default for Camera {
     fn default() -> Self {
@@ -46,6 +50,7 @@ impl Default for Camera {
             distance: 10.,
             aspect: 1.,
             fov: std::f64::consts::FRAC_PI_4,
+            ortho: false,
         }
     }
 }
@@ -62,17 +67,43 @@ impl Camera {
         self.relative_matrix() * DMat4::from_translation(-DVec3::from(self.target))
     }
     pub fn relative_matrix(&self) -> DMat4 {
-        // Right-handed with a 0..1 depth range, as wgpu expects.
-        glam::dcamera::rh::proj::directx::perspective(
-            self.fov,
-            self.aspect,
-            (self.distance * 1e-5).max(0.0001),
-            (self.distance * 1000.).max(100.),
-        ) * glam::dcamera::rh::view::look_at_mat4(
+        self.projection() * self.relative_view()
+    }
+    /// Right-handed with a 0..1 depth range, as wgpu expects.
+    fn projection(&self) -> DMat4 {
+        if self.ortho {
+            let h = self.half_height();
+            let w = h * self.aspect;
+            // Parallel rays see behind the eye too, so the near plane is there.
+            let reach = (self.distance * 1000.).max(100.);
+            glam::dcamera::rh::proj::directx::orthographic(-w, w, -h, h, -reach, reach)
+        } else {
+            glam::dcamera::rh::proj::directx::perspective(
+                self.fov,
+                self.aspect,
+                (self.distance * 1e-5).max(0.0001),
+                (self.distance * 1000.).max(100.),
+            )
+        }
+    }
+    /// Half the visible height at `target`, in metres.
+    pub fn half_height(&self) -> f64 {
+        self.distance * (self.fov * 0.5).tan()
+    }
+    /// The view transform for coordinates relative to `target`.
+    fn relative_view(&self) -> DMat4 {
+        glam::dcamera::rh::view::look_at_mat4(
             self.eye() - DVec3::from(self.target),
             DVec3::ZERO,
             DVec3::Z,
         )
+    }
+    /// Coefficients giving the view depth (distance in front of the eye along
+    /// the view axis) of a world point `p` as `row.dot(p.extend(1))`. Behind
+    /// the eye it is negative, which only a parallel projection shows.
+    pub fn depth_row(&self) -> DVec4 {
+        let view = self.relative_view() * DMat4::from_translation(-DVec3::from(self.target));
+        -view.row(2)
     }
     /// Projects to normalized viewport coordinates (origin top left) and view depth.
     pub fn project(&self, p: DVec3) -> Option<([f64; 2], f64)> {
@@ -82,10 +113,18 @@ impl Camera {
     pub fn projector(&self) -> Projector {
         Projector {
             matrix: self.matrix(),
+            depth: self.depth_row(),
         }
     }
     /// The same eye position, looking at and orbiting around `target`.
     pub fn looking_at(&self, target: DVec3) -> Self {
+        // In parallel projection the distance is the zoom; keep it.
+        if self.ortho {
+            return Self {
+                target: target.to_array(),
+                ..*self
+            };
+        }
         let offset = self.eye() - target;
         let distance = offset.length();
         if distance <= f64::EPSILON {
@@ -119,15 +158,21 @@ impl Camera {
 }
 pub struct Projector {
     matrix: DMat4,
+    depth: DVec4,
 }
 impl Projector {
+    /// Normalized viewport coordinates and view depth (see `Camera::depth_row`)
+    /// of a point within the view volume.
     pub fn project(&self, p: DVec3) -> Option<([f64; 2], f64)> {
         let clip = self.matrix * p.extend(1.);
         if clip.w <= 0. || clip.z < 0. || clip.z > clip.w {
             return None;
         }
         let ndc = clip.truncate() / clip.w;
-        Some(([(ndc.x + 1.) * 0.5, (1. - ndc.y) * 0.5], clip.w))
+        Some((
+            [(ndc.x + 1.) * 0.5, (1. - ndc.y) * 0.5],
+            self.depth.dot(p.extend(1.)),
+        ))
     }
 }
 /// Which side of the selection a manual exclusion removes.
@@ -172,6 +217,8 @@ impl Selection {
             mode: self.mode,
             depth: self.depth_meters,
             matrix: self.camera.matrix(),
+            depth_row: self.camera.depth_row(),
+            ortho: self.camera.ortho,
             projector: self.camera.projector(),
             min,
             max,
@@ -183,6 +230,8 @@ pub struct PreparedSelection<'a> {
     mode: SelectionMode,
     depth: Option<f64>,
     matrix: DMat4,
+    depth_row: DVec4,
+    ortho: bool,
     projector: Projector,
     /// Polygon bounding box in normalized viewport coordinates.
     min: [f64; 2],
@@ -194,8 +243,9 @@ impl PreparedSelection<'_> {
         let (uv, depth) = self.projector.project(p)?;
         self.inside_polygon(uv).then_some(depth)
     }
-    /// Whether `p` is in front of the camera and seen through the polygon,
-    /// without the near and far planes that limit `contains`.
+    /// Whether `p` is seen through the polygon, without the near and far
+    /// planes that limit `contains`: in front of the eye in perspective, at any
+    /// depth in parallel projection (where w is always 1).
     pub fn covers(&self, p: DVec3) -> bool {
         let clip = self.matrix * p.extend(1.);
         if clip.w <= 0. {
@@ -252,17 +302,24 @@ impl PreparedSelection<'_> {
             max: (DVec3::from(bounds.max) + margin).to_array(),
         };
         let m = self.matrix * world;
-        let corners: Vec<_> = padded.corners().map(|p| m * p.extend(1.)).collect();
+        let depth_row = world.transpose() * self.depth_row;
+        let corners: Vec<_> = padded
+            .corners()
+            .map(|p| (m * p.extend(1.), depth_row.dot(p.extend(1.))))
+            .collect();
         // Viewport u = (x/w + 1) / 2 and v = (1 - y/w) / 2, so for w > 0 the
         // polygon box is k_min*w <= x <= k_max*w and l_min*w <= y <= l_max*w.
         let x = [2. * self.min[0] - 1., 2. * self.max[0] - 1.];
         let y = [1. - 2. * self.max[1], 1. - 2. * self.min[1]];
-        let outside = |test: &dyn Fn(DVec4) -> bool| corners.iter().all(|c| test(*c));
+        let outside = |test: &dyn Fn(DVec4) -> bool| corners.iter().all(|(c, _)| test(*c));
         let beyond_depth = depth.is_some_and(|max_depth| {
-            outside(&|c| c.z < 0.) || outside(&|c| c.z > c.w) || outside(&|c| c.w > max_depth)
+            outside(&|c| c.z < 0.)
+                || outside(&|c| c.z > c.w)
+                || corners.iter().all(|(_, d)| *d > max_depth)
         });
+        // In parallel projection w is 1 everywhere.
         !(beyond_depth
-            || outside(&|c| c.w <= 0.)
+            || (!self.ortho && outside(&|c| c.w <= 0.))
             || outside(&|c| c.x < x[0] * c.w)
             || outside(&|c| c.x > x[1] * c.w)
             || outside(&|c| c.y < y[0] * c.w)
@@ -619,7 +676,14 @@ impl Project {
         let score = |si: usize, ni: u32| {
             let node = &scans[si].nodes[ni as usize];
             let center = worlds[si].transform_point3(node.bounds.center());
-            let score = node.bounds.radius() / eye.distance(center).max(0.0001);
+            // On screen, a node's size goes with its distance in perspective and
+            // with the fixed visible height in parallel projection.
+            let distance = if camera.ortho {
+                camera.distance
+            } else {
+                eye.distance(center)
+            };
+            let score = node.bounds.radius() / distance.max(0.0001);
             (!node.children.is_empty() && score > 0.015).then_some((score.to_bits(), si, ni))
         };
         let mut cut = BTreeSet::new();
@@ -746,7 +810,53 @@ mod tests {
     }
 
     #[test]
+    fn parallel_projection_keeps_size_and_sees_behind_the_eye() {
+        let camera = Camera {
+            target: [10., 20., 5.],
+            yaw: 0.3,
+            pitch: 0.4,
+            distance: 30.,
+            aspect: 1.5,
+            ortho: true,
+            ..Camera::default()
+        };
+        let target = DVec3::from(camera.target);
+        let toward_eye = (camera.eye() - target).normalize();
+        // Points along the view axis land on the centre, whatever their depth,
+        // with depth measured from the eye.
+        for t in [-100., 0., 29., 45.] {
+            let (uv, depth) = camera.project(target + toward_eye * t).unwrap();
+            assert!((uv[0] - 0.5).abs() < 1e-9 && (uv[1] - 0.5).abs() < 1e-9);
+            assert!((depth - (camera.distance - t)).abs() < 1e-6);
+        }
+        // The visible height at any depth is what perspective shows at the target.
+        let up = toward_eye.cross(DVec3::Z).cross(toward_eye).normalize();
+        let perspective = Camera {
+            ortho: false,
+            ..camera
+        };
+        for t in [-50., 0., 20.] {
+            let p = target + toward_eye * t + up * camera.half_height() * 0.5;
+            let (uv, _) = camera.project(p).unwrap();
+            assert!((uv[1] - 0.25).abs() < 1e-9, "{uv:?}");
+        }
+        let (uv, _) = perspective
+            .project(target + up * camera.half_height() * 0.5)
+            .unwrap();
+        assert!((uv[1] - 0.25).abs() < 1e-9);
+        // Retargeting keeps the zoom.
+        let moved = camera.looking_at(DVec3::new(0., 0., 0.));
+        assert_eq!(moved.distance, camera.distance);
+    }
+
+    #[test]
     fn chunk_culling_never_skips_a_selectable_or_covered_point() {
+        for ortho in [false, true] {
+            culling_never_skips(ortho);
+        }
+    }
+
+    fn culling_never_skips(ortho: bool) {
         // Deterministic pseudo-random values in [0, 1).
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
@@ -762,6 +872,7 @@ mod tests {
                 pitch: 0.5,
                 distance: 12.,
                 aspect: 1.5,
+                ortho,
                 ..Camera::default()
             },
             polygon: vec![[0.42, 0.40], [0.61, 0.44], [0.55, 0.63], [0.40, 0.58]],

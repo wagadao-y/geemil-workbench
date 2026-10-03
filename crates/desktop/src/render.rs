@@ -29,6 +29,8 @@ struct Uniform {
     size: f32,
     padding: f32,
     tint: [f32; 4],
+    /// View depth of a vertex for EDL as `dot(depth, (position, 1))`.
+    depth: [f32; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -284,18 +286,28 @@ impl PointRenderer {
         // Vertices are relative to `origin`; compose in f64 so large
         // coordinates keep their precision before narrowing to f32.
         let view = camera.relative_matrix() * DMat4::from_translation(-DVec3::from(camera.target));
+        // Parallel projection sees behind the eye; measure EDL depth from a
+        // plane as far behind the eye as the target is in front, so it stays
+        // positive and EDL shades like perspective does at the target.
+        let mut depth_row = camera.depth_row();
+        if camera.ortho {
+            depth_row.w += camera.distance;
+        }
         let mut uniforms = vec![0u8; segments.len() * self.uniform_stride as usize];
         for ((_, segment), slot) in segments
             .iter()
             .zip(uniforms.chunks_mut(self.uniform_stride as usize))
         {
-            let matrix = view * segment.motion * DMat4::from_translation(self.origin);
+            let to_world = segment.motion * DMat4::from_translation(self.origin);
+            let matrix = view * to_world;
+            let depth = to_world.transpose() * depth_row;
             let uniform = Uniform {
                 matrix: matrix.as_mat4().to_cols_array_2d(),
                 viewport: [size[0] as f32, size[1] as f32],
                 size: point_size,
                 padding: 0.,
                 tint: segment.tint,
+                depth: depth.as_vec4().to_array(),
             };
             slot[..UNIFORM_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&uniform));
         }

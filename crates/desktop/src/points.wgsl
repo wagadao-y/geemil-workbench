@@ -1,4 +1,4 @@
-struct Camera { matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, padding: f32, tint: vec4<f32> };
+struct Camera { matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, padding: f32, tint: vec4<f32>, depth: vec4<f32> };
 @group(0) @binding(0) var<uniform> camera: Camera;
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -14,8 +14,9 @@ struct Out {
     out.corner = corners[id];
     // Mix the tint in sRGB, like the colours it replaces.
     out.color = vec4(mix(color.rgb, camera.tint.rgb, camera.tint.a), color.a);
-    // View-space distance along the camera axis; screen-aligned splats keep it constant.
-    out.depth = out.position.w;
+    // View-space distance along the camera axis; screen-aligned splats keep it
+    // constant. 0 marks background, so keep drawn points above it.
+    out.depth = max(dot(camera.depth, vec4(position, 1.0)), 1e-6);
     return out;
 }
 fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
