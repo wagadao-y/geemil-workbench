@@ -41,7 +41,7 @@ impl Workbench {
             let mut project = (**p).clone();
             let name = self.branch_name.clone();
             self.start(ctx, move |_| {
-                project.fork(name)?;
+                project.save_revision(name)?;
                 Ok(project)
             });
         }

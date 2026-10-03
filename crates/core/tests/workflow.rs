@@ -5,6 +5,15 @@ use geemil_core::{
 use glam::DVec3;
 use std::{collections::BTreeMap, fs::File, io::BufReader, sync::atomic::Ordering};
 
+/// The latest edit recorded in the working state.
+fn last_operation(project: &Project) -> serde_json::Value {
+    project.current().operation["operations"]
+        .as_array()
+        .and_then(|ops| ops.last())
+        .cloned()
+        .unwrap()
+}
+
 fn records(path: &std::path::Path) -> Vec<BTreeMap<(i64, i64), Vec<e57::RecordValue>>> {
     let mut reader = e57::E57Reader::from_file(path).unwrap();
     reader
@@ -133,7 +142,7 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
             &JobControl::default(),
         )
         .unwrap();
-    let base = project.manifest.current;
+    let base = project.save_revision("Imported".into()).unwrap();
     let ids: Vec<_> = project.scans().map(|s| s.id).collect();
     let bounds = project.bounds();
     let camera = Camera {
@@ -171,7 +180,10 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
         .unwrap();
     assert_eq!(count, expected);
     assert!(count > 0 && count < 32768);
-    let branch_a = project.manifest.current;
+    // Edits stay in the working state until saved.
+    assert!(project.has_unsaved_changes());
+    assert_eq!(project.manifest.current, base);
+    let branch_a = project.save_revision("A".into()).unwrap();
     let output = dir.path().join("deleted.e57");
     project.export_e57(&output, &JobControl::default()).unwrap();
     let reader = e57::E57Reader::from_file(&output).unwrap();
@@ -179,11 +191,25 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
         reader.pointclouds().iter().map(|p| p.records).sum::<u64>(),
         32768 - count
     );
+    // Saving from an older revision starts a branch.
     project.switch(base).unwrap();
-    project.fork("Alternative".into()).unwrap();
     assert!(project.current().layers.is_empty());
-    let branch_b = project.manifest.current;
+    let first = project.scans().next().unwrap().id;
+    project
+        .set_transform(
+            first,
+            Pose {
+                translation: [1., 0., 0.],
+                ..Pose::default()
+            },
+        )
+        .unwrap();
+    let branch_b = project.save_revision("B".into()).unwrap();
     assert_ne!(branch_a, branch_b);
+    for id in [branch_a, branch_b] {
+        let r = project.manifest.revisions.iter().find(|r| r.id == id);
+        assert_eq!(r.unwrap().parent, Some(base));
+    }
     project.switch(branch_a).unwrap();
     assert_eq!(project.current().layers.len(), 1);
     let reloaded = Project::load(&project.root).unwrap();
@@ -213,6 +239,7 @@ fn cancellation_does_not_publish_an_import_revision() {
     let reopened = Project::load(&p.root).unwrap();
     assert_eq!(reopened.manifest.current, initial);
     assert!(reopened.manifest.scans.is_empty());
+    assert!(!reopened.has_unsaved_changes());
     assert!(job.cancel.load(Ordering::Relaxed));
 }
 
@@ -480,7 +507,7 @@ fn cropping_excludes_everything_outside_the_polygon_at_any_depth() {
     let excluded = project.delete_selection(&crop, &ids, &job).unwrap();
     assert_eq!(excluded, outside);
     // The recorded operation names the mode; older records default to inside.
-    let op = &project.current().operation;
+    let op = &last_operation(&project);
     assert_eq!(op["selection"]["mode"], "exclude_outside");
     assert!(op["nearest"].is_null());
     let mut legacy = op["selection"].clone();
@@ -518,7 +545,7 @@ fn selection_nearest_matches_the_recorded_exclusion() {
         .unwrap()
         .unwrap();
     assert!(project.delete_selection(&selection, &ids, &job).unwrap() > 0);
-    assert_eq!(project.current().operation["nearest"], nearest);
+    assert_eq!(last_operation(&project)["nearest"], nearest);
 }
 
 /// What the app previews: displayed samples judged with the exact nearest depth.
@@ -639,8 +666,8 @@ fn unlimited_inside_exclusion_is_the_complement_of_cropping() {
             project.delete_selection(&selection, &ids, &job).unwrap(),
             total,
         ));
-        assert!(project.current().operation["nearest"].is_null());
-        assert!(project.current().operation["selection"]["depth_meters"].is_null());
+        assert!(last_operation(&project)["nearest"].is_null());
+        assert!(last_operation(&project)["selection"]["depth_meters"].is_null());
     }
     let [(inside, total), (outside, _)] = counts[..] else {
         unreachable!()

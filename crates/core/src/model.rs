@@ -10,7 +10,8 @@ use std::{
 };
 use uuid::Uuid;
 
-pub const FORMAT_VERSION: u32 = 2;
+/// 3 adds the unsaved working state (`Manifest::draft`) and the scan tree.
+pub const FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Bounds {
@@ -168,15 +169,34 @@ pub struct Layer {
     pub masks: Vec<ChunkMask>,
     pub excluded: u64,
 }
+/// A folder in the scan tree. Its transform, kept in `Revision::transforms`
+/// under its id, moves everything below it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Group {
+    pub id: Uuid,
+    pub name: String,
+    pub parent: Option<Uuid>,
+}
+/// A project state: a saved revision, or the unsaved working state.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Revision {
     pub id: Uuid,
     pub parent: Option<Uuid>,
     pub name: String,
+    /// What led here; for saved revisions `{"kind":"edits","operations":[...]}`.
     pub operation: serde_json::Value,
     pub scans: Vec<Uuid>,
     pub layers: Vec<Uuid>,
+    /// Additional rigid transforms of scans and groups.
     pub transforms: BTreeMap<Uuid, Pose>,
+    #[serde(default)]
+    pub groups: Vec<Group>,
+    /// The folder of each scan in `groups`; absent scans are at the top level.
+    #[serde(default)]
+    pub scan_groups: BTreeMap<Uuid, Uuid>,
+    /// Unix seconds when the user saved this revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_at: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
@@ -186,7 +206,12 @@ pub struct Manifest {
     pub images: Vec<ImageInfo>,
     pub layers: Vec<Layer>,
     pub revisions: Vec<Revision>,
+    /// The saved revision the project shows, or the working state is based on.
     pub current: Uuid,
+    /// Unsaved working state on top of `current`. Edits change only this; saving
+    /// turns it into a revision. Kept on disk so a crash loses nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<Revision>,
 }
 #[derive(Clone, Debug)]
 pub struct Project {
@@ -217,8 +242,12 @@ impl Project {
                     scans: vec![],
                     layers: vec![],
                     transforms: BTreeMap::new(),
+                    groups: vec![],
+                    scan_groups: BTreeMap::new(),
+                    saved_at: Some(crate::history::now()),
                 }],
                 current: id,
+                draft: None,
             },
         };
         p.save()?;
@@ -241,6 +270,9 @@ impl Project {
             manifest.revisions.iter().any(|r| r.id == manifest.current),
             "Current revision is missing"
         );
+        for state in manifest.revisions.iter().chain(&manifest.draft) {
+            crate::history::validate_state(&manifest, state)?;
+        }
         let p = Self { root, manifest };
         for s in &p.manifest.scans {
             ensure!((32..=1_048_576).contains(&s.stride), "Invalid point stride");
@@ -275,67 +307,22 @@ impl Project {
         fs::rename(tmp, self.root.join("project.json"))?;
         Ok(())
     }
+    /// The state everything reads: the working state, else the current revision.
     pub fn current(&self) -> &Revision {
+        self.manifest.draft.as_ref().unwrap_or_else(|| self.base())
+    }
+    /// The saved revision the current state is, or is based on.
+    pub fn base(&self) -> &Revision {
         self.manifest
             .revisions
             .iter()
             .find(|r| r.id == self.manifest.current)
             .expect("validated revision")
     }
-    pub fn switch(&mut self, id: Uuid) -> Result<()> {
-        ensure!(
-            self.manifest.revisions.iter().any(|r| r.id == id),
-            "Revision does not exist"
-        );
-        let old = self.manifest.current;
-        self.manifest.current = id;
-        if let Err(e) = self.save() {
-            self.manifest.current = old;
-            return Err(e);
-        }
-        Ok(())
-    }
-    pub fn commit(
-        &mut self,
-        name: String,
-        operation: serde_json::Value,
-        layers: Vec<Uuid>,
-        transforms: BTreeMap<Uuid, Pose>,
-    ) -> Result<Uuid> {
-        let old = self.manifest.current;
-        let id = Uuid::new_v4();
-        let scans = self.current().scans.clone();
-        self.commit_snapshot(Revision {
-            id,
-            parent: Some(old),
-            name,
-            operation,
-            scans,
-            layers,
-            transforms,
-        })?;
-        Ok(id)
-    }
-    pub(crate) fn commit_snapshot(&mut self, revision: Revision) -> Result<Uuid> {
-        let old = self.manifest.current;
-        let id = revision.id;
-        self.manifest.revisions.push(revision);
-        self.manifest.current = id;
-        if let Err(e) = self.save() {
-            self.manifest.current = old;
-            self.manifest.revisions.pop();
-            return Err(e);
-        }
-        Ok(id)
-    }
+    /// Local scan coordinates to the common project frame: folder transforms
+    /// (outermost first), the scan's own additional transform, then its pose.
     pub fn world_matrix(&self, scan: &Scan) -> DMat4 {
-        self.current()
-            .transforms
-            .get(&scan.id)
-            .copied()
-            .unwrap_or_default()
-            .matrix()
-            * scan.original_pose.unwrap_or_default().matrix()
+        self.correction(scan.id) * scan.original_pose.unwrap_or_default().matrix()
     }
     pub fn bounds(&self) -> Bounds {
         let mut result: Option<Bounds> = None;

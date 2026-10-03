@@ -458,67 +458,51 @@ impl Project {
             masks,
             excluded: total,
         });
-        let mut layers = next.current().layers.clone();
-        layers.push(id);
-        let transforms = next.current().transforms.clone();
-        next.commit(format!("Exclude {total} points"),serde_json::json!({"kind":"selection","selection":selection,"scans":scan_ids,"nearest":nearest}),layers,transforms)?;
+        next.edit(
+            serde_json::json!({"kind": "selection", "selection": selection, "scans": scan_ids,
+                "nearest": nearest, "layer": id, "excluded": total}),
+            |s| {
+                s.layers.push(id);
+                Ok(())
+            },
+        )?;
         *self = next;
         Ok(total)
     }
+    /// Turns an exclusion layer on or off in the working state.
     pub fn set_layer_enabled(&mut self, id: Uuid, enabled: bool) -> Result<()> {
         ensure!(
             self.manifest.layers.iter().any(|l| l.id == id),
             "Missing layer"
         );
-        let mut layers = self.current().layers.clone();
-        layers.retain(|v| *v != id);
-        if enabled {
-            layers.push(id);
-        }
-        let transforms = self.current().transforms.clone();
-        self.commit(
-            if enabled {
-                "Enable layer"
-            } else {
-                "Disable layer"
-            }
-            .into(),
-            serde_json::json!({"kind":"layer","id":id,"enabled":enabled}),
-            layers,
-            transforms,
-        )?;
-        Ok(())
+        self.edit(
+            serde_json::json!({"kind": "layer", "id": id, "enabled": enabled}),
+            |s| {
+                s.layers.retain(|v| *v != id);
+                if enabled {
+                    s.layers.push(id);
+                }
+                Ok(())
+            },
+        )
     }
+    /// Sets the additional transform of a scan or folder, relative to its folder.
     pub fn set_transform(&mut self, id: Uuid, pose: Pose) -> Result<()> {
-        ensure!(self.current().scans.contains(&id), "Missing scan");
-        let mut transforms = self.current().transforms.clone();
-        transforms.insert(id, pose);
-        self.commit(
-            "Manual transform".into(),
-            serde_json::json!({"kind":"transform","scan":id,"pose":pose}),
-            self.current().layers.clone(),
-            transforms,
-        )?;
-        Ok(())
-    }
-    pub fn fork(&mut self, name: String) -> Result<()> {
-        self.commit(
-            name,
-            serde_json::json!({"kind":"fork"}),
-            self.current().layers.clone(),
-            self.current().transforms.clone(),
-        )?;
-        Ok(())
-    }
-    /// Keep other branches and layers; compact only the navigation ancestry of a new checkpoint.
-    pub fn checkpoint(&mut self, name: String) -> Result<()> {
-        let mut r = self.current().clone();
-        r.id = Uuid::new_v4();
-        r.parent = None;
-        r.name = name;
-        r.operation = serde_json::json!({"kind":"checkpoint","from":self.manifest.current});
-        self.commit_snapshot(r)?;
-        Ok(())
+        self.edit(
+            serde_json::json!({"kind": "transform", "id": id, "pose": pose}),
+            |s| {
+                ensure!(
+                    s.scans.contains(&id) || s.groups.iter().any(|g| g.id == id),
+                    "Missing scan or folder"
+                );
+                if pose == Pose::default() {
+                    s.transforms.remove(&id);
+                } else {
+                    s.transforms.insert(id, pose);
+                }
+                Ok(())
+            },
+        )
     }
 
     pub fn load_view(

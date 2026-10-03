@@ -315,7 +315,7 @@ impl Workbench {
                 camera: selection.camera,
                 visible: self.visible.iter().copied().collect(),
                 root: project.root.clone(),
-                revision: project.manifest.current,
+                revision: project.current().id,
             };
             if preview.nearest_for.as_ref() != Some(&input) {
                 preview.nearest = displayed_nearest(&selection, &self.points);

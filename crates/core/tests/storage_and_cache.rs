@@ -14,6 +14,7 @@ fn fixture(root: &std::path::Path) -> Project {
     let mut p = Project::create(&root.join("project"), "Test").unwrap();
     p.import_file(&input, ImportOptions::default(), &JobControl::default())
         .unwrap();
+    p.save_revision("Imported".into()).unwrap();
     p
 }
 
@@ -220,7 +221,10 @@ fn legacy_conversion_preserves_references_revisions_and_masks() {
     let mask = p.exclusion_mask(&scan, 0).unwrap();
     p.compress_storage(&JobControl::default()).unwrap();
     let reopened = Project::load(&p.root).unwrap();
-    assert_eq!(reopened.manifest.format_version, 2);
+    assert_eq!(
+        reopened.manifest.format_version,
+        geemil_core::FORMAT_VERSION
+    );
     assert_eq!(reopened.manifest.current, before.current);
     assert_eq!(reopened.manifest.revisions.len(), before.revisions.len());
     let new_scan = reopened.scans().next().unwrap();

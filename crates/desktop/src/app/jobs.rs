@@ -11,7 +11,7 @@ use std::sync::{
 
 enum JobEvent {
     Progress(Stage, u64, u64),
-    Complete(Result<Project, JobFailure>),
+    Complete(Result<Box<Project>, JobFailure>),
 }
 enum JobFailure {
     Panicked,
@@ -78,7 +78,7 @@ impl Workbench {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(job)))
                 .map_err(|_| JobFailure::Panicked)
                 .and_then(|r| r.map_err(JobFailure::Failed));
-            let _ = tx.send(JobEvent::Complete(result));
+            let _ = tx.send(JobEvent::Complete(result.map(Box::new)));
             repaint.request_repaint();
         });
     }
@@ -111,6 +111,7 @@ impl Workbench {
         self.job = None;
         match result {
             Ok(project) => {
+                let project = *project;
                 self.error = None;
                 let fit = self
                     .project

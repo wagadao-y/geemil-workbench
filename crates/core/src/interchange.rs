@@ -684,15 +684,33 @@ impl Project {
             s.points_file = format!("{prefix}/{}", s.points_file);
             s.lod_file = format!("{prefix}/{}", s.lod_file);
         }
+        let file = source
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let ids: Vec<_> = scans.iter().map(|s| s.id).collect();
         let mut next = self.clone();
-        next.manifest.format_version = crate::FORMAT_VERSION;
-        let mut ids = next.current().scans.clone();
-        ids.extend(scans.iter().map(|s| s.id));
         next.manifest.scans.extend(scans);
         next.manifest.images.extend(images);
-        let layers = next.current().layers.clone();
-        let transforms = next.current().transforms.clone();
-        next.commit_snapshot(crate::Revision {id:Uuid::new_v4(),parent:Some(next.manifest.current),name:format!("Import {}",source.file_name().unwrap_or_default().to_string_lossy()),operation:serde_json::json!({"kind":"import","file":source.file_name().unwrap_or_default().to_string_lossy()}),scans:ids,layers,transforms})?;
+        // Several scans from one file share a folder named after it.
+        let group = (ids.len() > 1).then(Uuid::new_v4);
+        next.edit(
+            serde_json::json!({"kind": "import", "file": file, "scans": ids, "group": group}),
+            |s| {
+                s.scans.extend(&ids);
+                if let Some(group) = group {
+                    let name = Path::new(&file).file_stem().unwrap_or_default();
+                    s.groups.push(crate::Group {
+                        id: group,
+                        name: name.to_string_lossy().into_owned(),
+                        parent: None,
+                    });
+                    s.scan_groups.extend(ids.iter().map(|id| (*id, group)));
+                }
+                Ok(())
+            },
+        )?;
         *self = next;
         Ok(())
     }
@@ -734,13 +752,10 @@ impl Project {
                     .get(scan.template_index)
                     .cloned()
                     .context("Missing scan template")?;
-                let correction = self
-                    .current()
-                    .transforms
-                    .get(&scan.id)
-                    .copied()
-                    .unwrap_or_default();
-                let pose = if scan.original_pose.is_some() || correction != Pose::default() {
+                let corrected = !self
+                    .correction(scan.id)
+                    .abs_diff_eq(glam::DMat4::IDENTITY, 0.);
+                let pose = if scan.original_pose.is_some() || corrected {
                     Some(Pose::from_matrix(self.world_matrix(scan)))
                 } else {
                     None
@@ -773,10 +788,9 @@ impl Project {
                     .filter(|s| s.template == template)
                     .cloned()
                     .collect();
+                // Images move with their scan, including its folders' transforms.
                 copy_images(&mut reader, &mut writer, &stage, &owned, job, |id| {
-                    id.and_then(|id| self.current().transforms.get(&id))
-                        .copied()
-                        .unwrap_or_default()
+                    id.map_or_else(Pose::default, |id| Pose::from_matrix(self.correction(id)))
                 })?;
             }
             fs::remove_dir(&stage)?;

@@ -49,7 +49,8 @@ impl ViewCache {
         self.stats
     }
     pub(crate) fn prepare(&mut self, project: &Project) {
-        let epoch = (project.root.clone(), project.manifest.current);
+        // Every edit gives the state a new id, so stale samples never survive.
+        let epoch = (project.root.clone(), project.current().id);
         if self.epoch.as_ref() != Some(&epoch) {
             self.entries.clear();
             self.stats.resident_bytes = 0;
