@@ -461,6 +461,13 @@ pub(crate) fn index(
 }
 
 impl Project {
+    /// Whether any scan still uses the uncompressed format of early projects.
+    pub fn has_legacy_storage(&self) -> bool {
+        self.manifest
+            .scans
+            .iter()
+            .any(|s| s.chunks.iter().any(|c| c.stored_bytes == 0))
+    }
     /// Repack legacy assets without changing point references, layers or revisions.
     /// Old files are retained until all new blocks have been read back and the
     /// manifest has been committed. A cancelled conversion keeps the old manifest.

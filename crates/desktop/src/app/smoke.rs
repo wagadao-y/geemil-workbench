@@ -20,6 +20,13 @@ pub struct SmokeOptions {
     /// Select the centre of the view after one second and preview this exclusion
     /// (mode, whether an inside exclusion limits its depth).
     pub select: Option<(SelectionMode, bool)>,
+    /// Open this dialog for the capture: revisions, shortcuts, new-project,
+    /// cleanup or save-as. Also selects the first folder of the tree.
+    pub dialog: Option<String>,
+    /// Steps run one by one once the view loaded, each followed by a state
+    /// line: exclude, undo, redo, save, folder (new folder with the first scan),
+    /// remove (take out the first scan), measure (measure two picked points).
+    pub script: Vec<String>,
 }
 
 pub(super) struct SmokeTest {
@@ -27,6 +34,8 @@ pub(super) struct SmokeTest {
     orbit: bool,
     pub(super) colors: bool,
     select: Option<(SelectionMode, bool)>,
+    dialog: Option<String>,
+    script: std::collections::VecDeque<String>,
     requested: bool,
     probes: Vec<(egui::Pos2, [u8; 4])>,
     camera: Camera,
@@ -40,12 +49,18 @@ impl SmokeTest {
             orbit: options.orbit,
             colors: options.colors,
             select: options.select,
+            dialog: options.dialog,
+            script: options.script.into(),
             requested: false,
             probes: vec![],
             camera: Camera::default(),
             moving_updates: 0,
             started: Instant::now(),
         }
+    }
+    /// Whether this run is a smoke test rather than an interactive session.
+    pub(super) fn active(&self) -> bool {
+        self.screenshot.is_some() || self.colors
     }
     pub(super) fn view_loaded(&mut self, interactive: bool, points: usize) {
         if interactive && points > 0 && self.started.elapsed() < Duration::from_secs(2) {
@@ -92,17 +107,35 @@ impl Workbench {
                 .collect();
             self.points_origin = [0.; 3];
             self.points_generation += 1;
-            self.point_size = 8.;
+            self.settings.point_size = 8.;
             self.dirty = false;
         }
         self.smoke.camera = self.camera;
+        if let Some(name) = self.smoke.dialog.take() {
+            use super::dialogs::Dialog;
+            self.selected = self
+                .project
+                .as_ref()
+                .and_then(|p| p.groups().first().map(|g| g.id));
+            self.dialog = match name.as_str() {
+                "revisions" => Some(Dialog::revisions(self.project.as_deref())),
+                "shortcuts" => Some(Dialog::Shortcuts),
+                "new-project" => Some(Dialog::new_project(&self.settings, vec![])),
+                "cleanup" => Some(Dialog::Cleanup),
+                "save-as" => Some(Dialog::SaveAs {
+                    name: "リビジョン 2".into(),
+                }),
+                _ => None,
+            };
+        }
     }
     /// Drives the camera and handles the screenshot at the start of a frame.
     pub(super) fn smoke_frame(&mut self, ctx: &egui::Context) {
-        let smoke = &mut self.smoke;
-        let Some(path) = &smoke.screenshot else {
+        let Some(path) = self.smoke.screenshot.clone() else {
             return;
         };
+        let path = &path;
+        let smoke = &mut self.smoke;
         if smoke.orbit && smoke.started.elapsed() < Duration::from_secs(2) {
             let t = smoke.started.elapsed().as_secs_f64();
             self.camera.yaw = smoke.camera.yaw + t * 0.3;
@@ -118,6 +151,15 @@ impl Workbench {
             self.selection
                 .select_rect(self.camera, [0.35, 0.3], [0.65, 0.7], mode, limit_depth);
         }
+        if self.job.is_none()
+            && !self.points.is_empty()
+            && self.smoke.started.elapsed() > Duration::from_millis(1500)
+            && let Some(step) = self.smoke.script.pop_front()
+        {
+            self.smoke_step(ctx, &step);
+            ctx.request_repaint();
+        }
+        let smoke = &mut self.smoke;
         for event in ctx.input(|i| i.events.clone()) {
             if let egui::Event::Screenshot { image, .. } = event {
                 if smoke.colors {
@@ -167,8 +209,11 @@ impl Workbench {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
+        // Without a project the start screen is the subject.
         if !smoke.requested
-            && !self.points.is_empty()
+            && smoke.script.is_empty()
+            && self.job.is_none()
+            && (!self.points.is_empty() || self.project.is_none())
             && smoke.started.elapsed() > Duration::from_secs(3)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -202,5 +247,56 @@ impl Workbench {
                     })
             })
             .collect();
+    }
+    fn smoke_step(&mut self, ctx: &egui::Context, step: &str) {
+        use super::actions::Action;
+        match step {
+            "exclude" => self.perform(ctx, Action::Exclude),
+            "undo" => self.perform(ctx, Action::Undo),
+            "redo" => self.perform(ctx, Action::Redo),
+            "save" => self.perform(ctx, Action::Save),
+            "folder" => {
+                let first = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.scans().next().map(|s| s.id));
+                if let Some(group) = self.apply_edit(|p| p.create_group("Smoke".into(), None))
+                    && let Some(scan) = first
+                {
+                    self.apply_edit(|p| p.move_to_group(&[scan], Some(group)));
+                }
+            }
+            "remove" => {
+                let first = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.scans().next().map(|s| s.id));
+                if let Some(scan) = first {
+                    self.apply_edit(|p| p.remove_scans(&[scan]));
+                }
+            }
+            "measure" => {
+                self.selection.tool = super::selection::Tool::Measure;
+                let mut points = self.points.iter().step_by((self.points.len() / 2).max(1));
+                if let (Some(a), Some(b)) = (points.next(), points.next()) {
+                    self.measure_points(a.position.into(), b.position.into());
+                }
+            }
+            other => eprintln!("Unknown smoke step {other}"),
+        }
+        if let Some(p) = &self.project {
+            eprintln!(
+                "Smoke step {step}: scans {}, folders {}, layers {}, revisions {}, unsaved {}, undo {}, redo {}, job {}, measure {:?}",
+                p.scans().count(),
+                p.groups().len(),
+                p.current().layers.len(),
+                p.manifest.revisions.len(),
+                p.has_unsaved_changes(),
+                self.undo_available(),
+                self.redo_available(),
+                self.job.is_some(),
+                self.measure_distance(),
+            );
+        }
     }
 }

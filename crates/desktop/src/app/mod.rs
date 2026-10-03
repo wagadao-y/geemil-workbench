@@ -1,33 +1,63 @@
 //! Application state and frame orchestration. Panels, jobs, view loading and
 //! smoke tests live in submodules as further `impl Workbench` blocks.
-mod history;
+mod actions;
+mod dialogs;
 mod jobs;
+mod measure;
+mod menu;
 mod navigation;
+mod revisions;
 mod selection;
-mod sidebar;
 mod smoke;
 mod status;
-mod toolbar;
+mod tree;
+mod undo;
 mod view;
 mod viewport;
+mod welcome;
 
 pub use smoke::SmokeOptions;
 
 use crate::i18n::{self, Strings};
 use crate::render::PointRenderer;
 use eframe::egui;
-use geemil_core::{Bounds, Camera, Project, Sample};
-use glam::DQuat;
+use geemil_core::{Bounds, Camera, CleanupReport, Project, Sample};
 use jobs::{ActiveJob, Notice};
+use serde::{Deserialize, Serialize};
 use smoke::SmokeTest;
 use std::{
     collections::BTreeSet,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, mpsc},
     time::{Duration, Instant},
 };
 use uuid::Uuid;
 use view::ViewLoader;
+
+/// Preferences kept between sessions.
+#[derive(Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct Settings {
+    recent: Vec<PathBuf>,
+    last_location: Option<PathBuf>,
+    point_budget: usize,
+    point_size: f32,
+    edl: bool,
+    edl_strength: f32,
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            recent: vec![],
+            last_location: None,
+            point_budget: 2_000_000,
+            point_size: 2.,
+            edl: true,
+            edl_strength: 1.,
+        }
+    }
+}
+const SETTINGS_KEY: &str = "settings";
 
 pub struct Workbench {
     t: &'static Strings,
@@ -35,13 +65,16 @@ pub struct Workbench {
     renderer: PointRenderer,
     camera: Camera,
     visible: BTreeSet<Uuid>,
+    /// The scan or folder selected in the tree.
     selected: Option<Uuid>,
+    settings: Settings,
 
     // Background work and status bar.
     job: Option<ActiveJob>,
     status: String,
     error: Option<Notice>,
     progress: f32,
+    cleanup_report: Option<mpsc::Receiver<CleanupReport>>,
 
     // Displayed samples and view refinement.
     view: ViewLoader,
@@ -54,18 +87,14 @@ pub struct Workbench {
     last_camera: Camera,
     last_motion: Instant,
     refine_pending: bool,
-    point_budget: usize,
-    point_size: f32,
-    edl: bool,
-    edl_strength: f32,
     flight: Option<navigation::Flight>,
 
     selection: selection::SelectionState,
-
-    // Sidebar inputs.
-    translation: [f64; 3],
-    rotation: [f64; 3],
-    branch_name: String,
+    measure: measure::Measure,
+    transform_edit: tree::TransformEdit,
+    undo: undo::UndoStack,
+    dialog: Option<dialogs::Dialog>,
+    title: String,
 
     smoke: SmokeTest,
 }
@@ -82,6 +111,13 @@ impl Workbench {
             .as_ref()
             .expect("wgpu renderer selected");
         let t = &i18n::JA;
+        let smoke = SmokeTest::new(smoke);
+        // Smoke tests run with defaults and leave the user's settings alone.
+        let settings = cc
+            .storage
+            .filter(|_| !smoke.active())
+            .and_then(|s| eframe::get_value(s, SETTINGS_KEY))
+            .unwrap_or_default();
         let mut app = Self {
             t,
             project: None,
@@ -89,10 +125,12 @@ impl Workbench {
             camera: Camera::default(),
             visible: BTreeSet::new(),
             selected: None,
+            settings,
             job: None,
             status: t.status_start.into(),
             error: None,
             progress: 0.,
+            cleanup_report: None,
             view: ViewLoader::spawn(cc.egui_ctx.clone()),
             points: vec![],
             points_generation: 0,
@@ -103,27 +141,33 @@ impl Workbench {
             last_camera: Camera::default(),
             last_motion: Instant::now(),
             refine_pending: false,
-            point_budget: 200_000,
-            point_size: 3.,
-            edl: true,
-            edl_strength: 1.,
             flight: None,
             selection: Default::default(),
-            translation: [0.; 3],
-            rotation: [0.; 3],
-            branch_name: t.default_branch_name.into(),
-            smoke: SmokeTest::new(smoke),
+            measure: Default::default(),
+            transform_edit: Default::default(),
+            undo: Default::default(),
+            dialog: None,
+            title: String::new(),
+            smoke,
         };
         if let Some(path) = path {
-            match Project::load(&path) {
-                Ok(p) => app.install(p, true),
-                Err(e) => app.error = Some(Notice::new(t, &e)),
+            if app.smoke.active() {
+                match Project::load(&path) {
+                    Ok(p) => {
+                        app.install(p, true);
+                        app.status = t.status_opened.into();
+                    }
+                    Err(e) => app.error = Some(Notice::new(t, &e)),
+                }
+            } else {
+                app.open_project(&path);
             }
         }
         app.smoke_setup();
         app
     }
-    /// Replaces the project state after open, create, a finished job or a revision switch.
+    /// Replaces the project state after open, create, an edit, a finished job,
+    /// undo or a revision switch.
     fn install(&mut self, project: Project, fit: bool) {
         let previous: Option<Vec<_>> = self
             .project
@@ -131,39 +175,71 @@ impl Workbench {
             .filter(|p| p.root == project.root)
             .map(|p| p.scans().map(|s| s.id).collect());
         let scans: Vec<_> = project.scans().map(|s| s.id).collect();
-        carry_scan_state(
-            &mut self.visible,
-            &mut self.selected,
-            previous.as_deref(),
-            &scans,
-        );
-        if fit {
+        let items: Vec<_> = scans
+            .iter()
+            .copied()
+            .chain(project.groups().iter().map(|g| g.id))
+            .collect();
+        carry_scan_state(&mut self.visible, previous.as_deref(), &scans);
+        if !self.selected.is_some_and(|id| items.contains(&id)) {
+            self.selected = None;
+        }
+        if fit || previous.is_none() {
             frame_bounds(&mut self.camera, &project.bounds());
+            self.selection.clear();
+            self.measure.clear();
         }
         self.points_generation = self.view.next_generation();
         self.view.invalidate();
-        self.points.clear();
         self.points_origin = self.camera.target;
         self.project = Some(Arc::new(project));
-        self.status = self.t.status_saved.into();
-        self.selection.clear();
         self.dirty = true;
-        self.sync_pose();
     }
     fn fit_view(&mut self) {
         if let Some(p) = &self.project {
             frame_bounds(&mut self.camera, &p.bounds());
+            self.flight = None;
             self.dirty = true;
             self.selection.clear();
         }
     }
-    /// Loads the selected scan's stored transform into the alignment inputs.
-    fn sync_pose(&mut self) {
-        if let (Some(p), Some(id)) = (&self.project, self.selected) {
-            let pose = p.current().transforms.get(&id).copied().unwrap_or_default();
-            self.translation = pose.translation;
-            let (x, y, z) = DQuat::from_array(pose.rotation_xyzw).to_euler(glam::EulerRot::XYZ);
-            self.rotation = [x.to_degrees(), y.to_degrees(), z.to_degrees()];
+    /// Starts imports for files dropped on the window.
+    fn dropped_files(&mut self, ctx: &egui::Context) {
+        let files: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .map(|f| f.path().to_owned())
+                .filter(|p| {
+                    let ext = p
+                        .extension()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_lowercase();
+                    matches!(ext.as_str(), "e57" | "las" | "laz")
+                })
+                .collect()
+        });
+        if files.is_empty() || self.job.is_some() || self.dialog.is_some() {
+            return;
+        }
+        if self.project.is_none() {
+            self.status = self.t.dropped_without_project.into();
+        }
+        self.import(ctx, files);
+    }
+    fn update_title(&mut self, ctx: &egui::Context) {
+        let title = match &self.project {
+            Some(p) => format!(
+                "{}{} — Geemil Workbench",
+                p.manifest.name,
+                if p.has_unsaved_changes() { " *" } else { "" }
+            ),
+            None => "Geemil Workbench".into(),
+        };
+        if title != self.title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.title = title;
         }
     }
 }
@@ -174,13 +250,33 @@ impl eframe::App for Workbench {
         self.smoke_frame(&ctx);
         self.poll_job();
         self.poll_view();
+        if self.dialog.is_none() {
+            self.keyboard(&ctx);
+        }
+        self.dropped_files(&ctx);
+        self.menu_bar(ui);
         self.toolbar(ui);
-        self.sidebar(ui);
+        self.tool_options(ui);
         self.status_bar(ui);
-        self.viewport(ui, frame);
+        self.side_panel(ui);
+        if self.project.is_some() || self.smoke.colors {
+            self.viewport(ui, frame);
+        } else {
+            self.welcome(ui);
+        }
+        self.dialogs(&ctx);
         self.request_view();
+        self.update_title(&ctx);
         if self.dirty || self.refine_pending || self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+    fn persist_egui_memory(&self) -> bool {
+        !self.smoke.active()
+    }
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if !self.smoke.active() {
+            eframe::set_value(storage, SETTINGS_KEY, &self.settings);
         }
     }
 }
@@ -210,6 +306,7 @@ fn install_fonts(ctx: &egui::Context) {
             break;
         }
     }
+    egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
     ctx.set_fonts(fonts);
 }
 
@@ -218,14 +315,9 @@ fn frame_bounds(camera: &mut Camera, bounds: &Bounds) {
     camera.distance = (bounds.radius() * 2.8).max(1.);
 }
 
-/// Carries scan visibility and selection into a new project state. `previous`
-/// holds the replaced state's scans when it belongs to the same project.
-fn carry_scan_state(
-    visible: &mut BTreeSet<Uuid>,
-    selected: &mut Option<Uuid>,
-    previous: Option<&[Uuid]>,
-    scans: &[Uuid],
-) {
+/// Carries scan visibility into a new project state. `previous` holds the
+/// replaced state's scans when it belongs to the same project.
+fn carry_scan_state(visible: &mut BTreeSet<Uuid>, previous: Option<&[Uuid]>, scans: &[Uuid]) {
     match previous {
         // Keep what the user hid, and show scans that just appeared.
         Some(previous) => {
@@ -233,9 +325,6 @@ fn carry_scan_state(
             visible.extend(scans.iter().filter(|id| !previous.contains(id)));
         }
         None => *visible = scans.iter().copied().collect(),
-    }
-    if !selected.is_some_and(|id| scans.contains(&id)) {
-        *selected = scans.first().copied();
     }
 }
 
@@ -246,27 +335,21 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn import_keeps_hidden_scans_and_selection() {
+    fn import_keeps_hidden_scans() {
         let [a, b, c] = [(); 3].map(|_| Uuid::new_v4());
         let mut visible = BTreeSet::from([a]);
-        let mut selected = Some(b);
-        carry_scan_state(&mut visible, &mut selected, Some(&[a, b]), &[a, b, c]);
+        carry_scan_state(&mut visible, Some(&[a, b]), &[a, b, c]);
         assert_eq!(visible, BTreeSet::from([a, c]));
-        assert_eq!(selected, Some(b));
     }
 
     #[test]
-    fn removed_or_foreign_scans_fall_back_to_the_first() {
+    fn removed_scans_disappear_and_other_projects_show_everything() {
         let [a, b, c] = [(); 3].map(|_| Uuid::new_v4());
         let mut visible = BTreeSet::from([a, b]);
-        let mut selected = Some(b);
-        // Switching to a revision without `b` drops it from both.
-        carry_scan_state(&mut visible, &mut selected, Some(&[a, b]), &[a]);
+        // Switching to a revision without `b` drops it.
+        carry_scan_state(&mut visible, Some(&[a, b]), &[a]);
         assert_eq!(visible, BTreeSet::from([a]));
-        assert_eq!(selected, Some(a));
-        // Another project shows everything and selects its first scan.
-        carry_scan_state(&mut visible, &mut selected, None, &[c, b]);
+        carry_scan_state(&mut visible, None, &[c, b]);
         assert_eq!(visible, BTreeSet::from([b, c]));
-        assert_eq!(selected, Some(c));
     }
 }

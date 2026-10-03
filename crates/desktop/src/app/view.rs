@@ -143,10 +143,11 @@ impl Workbench {
                 .try_send(ViewRequest {
                     project: project.clone(),
                     camera: self.camera,
+                    // Moving shows a coarser view so updates keep up with the camera.
                     budget: if moving {
-                        self.point_budget.min(32_000)
+                        (self.settings.point_budget / 8).clamp(32_000, 300_000)
                     } else {
-                        self.point_budget
+                        self.settings.point_budget
                     },
                     visible: self.visible.iter().copied().collect(),
                     generation,

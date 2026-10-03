@@ -1,5 +1,5 @@
 //! Camera input: orbit, pan, zoom, and double-click to orbit around a point.
-use super::{Workbench, selection::Tool};
+use super::{Workbench, actions::MAX_PITCH, selection::Tool};
 use eframe::egui;
 use geemil_core::{Camera, Sample};
 use glam::DVec3;
@@ -25,7 +25,8 @@ impl Workbench {
         {
             let delta = ctx.input(|i| i.pointer.delta());
             self.camera.yaw -= delta.x as f64 * 0.007;
-            self.camera.pitch = (self.camera.pitch + delta.y as f64 * 0.007).clamp(-1.5, 1.5);
+            self.camera.pitch =
+                (self.camera.pitch + delta.y as f64 * 0.007).clamp(-MAX_PITCH, MAX_PITCH);
             moved = true;
         }
         if response.dragged_by(egui::PointerButton::Secondary)
@@ -65,7 +66,7 @@ impl Workbench {
             ];
             let viewport = [rect.width() as f64, rect.height() as f64];
             // Splat radius in logical pixels, like `viewport`.
-            let radius = self.point_size as f64 / 2.;
+            let radius = self.settings.point_size as f64 / 2.;
             if let Some(target) = pick(&self.points, &self.camera, click, viewport, radius) {
                 self.flight = Some(Flight {
                     from: self.camera,
@@ -110,7 +111,7 @@ impl Workbench {
 /// nearest to the camera among splats covering the click, else the closest on
 /// screen within a few extra pixels. `viewport` and `radius` are in the same
 /// pixel units.
-fn pick(
+pub(super) fn pick(
     points: &[Sample],
     camera: &Camera,
     click: [f64; 2],

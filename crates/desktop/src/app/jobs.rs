@@ -2,12 +2,13 @@
 use super::Workbench;
 use crate::i18n::Strings;
 use eframe::egui;
-use geemil_core::{CoreError, JobControl, Project, Stage};
+use geemil_core::{CoreError, JobControl, Project, Revision, Stage};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
+use uuid::Uuid;
 
 enum JobEvent {
     Progress(Stage, u64, u64),
@@ -20,6 +21,8 @@ enum JobFailure {
 pub(super) struct ActiveJob {
     rx: mpsc::Receiver<JobEvent>,
     cancel: Arc<AtomicBool>,
+    /// For jobs that edit the working state: the state before, for undo.
+    undo_before: Option<(Option<Revision>, Uuid)>,
 }
 impl ActiveJob {
     pub(super) fn cancel(&self) {
@@ -48,9 +51,12 @@ pub(super) fn is_cancelled(error: &anyhow::Error) -> bool {
 }
 
 impl Workbench {
+    /// Runs `task` on a worker thread; its project becomes current when done.
+    /// `edit` records the state before for undo.
     pub(super) fn start(
         &mut self,
         ctx: &egui::Context,
+        edit: bool,
         task: impl FnOnce(JobControl) -> anyhow::Result<Project> + Send + 'static,
     ) {
         if self.job.is_some() {
@@ -68,7 +74,16 @@ impl Workbench {
                 progress_ctx.request_repaint();
             }),
         };
-        self.job = Some(ActiveJob { rx, cancel });
+        let undo_before = self
+            .project
+            .as_ref()
+            .filter(|_| edit)
+            .map(|p| (p.manifest.draft.clone(), p.current().id));
+        self.job = Some(ActiveJob {
+            rx,
+            cancel,
+            undo_before,
+        });
         self.view.invalidate();
         self.view.next_generation();
         self.progress = 0.;
@@ -105,10 +120,17 @@ impl Workbench {
                 }
             }
         }
+        if let Some(rx) = &self.cleanup_report
+            && let Ok(report) = rx.try_recv()
+        {
+            self.cleanup_report = None;
+            let size = self.t.bytes(report.bytes);
+            self.status = (self.t.cleanup_done)(&report, &size);
+        }
         let Some(result) = done else {
             return;
         };
-        self.job = None;
+        let undo_before = self.job.take().and_then(|j| j.undo_before);
         match result {
             Ok(project) => {
                 let project = *project;
@@ -118,7 +140,12 @@ impl Workbench {
                     .as_ref()
                     .is_none_or(|p| p.current().scans != project.current().scans);
                 self.install(project, fit);
-                self.status = self.t.status_done.into();
+                // The selection was used up by the job (e.g. an exclusion).
+                self.selection.clear();
+                self.record_job_edit(undo_before);
+                if self.cleanup_report.is_none() {
+                    self.status = self.t.status_done.into();
+                }
             }
             Err(e) => {
                 // A batch may have committed earlier files before cancellation/error.
@@ -127,7 +154,9 @@ impl Workbench {
                 {
                     let fit = project.current().scans != latest.current().scans;
                     self.install(latest, fit);
+                    self.record_job_edit(undo_before);
                 }
+                self.cleanup_report = None;
                 match e {
                     JobFailure::Failed(e) if is_cancelled(&e) => {
                         self.status = self.t.status_cancelled.into();
@@ -145,6 +174,14 @@ impl Workbench {
                     }
                 }
             }
+        }
+    }
+    /// Records an edit made by a job for undo, if it changed the state.
+    fn record_job_edit(&mut self, before: Option<(Option<Revision>, Uuid)>) {
+        if let (Some((state, id)), Some(p)) = (before, &self.project)
+            && p.current().id != id
+        {
+            self.undo.record(state);
         }
     }
 }

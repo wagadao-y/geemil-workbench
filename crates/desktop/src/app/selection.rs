@@ -22,6 +22,7 @@ pub(super) enum Tool {
     Navigate,
     Rect,
     Polygon,
+    Measure,
 }
 
 /// The selection being drawn, in normalized viewport coordinates of `camera`.
@@ -64,6 +65,15 @@ impl SelectionState {
         self.drag_start = None;
         self.camera = None;
         self.preview = Preview::default();
+    }
+    /// Whether there is a selection to exclude.
+    pub(super) fn is_ready(&self) -> bool {
+        self.selection().is_some()
+    }
+    pub(super) fn close_polygon(&mut self) {
+        if self.tool == Tool::Polygon && self.polygon.len() >= 3 {
+            self.closed = true;
+        }
     }
     /// A closed rectangle, as if dragged from `min` to `max` with `camera`.
     pub(super) fn select_rect(
@@ -173,72 +183,76 @@ impl Drop for NearestSearch {
 }
 
 impl Workbench {
-    pub(super) fn selection_tools(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    /// The tool options bar of the selection tools.
+    pub(super) fn selection_options(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let t = self.t;
-        ui.horizontal(|ui| {
-            let s = &mut self.selection;
-            ui.selectable_value(&mut s.tool, Tool::Navigate, t.navigate);
-            ui.selectable_value(&mut s.tool, Tool::Rect, t.tool_rect);
-            ui.selectable_value(&mut s.tool, Tool::Polygon, t.tool_polygon);
+        let s = &mut self.selection;
+        ui.selectable_value(
+            &mut s.mode,
+            SelectionMode::ExcludeInside,
+            format!(
+                "{} {}",
+                egui_phosphor::regular::SELECTION_FOREGROUND,
+                t.exclude_inside
+            ),
+        );
+        ui.selectable_value(
+            &mut s.mode,
+            SelectionMode::ExcludeOutside,
+            format!(
+                "{} {}",
+                egui_phosphor::regular::SELECTION_BACKGROUND,
+                t.exclude_outside
+            ),
+        );
+        ui.separator();
+        let inside = s.mode == SelectionMode::ExcludeInside;
+        ui.add_enabled(inside, egui::Checkbox::new(&mut s.limit_depth, t.depth));
+        ui.add_enabled(
+            inside && s.limit_depth,
+            egui::DragValue::new(&mut s.depth)
+                .speed(0.05)
+                .range(0.001..=1_000_000.)
+                .suffix(" m"),
+        );
+        ui.separator();
+        let ready = self.job.is_none() && self.selection.is_ready();
+        let exclude = format!("{} {}", egui_phosphor::regular::ERASER, t.exclude_selection);
+        if ui.add_enabled(ready, egui::Button::new(exclude)).clicked() {
+            self.exclude(ctx);
+        }
+        let clear = format!(
+            "{} {}",
+            egui_phosphor::regular::SELECTION_SLASH,
+            t.clear_selection
+        );
+        if ui
+            .add_enabled(!self.selection.polygon.is_empty(), egui::Button::new(clear))
+            .clicked()
+        {
+            self.selection.clear();
+        }
+        let preview = &self.selection.preview;
+        if self.selection.is_ready() && preview.marks_for.is_some() {
             ui.separator();
-            ui.selectable_value(&mut s.mode, SelectionMode::ExcludeInside, t.exclude_inside);
-            ui.selectable_value(
-                &mut s.mode,
-                SelectionMode::ExcludeOutside,
-                t.exclude_outside,
-            );
-            let inside = s.mode == SelectionMode::ExcludeInside;
-            ui.add_enabled(inside, egui::Checkbox::new(&mut s.limit_depth, t.depth));
-            ui.add_enabled(
-                inside && s.limit_depth,
-                egui::DragValue::new(&mut s.depth)
-                    .speed(0.05)
-                    .range(0.001..=1_000_000.)
-                    .suffix(" m"),
-            );
-            let ready = self.job.is_none() && self.selection.selection().is_some();
-            if ui
-                .add_enabled(ready, egui::Button::new(t.exclude_selection))
-                .clicked()
-            {
-                self.exclude(ctx);
+            ui.label((t.preview_count)(&t.count(preview.marked as u64)));
+            if preview.search.is_some() {
+                ui.spinner();
+                ui.small(t.preview_searching);
             }
-            if ui.button(t.clear_selection).clicked() {
-                self.selection.clear();
-            }
-            let preview = &self.selection.preview;
-            if self.selection.selection().is_some() && preview.marks_for.is_some() {
-                ui.label((t.preview_count)(&t.count(preview.marked as u64)));
-                if preview.search.is_some() {
-                    ui.spinner();
-                    ui.small(t.preview_searching);
-                }
-            }
-        });
+        } else {
+            ui.separator();
+            ui.weak(if self.selection.tool == Tool::Polygon {
+                t.hint_polygon
+            } else {
+                t.hint_rect
+            });
+        }
     }
-    /// Rectangle drag or polygon clicks, plus Enter, Escape and Delete.
-    pub(super) fn selection_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
+    /// Rectangle drag or polygon clicks. Keys are handled with the other shortcuts.
+    pub(super) fn selection_input(&mut self, response: &egui::Response) {
         if self.job.is_some() {
             return;
-        }
-        if !ctx.egui_wants_keyboard_input() {
-            let (enter, escape, delete) = ctx.input(|i| {
-                (
-                    i.key_pressed(egui::Key::Enter),
-                    i.key_pressed(egui::Key::Escape),
-                    i.key_pressed(egui::Key::Delete),
-                )
-            });
-            if escape {
-                self.selection.clear();
-            }
-            if enter && self.selection.polygon.len() >= 3 {
-                self.selection.closed = true;
-            }
-            if delete && self.selection.selection().is_some() {
-                self.exclude(ctx);
-                return;
-            }
         }
         let rect = response.rect;
         let normalize = |p: egui::Pos2| {
@@ -250,7 +264,7 @@ impl Workbench {
         let camera = self.camera;
         let s = &mut self.selection;
         match s.tool {
-            Tool::Navigate => {}
+            Tool::Navigate | Tool::Measure => {}
             Tool::Polygon => {
                 // The first click of a double click already added the last vertex.
                 if response.double_clicked() {
@@ -391,7 +405,7 @@ impl Workbench {
     }
     /// Excludes the selection from the visible scans, judged on original points
     /// with the camera captured when the selection started.
-    fn exclude(&mut self, ctx: &egui::Context) {
+    pub(super) fn exclude(&mut self, ctx: &egui::Context) {
         let (Some(selection), Some(p)) = (self.selection.selection(), &self.project) else {
             return;
         };
@@ -400,7 +414,7 @@ impl Workbench {
         }
         let mut project = (**p).clone();
         let ids = self.visible.iter().copied().collect::<Vec<_>>();
-        self.start(ctx, move |job| {
+        self.start(ctx, true, move |job| {
             project.delete_selection(&selection, &ids, &job)?;
             Ok(project)
         });
