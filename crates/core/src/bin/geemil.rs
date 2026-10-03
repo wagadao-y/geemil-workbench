@@ -70,8 +70,21 @@ fn main() -> Result<()> {
             let removed = p.remove_noise(args[2].parse()?, args[3].parse()?, &scans, &job)?;
             println!("{removed} points excluded in {:.2?}", started.elapsed());
         }
+        Some("sor") if args.len() == 5 => {
+            let mut p = Project::load(Path::new(&args[1]))?;
+            let scans: Vec<_> = p.scans().map(|s| s.id).collect();
+            let started = std::time::Instant::now();
+            let removed = p.remove_outliers(
+                args[2].parse()?,
+                args[3].parse()?,
+                args[4].parse()?,
+                &scans,
+                &job,
+            )?;
+            println!("{removed} points excluded in {:.2?}", started.elapsed());
+        }
         _ => bail!(
-            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | export-las PROJECT FILE.las|laz | compress PROJECT | subsample PROJECT VOXEL_M | noise PROJECT RADIUS_M MIN_NEIGHBOURS"
+            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | export-las PROJECT FILE.las|laz | compress PROJECT | subsample PROJECT VOXEL_M | noise PROJECT RADIUS_M MIN_NEIGHBOURS | sor PROJECT NEIGHBOURS SIGMAS REACH_M"
         ),
     }
     Ok(())

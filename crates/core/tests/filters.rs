@@ -261,3 +261,63 @@ fn box_crop_matches_brute_force_and_inside_complements_outside() {
         );
     }
 }
+
+#[test]
+fn statistical_outliers_match_brute_force_regardless_of_chunking() {
+    let dir = tempfile::tempdir().unwrap();
+    let (k, deviations, reach) = (6usize, 1.0, 2.0);
+    let mut results = vec![];
+    for (name, chunk_points) in [("small", 64), ("large", 65_536)] {
+        let mut p = project(dir.path(), name, chunk_points);
+        let before = surviving(&p);
+        // Mean distance to the k nearest other points; None if fewer in reach.
+        let means: Vec<Option<f64>> = before
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let mut d: Vec<f64> = before
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, b)| (0..3).map(|c| (a[c] - b[c]).powi(2)).sum::<f64>().sqrt())
+                    .filter(|d| *d <= reach)
+                    .collect();
+                d.sort_by(f64::total_cmp);
+                (d.len() >= k).then(|| d[..k].iter().sum::<f64>() / k as f64)
+            })
+            .collect();
+        let known: Vec<f64> = means.iter().flatten().copied().collect();
+        let mean = known.iter().sum::<f64>() / known.len() as f64;
+        let sigma =
+            (known.iter().map(|d| d * d).sum::<f64>() / known.len() as f64 - mean * mean).sqrt();
+        let threshold = mean + deviations * sigma;
+        let expected: Vec<_> = before
+            .iter()
+            .zip(&means)
+            .filter(|(_, m)| m.is_some_and(|m| m <= threshold))
+            .map(|(p, _)| *p)
+            .collect();
+        let removed = p
+            .remove_outliers(
+                k as u32,
+                deviations,
+                reach,
+                &ids(&p),
+                &JobControl::default(),
+            )
+            .unwrap();
+        let after = surviving(&p);
+        assert_eq!(removed as usize, before.len() - after.len());
+        assert_eq!(sorted_bits(&after), sorted_bits(&expected));
+        assert!(removed > 30, "only {removed} removed");
+        assert_eq!(
+            p.manifest.layers.last().unwrap().kind,
+            LayerKind::Statistical {
+                neighbours: k as u32,
+                deviations
+            }
+        );
+        results.push(sorted_bits(&after));
+    }
+    assert_eq!(results[0], results[1]);
+}

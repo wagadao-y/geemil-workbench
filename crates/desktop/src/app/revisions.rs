@@ -211,6 +211,10 @@ pub(super) fn layer_label(t: &Strings, layer: &Layer) -> String {
         } => (t.noise_layer)(&radius.to_string(), min_neighbours, &points),
         LayerKind::Box { inside: true } => (t.box_inside_layer)(&points),
         LayerKind::Box { inside: false } => (t.box_outside_layer)(&points),
+        LayerKind::Statistical {
+            neighbours,
+            deviations,
+        } => (t.outlier_layer)(neighbours, deviations, &points),
     }
 }
 

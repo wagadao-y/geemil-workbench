@@ -48,6 +48,7 @@ pub(super) enum Action {
     CompressStorage,
     Subsample,
     RemoveNoise,
+    RemoveOutliers,
     Tool(Tool),
     Shortcuts,
     About,
@@ -81,6 +82,7 @@ impl Action {
             Self::CompressStorage => icon::ARCHIVE,
             Self::Subsample => icon::DOTS_NINE,
             Self::RemoveNoise => icon::FUNNEL,
+            Self::RemoveOutliers => icon::CHART_SCATTER,
             Self::Tool(Tool::Navigate) => icon::HAND,
             Self::Tool(Tool::Rect) => icon::SELECTION,
             Self::Tool(Tool::Polygon) => icon::POLYGON,
@@ -120,6 +122,7 @@ impl Action {
             Self::CompressStorage => t.compress_storage.into(),
             Self::Subsample => t.subsample.into(),
             Self::RemoveNoise => t.remove_noise.into(),
+            Self::RemoveOutliers => t.remove_outliers.into(),
             Self::Tool(Tool::Navigate) => t.navigate.into(),
             Self::Tool(Tool::Rect) => t.tool_rect.into(),
             Self::Tool(Tool::Polygon) => t.tool_polygon.into(),
@@ -214,7 +217,9 @@ impl Workbench {
             Action::Save | Action::SaveAs | Action::Discard => idle && unsaved,
             Action::Revisions | Action::Cleanup => idle && project.is_some(),
             Action::CompressStorage => idle && project.is_some_and(|p| p.has_legacy_storage()),
-            Action::Subsample | Action::RemoveNoise => idle && !self.visible.is_empty(),
+            Action::Subsample | Action::RemoveNoise | Action::RemoveOutliers => {
+                idle && !self.visible.is_empty()
+            }
             Action::FitView | Action::View(_) => project.is_some(),
             Action::Quit
             | Action::ClearSelection
@@ -373,6 +378,13 @@ impl Workbench {
                     min_neighbours: self.settings.noise_neighbours,
                 }))
             }
+            Action::RemoveOutliers => {
+                self.dialog = Some(Dialog::Filter(Filter::Statistical {
+                    neighbours: self.settings.outlier_neighbours,
+                    deviations: self.settings.outlier_deviations,
+                    reach: self.settings.outlier_reach,
+                }))
+            }
             Action::Tool(tool) => {
                 self.selection.tool = tool;
                 if tool != Tool::Measure {
@@ -423,6 +435,15 @@ impl Workbench {
                 self.settings.noise_radius = radius;
                 self.settings.noise_neighbours = min_neighbours;
             }
+            Filter::Statistical {
+                neighbours,
+                deviations,
+                reach,
+            } => {
+                self.settings.outlier_neighbours = neighbours;
+                self.settings.outlier_deviations = deviations;
+                self.settings.outlier_reach = reach;
+            }
         }
         self.start(ctx, true, move |job| {
             match filter {
@@ -431,6 +452,11 @@ impl Workbench {
                     radius,
                     min_neighbours,
                 } => project.remove_noise(radius, min_neighbours, &ids, &job)?,
+                Filter::Statistical {
+                    neighbours,
+                    deviations,
+                    reach,
+                } => project.remove_outliers(neighbours, deviations, reach, &ids, &job)?,
             };
             Ok(project)
         });

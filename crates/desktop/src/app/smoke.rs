@@ -28,7 +28,7 @@ pub struct SmokeOptions {
     /// remove (take out the first scan), measure (measure two picked points),
     /// preview (edit the first scan's transform without applying it),
     /// apply-transform (apply the edited transform), subsample (5 cm voxels),
-    /// noise (0.1 m radius, 4 neighbours), align-icp (ICP of the first scan
+    /// noise (0.1 m radius, 4 neighbours), sor (6 neighbours, 1 sigma), align-icp (ICP of the first scan
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
     /// align-apply (apply the previewed result), ortho (parallel projection,
     /// top view), box (a 2 m slice at the median height, display clipped),
@@ -358,6 +358,14 @@ impl Workbench {
                 eprintln!("Smoke align: {}", self.align_summary());
                 self.align_apply();
             }
+            "sor" => self.run_filter(
+                ctx,
+                super::dialogs::Filter::Statistical {
+                    neighbours: 6,
+                    deviations: 1.,
+                    reach: 0.5,
+                },
+            ),
             "apply-transform" => {
                 if let Some((id, pose)) = self.transform_preview() {
                     self.apply_edit(|p| p.set_transform(id, pose));

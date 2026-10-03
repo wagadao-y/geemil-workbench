@@ -178,6 +178,10 @@ pub enum LayerKind {
     Noise { radius: f64, min_neighbours: u32 },
     /// A 3D box crop: the points inside the box, or outside it.
     Box { inside: bool },
+    /// Statistical outlier removal: points whose mean distance to their
+    /// `neighbours` nearest points exceeds the scan's mean by `deviations`
+    /// standard deviations.
+    Statistical { neighbours: u32, deviations: f64 },
 }
 /// A box in the project frame, turned about the vertical axis.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]

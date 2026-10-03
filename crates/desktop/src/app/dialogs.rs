@@ -37,8 +37,18 @@ pub(super) enum Dialog {
 /// A point filter and its parameters, as edited in its dialog.
 #[derive(Clone, Copy)]
 pub(super) enum Filter {
-    Subsample { size: f64 },
-    Noise { radius: f64, min_neighbours: u32 },
+    Subsample {
+        size: f64,
+    },
+    Noise {
+        radius: f64,
+        min_neighbours: u32,
+    },
+    Statistical {
+        neighbours: u32,
+        deviations: f64,
+        reach: f64,
+    },
 }
 #[derive(Clone, Copy)]
 pub(super) enum AfterDiscard {
@@ -214,6 +224,10 @@ impl Workbench {
                             format!("{} {}", icon::FUNNEL, t.remove_noise),
                             t.noise_message,
                         ),
+                        Filter::Statistical { .. } => (
+                            format!("{} {}", icon::CHART_SCATTER, t.remove_outliers),
+                            t.outliers_message,
+                        ),
                     };
                     ui.heading(heading.trim_end_matches('…'));
                     ui.label(message);
@@ -235,6 +249,26 @@ impl Workbench {
                                 ui.end_row();
                                 ui.label(t.min_neighbours);
                                 ui.add(egui::DragValue::new(min_neighbours).range(1..=100));
+                                ui.end_row();
+                            }
+                            Filter::Statistical {
+                                neighbours,
+                                deviations,
+                                reach,
+                            } => {
+                                ui.label(t.outlier_neighbours);
+                                ui.add(egui::DragValue::new(neighbours).range(1..=64));
+                                ui.end_row();
+                                ui.label(t.outlier_deviations);
+                                ui.add(
+                                    egui::DragValue::new(deviations)
+                                        .range(0.0..=10.)
+                                        .speed(0.05)
+                                        .max_decimals(2),
+                                );
+                                ui.end_row();
+                                ui.label(t.outlier_reach);
+                                ui.add(metres(reach));
                                 ui.end_row();
                             }
                         });

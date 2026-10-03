@@ -96,6 +96,7 @@ impl Workbench {
                     ui.separator();
                     self.menu_item(ui, Action::Subsample, &mut chosen);
                     self.menu_item(ui, Action::RemoveNoise, &mut chosen);
+                    self.menu_item(ui, Action::RemoveOutliers, &mut chosen);
                     ui.separator();
                     self.menu_item(ui, Action::CompressStorage, &mut chosen);
                 });

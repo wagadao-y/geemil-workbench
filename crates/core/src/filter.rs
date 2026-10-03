@@ -135,6 +135,124 @@ fn cell(p: DVec3, size: f64) -> [i64; 3] {
     (p / size).floor().as_i64vec3().to_array()
 }
 
+/// A static kd-tree for nearest-neighbour queries: each subslice is a subtree
+/// whose middle element splits it on the axis stored with it.
+struct KdTree {
+    points: Vec<DVec3>,
+    axes: Vec<u8>,
+}
+impl KdTree {
+    fn new(mut points: Vec<DVec3>) -> Self {
+        let mut axes = vec![0u8; points.len()];
+        fn build(points: &mut [DVec3], axes: &mut [u8]) {
+            if points.len() <= 1 {
+                return;
+            }
+            let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
+            for p in points.iter() {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+            let extent = hi - lo;
+            let axis = if extent.x >= extent.y && extent.x >= extent.z {
+                0
+            } else if extent.y >= extent.z {
+                1
+            } else {
+                2
+            };
+            let mid = points.len() / 2;
+            points.select_nth_unstable_by(mid, |a, b| a[axis].total_cmp(&b[axis]));
+            axes[mid] = axis as u8;
+            let (left, right) = points.split_at_mut(mid);
+            let (left_axes, right_axes) = axes.split_at_mut(mid);
+            build(left, left_axes);
+            build(&mut right[1..], &mut right_axes[1..]);
+        }
+        build(&mut points, &mut axes);
+        Self { points, axes }
+    }
+    /// The squared distances of the `best.len()` nearest points within
+    /// `radius` of `p`, ascending; unfilled slots stay infinite.
+    fn nearest(&self, p: DVec3, radius: f64, best: &mut [f64]) {
+        best.fill(f64::INFINITY);
+        let limit = radius * radius;
+        fn visit(
+            tree: &KdTree,
+            range: std::ops::Range<usize>,
+            p: DVec3,
+            limit: f64,
+            best: &mut [f64],
+        ) {
+            if range.is_empty() {
+                return;
+            }
+            let mid = range.start + range.len() / 2;
+            let q = tree.points[mid];
+            let d2 = q.distance_squared(p);
+            if d2 <= limit && d2 < best[best.len() - 1] {
+                // Insert into the ascending list.
+                let mut i = best.len() - 1;
+                while i > 0 && best[i - 1] > d2 {
+                    best[i] = best[i - 1];
+                    i -= 1;
+                }
+                best[i] = d2;
+            }
+            let axis = tree.axes[mid] as usize;
+            let diff = p[axis] - q[axis];
+            let (near, far) = if diff < 0. {
+                (range.start..mid, mid + 1..range.end)
+            } else {
+                (mid + 1..range.end, range.start..mid)
+            };
+            visit(tree, near, p, limit, best);
+            if diff * diff <= limit.min(best[best.len() - 1]) {
+                visit(tree, far, p, limit, best);
+            }
+        }
+        visit(self, 0..self.points.len(), p, limit, best);
+    }
+}
+
+/// Mean distance from each surviving point of `chunk` to its `k` nearest
+/// other points of the scan within `radius`; `None` where fewer are in reach.
+fn mean_neighbour_distances(
+    cache: &ChunkCache,
+    chunk: u32,
+    k: usize,
+    radius: f64,
+    job: &JobControl,
+) -> Result<(std::sync::Arc<ChunkPoints>, Vec<Option<f64>>)> {
+    let own = cache.get(chunk, job)?;
+    let bounds = &cache.scan.chunks[chunk as usize].bounds;
+    let lo = DVec3::from(bounds.min) - radius;
+    let hi = DVec3::from(bounds.max) + radius;
+    let mut points = own.positions.clone();
+    points.extend(
+        cache
+            .neighbours(chunk, lo, hi, job)?
+            .into_iter()
+            .map(|(p, ..)| p),
+    );
+    let tree = KdTree::new(points);
+    // The point itself comes first at distance 0.
+    let mut best = vec![0.; k + 1];
+    let mut result = Vec::with_capacity(own.positions.len());
+    for (i, p) in own.positions.iter().enumerate() {
+        if i % 4096 == 0 {
+            job.check()?;
+        }
+        tree.nearest(*p, radius, &mut best);
+        result.push(
+            best[k]
+                .is_finite()
+                .then(|| best[1..].iter().map(|d| d.sqrt()).sum::<f64>() / k as f64),
+        );
+    }
+    Ok((own, result))
+}
+
 /// A chunk's exclusion mask and the number of points it excludes.
 type ChunkResult = (Vec<u8>, u64);
 
@@ -339,6 +457,77 @@ impl Project {
             },
         )
     }
+    /// Statistical outlier removal, per scan: a point is excluded when its mean
+    /// distance to its `neighbours` nearest points is more than `deviations`
+    /// standard deviations above the scan's mean, or when fewer than
+    /// `neighbours` points are within `max_distance` (which bounds how far
+    /// neighbouring chunks are read). Two passes: statistics, then the mask.
+    pub fn remove_outliers(
+        &mut self,
+        neighbours: u32,
+        deviations: f64,
+        max_distance: f64,
+        scan_ids: &[Uuid],
+        job: &JobControl,
+    ) -> Result<u64> {
+        ensure!((1..=256).contains(&neighbours), "Invalid neighbour count");
+        ensure!(
+            deviations.is_finite() && deviations >= 0.,
+            "Invalid deviation"
+        );
+        ensure!(
+            max_distance.is_finite() && max_distance > 0.,
+            "Invalid search distance"
+        );
+        let k = neighbours as usize;
+        let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
+        let statistics = Progress::new(Stage::OutlierStatistics, &scans, 1);
+        let filtering = Progress::new(Stage::OutlierFilter, &scans, 1);
+        let mut layer = LayerWriter::new(self)?;
+        for scan in &scans {
+            let cache = ChunkCache::new(self, scan);
+            let sums = each_chunk(&cache, job, &statistics, &|cache, chunk, job| {
+                let (_, distances) = mean_neighbour_distances(cache, chunk, k, max_distance, job)?;
+                Ok(distances
+                    .into_iter()
+                    .flatten()
+                    .fold((0u64, 0., 0.), |(n, s, q), d| (n + 1, s + d, q + d * d)))
+            })?;
+            let (n, sum, squares) = sums
+                .into_iter()
+                .fold((0u64, 0., 0.), |(n, s, q), (a, b, c)| (n + a, s + b, q + c));
+            let mean = sum / n.max(1) as f64;
+            let sigma = (squares / n.max(1) as f64 - mean * mean).max(0.).sqrt();
+            let threshold = mean + deviations * sigma;
+            let masks = each_chunk(&cache, job, &filtering, &|cache, chunk, job| {
+                let (own, distances) =
+                    mean_neighbour_distances(cache, chunk, k, max_distance, job)?;
+                let mut mask =
+                    vec![0u8; (cache.scan.chunks[chunk as usize].count as usize).div_ceil(8)];
+                let mut count = 0;
+                for (index, d) in own.indices.iter().zip(distances) {
+                    if d.is_none_or(|d| d > threshold) {
+                        mask[*index as usize / 8] |= 1 << (index % 8);
+                        count += 1;
+                    }
+                }
+                Ok((mask, count))
+            })?;
+            for (chunk, (mask, count)) in masks.into_iter().enumerate() {
+                layer.push(scan.id, chunk as u32, &mask, count)?;
+            }
+        }
+        job.check()?;
+        layer.finish(
+            self,
+            LayerKind::Statistical {
+                neighbours,
+                deviations,
+            },
+            serde_json::json!({"kind": "outlier_filter", "neighbours": neighbours,
+                "deviations": deviations, "max_distance": max_distance, "scans": scan_ids}),
+        )
+    }
     /// Runs `judge` on every chunk of the scans on worker threads and writes
     /// the results, in chunk order, as one layer.
     fn filter(
@@ -351,47 +540,83 @@ impl Project {
         judge: impl Fn(&ChunkCache, u32, &JobControl) -> Result<ChunkResult> + Sync,
     ) -> Result<u64> {
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
-        let total: u64 = scans.iter().map(|s| s.chunks.len() as u64).sum();
-        let done = AtomicU64::new(0);
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+        let progress = Progress::new(stage, &scans, 1);
         let mut layer = LayerWriter::new(self)?;
         for scan in &scans {
             let cache = ChunkCache::new(self, scan);
-            let results: Vec<Mutex<Option<ChunkResult>>> =
-                scan.chunks.iter().map(|_| Mutex::new(None)).collect();
-            let next = AtomicUsize::new(0);
-            let failed = AtomicBool::new(false);
-            let error = Mutex::new(None);
-            std::thread::scope(|scope| {
-                for _ in 0..workers.min(scan.chunks.len()) {
-                    scope.spawn(|| {
-                        while !failed.load(Ordering::Relaxed) {
-                            let chunk = next.fetch_add(1, Ordering::Relaxed);
-                            if chunk >= scan.chunks.len() {
-                                break;
-                            }
-                            match judge(&cache, chunk as u32, job) {
-                                Ok(result) => *results[chunk].lock().unwrap() = Some(result),
-                                Err(e) => {
-                                    failed.store(true, Ordering::Relaxed);
-                                    error.lock().unwrap().get_or_insert(e);
-                                    break;
-                                }
-                            }
-                            job.report(stage, done.fetch_add(1, Ordering::Relaxed) + 1, total);
-                        }
-                    });
-                }
-            });
-            if let Some(e) = error.into_inner().unwrap() {
-                return Err(e);
-            }
-            for (chunk, result) in results.into_iter().enumerate() {
-                let (mask, count) = result.into_inner().unwrap().expect("every chunk judged");
+            let results = each_chunk(&cache, job, &progress, &judge)?;
+            for (chunk, (mask, count)) in results.into_iter().enumerate() {
                 layer.push(scan.id, chunk as u32, &mask, count)?;
             }
         }
         job.check()?;
         layer.finish(self, kind, operation)
     }
+}
+
+/// Chunks done over all passes, for progress reports.
+struct Progress {
+    stage: Stage,
+    done: AtomicU64,
+    total: u64,
+}
+impl Progress {
+    fn new(stage: Stage, scans: &[&Scan], passes: u64) -> Self {
+        Self {
+            stage,
+            done: AtomicU64::new(0),
+            total: scans.iter().map(|s| s.chunks.len() as u64).sum::<u64>() * passes,
+        }
+    }
+    fn step(&self, job: &JobControl) {
+        job.report(
+            self.stage,
+            self.done.fetch_add(1, Ordering::Relaxed) + 1,
+            self.total,
+        );
+    }
+}
+
+/// Runs `work` on every chunk of the cache's scan on worker threads and
+/// returns the results in chunk order; the first error stops the rest.
+fn each_chunk<R: Send>(
+    cache: &ChunkCache,
+    job: &JobControl,
+    progress: &Progress,
+    work: &(impl Fn(&ChunkCache, u32, &JobControl) -> Result<R> + Sync),
+) -> Result<Vec<R>> {
+    let chunks = cache.scan.chunks.len();
+    let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
+    let results: Vec<Mutex<Option<R>>> = (0..chunks).map(|_| Mutex::new(None)).collect();
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let error = Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..workers.min(chunks) {
+            scope.spawn(|| {
+                while !failed.load(Ordering::Relaxed) {
+                    let chunk = next.fetch_add(1, Ordering::Relaxed);
+                    if chunk >= chunks {
+                        break;
+                    }
+                    match work(cache, chunk as u32, job) {
+                        Ok(result) => *results[chunk].lock().unwrap() = Some(result),
+                        Err(e) => {
+                            failed.store(true, Ordering::Relaxed);
+                            error.lock().unwrap().get_or_insert(e);
+                            break;
+                        }
+                    }
+                    progress.step(job);
+                }
+            });
+        }
+    });
+    if let Some(e) = error.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(results
+        .into_iter()
+        .map(|r| r.into_inner().unwrap().expect("every chunk processed"))
+        .collect())
 }

@@ -64,7 +64,8 @@ fn main() -> Result<()> {
     let points: u64 = args[2].parse()?;
     std::fs::create_dir_all(out)?;
     for s in 0..scans {
-        let mut rng = Rng(0x9e37_79b9_7f4a_7c15 ^ (s as u64 + 1) * 0x2545_f491_4f6c_dd1d);
+        let mut rng =
+            Rng(0x9e37_79b9_7f4a_7c15 ^ (s as u64 + 1).wrapping_mul(0x2545_f491_4f6c_dd1d));
         // Scanners on a spiral inside the walls, 1.6 m above the ground.
         let angle = s as f64 * 2.4;
         let radius = 8. + 40. * (s as f64 / scans.max(1) as f64);

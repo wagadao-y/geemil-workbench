@@ -52,6 +52,9 @@ pub(super) struct Settings {
     noise_neighbours: u32,
     icp_distance: f64,
     icp_samples: usize,
+    outlier_neighbours: u32,
+    outlier_deviations: f64,
+    outlier_reach: f64,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -67,6 +70,10 @@ impl Default for Settings {
             noise_neighbours: 4,
             icp_distance: 0.5,
             icp_samples: 60_000,
+            // CloudCompare's defaults.
+            outlier_neighbours: 6,
+            outlier_deviations: 1.0,
+            outlier_reach: 0.5,
         }
     }
 }
