@@ -1,5 +1,6 @@
 //! Portable, immutable point storage and revision operations.
 
+mod align;
 mod codec;
 mod edit;
 mod error;
@@ -13,6 +14,7 @@ mod storage;
 mod tree;
 mod view_cache;
 
+pub use align::{IcpOptions, IcpResult, rigid_fit};
 pub use edit::{
     Camera, LoadedView, PreparedSelection, Projector, Selection, SelectionMode, ViewSegment,
 };

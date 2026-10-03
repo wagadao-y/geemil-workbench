@@ -441,10 +441,13 @@ pub static JA: Strings = Strings {
         Stage::NoiseFilter => "ノイズを判定中",
         Stage::WritingE57 => "E57を書き出し中",
         Stage::WritingLas => "LAS/LAZを書き出し中",
+        Stage::IcpSampling => "ICP: 点を抽出中",
+        Stage::IcpIterations => "ICP: 反復計算中",
         Stage::ViewLod => "表示LODを選択中",
         Stage::ViewPoints => "表示点を読み込み中",
     },
-    core_error: |error| match error {
+    core_error: |error| {
+        match error {
         CoreError::Cancelled => "キャンセルしました。".into(),
         CoreError::UnsupportedFormat => "対応している形式はE57、LAS、LAZです。".into(),
         CoreError::OutputExists(p) => {
@@ -466,8 +469,15 @@ pub static JA: Strings = Strings {
             format!("このバージョンでは開けないプロジェクト形式です（形式バージョン {v}）。")
         }
         CoreError::CoordinateSystemMismatch => {
-            "座標系の異なるスキャンを一つのE57へ書き出すことはできません。".into()
+            "座標系の異なるスキャンを一つのファイルへ書き出すことはできません。".into()
         }
+        CoreError::NoOverlap => {
+            "基準のスキャンと重なる点が見つかりません。対応点で大まかに合わせるか、最大対応距離を大きくしてください。".into()
+        }
+        CoreError::AlignmentUndetermined => {
+            "重なる部分の形状（平面だけなど）から位置が決まりません。対応点で合わせてください。".into()
+        }
+    }
     },
 };
 

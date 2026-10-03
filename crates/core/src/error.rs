@@ -19,6 +19,8 @@ pub enum Stage {
     NoiseFilter,
     WritingE57,
     WritingLas,
+    IcpSampling,
+    IcpIterations,
     ViewLod,
     ViewPoints,
 }
@@ -40,6 +42,8 @@ impl fmt::Display for Stage {
             Self::NoiseFilter => "Noise filter",
             Self::WritingE57 => "Writing E57",
             Self::WritingLas => "Writing LAS/LAZ",
+            Self::IcpSampling => "ICP: sampling",
+            Self::IcpIterations => "ICP: iterating",
             Self::ViewLod => "View LOD",
             Self::ViewPoints => "View points",
         })
@@ -57,6 +61,10 @@ pub enum CoreError {
     NotAProject(PathBuf),
     UnsupportedProjectFormat(u32),
     CoordinateSystemMismatch,
+    /// ICP found no reference points within reach of the moved points.
+    NoOverlap,
+    /// The overlap does not fix the motion, e.g. it is a single plane.
+    AlignmentUndetermined,
 }
 impl CoreError {
     pub fn find(error: &anyhow::Error) -> Option<&Self> {
@@ -75,6 +83,10 @@ impl fmt::Display for CoreError {
             Self::NotAProject(p) => write!(f, "Not a project directory: {}", p.display()),
             Self::UnsupportedProjectFormat(v) => write!(f, "Unsupported project format {v}"),
             Self::CoordinateSystemMismatch => write!(f, "Scans have different coordinate systems"),
+            Self::NoOverlap => write!(f, "No overlap with the reference within the distance"),
+            Self::AlignmentUndetermined => {
+                write!(f, "The overlap does not determine the alignment")
+            }
         }
     }
 }
