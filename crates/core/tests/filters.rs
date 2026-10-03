@@ -211,3 +211,53 @@ fn filters_reject_invalid_parameters_and_cancel_without_a_layer() {
     assert!(p.manifest.layers.is_empty());
     assert_eq!(p.current().id, state);
 }
+
+#[test]
+fn box_crop_matches_brute_force_and_inside_complements_outside() {
+    use geemil_core::{CropBox, Pose};
+    use glam::{DQuat, DVec3};
+    let dir = tempfile::tempdir().unwrap();
+    let crop = CropBox {
+        center: [500004.5, 4000001.2, 0.5],
+        size: [3., 1.5, 2.],
+        yaw: 0.4,
+    };
+    for (name, chunk_points) in [("small", 64), ("large", 65_536)] {
+        let mut p = project(dir.path(), name, chunk_points);
+        let scan = p.scans().next().unwrap().clone();
+        // A transformed scan: the box applies in the project frame.
+        let centre = DVec3::new(500005., 4000001., 0.);
+        let pose = Pose::from_matrix(
+            glam::DMat4::from_translation(centre + DVec3::new(0.3, -0.2, 0.))
+                * glam::DMat4::from_quat(DQuat::from_rotation_z(0.05))
+                * glam::DMat4::from_translation(-centre),
+        );
+        p.set_transform(scan.id, pose).unwrap();
+        let world = p.world_matrix(&scan);
+        let all = surviving(&p);
+        let expected_inside = all
+            .iter()
+            .filter(|q| crop.contains(world.transform_point3(DVec3::from(**q))))
+            .count() as u64;
+        assert!(expected_inside > 100 && expected_inside < all.len() as u64 / 2);
+        let state = p.manifest.draft.clone();
+        let removed = p
+            .exclude_box(&crop, true, &[scan.id], &JobControl::default())
+            .unwrap();
+        assert_eq!(removed, expected_inside);
+        assert!(
+            surviving(&p)
+                .iter()
+                .all(|q| !crop.contains(world.transform_point3(DVec3::from(*q))))
+        );
+        p.restore_working_state(state).unwrap();
+        let removed = p
+            .exclude_box(&crop, false, &[scan.id], &JobControl::default())
+            .unwrap();
+        assert_eq!(removed, all.len() as u64 - expected_inside);
+        assert_eq!(
+            p.manifest.layers.last().unwrap().kind,
+            LayerKind::Box { inside: false }
+        );
+    }
+}

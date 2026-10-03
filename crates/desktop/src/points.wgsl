@@ -1,4 +1,7 @@
-struct Camera { matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, padding: f32, tint: vec4<f32>, depth: vec4<f32> };
+struct Camera {
+    matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, padding: f32, tint: vec4<f32>,
+    depth: vec4<f32>, clip: mat4x4<f32>, clip_on: f32, pad_a: f32, pad_b: f32, pad_c: f32,
+};
 @group(0) @binding(0) var<uniform> camera: Camera;
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -17,6 +20,10 @@ struct Out {
     // View-space distance along the camera axis; screen-aligned splats keep it
     // constant. 0 marks background, so keep drawn points above it.
     out.depth = max(dot(camera.depth, vec4(position, 1.0)), 1e-6);
+    // Outside the clipping box: put the splat behind the near plane.
+    if camera.clip_on > 0.5 && any(abs((camera.clip * vec4(position, 1.0)).xyz) > vec3(1.0)) {
+        out.position = vec4(0.0, 0.0, -2.0, 1.0);
+    }
     return out;
 }
 fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {

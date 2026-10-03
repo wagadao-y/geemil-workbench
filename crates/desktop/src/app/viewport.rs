@@ -1,5 +1,5 @@
 use super::Workbench;
-use crate::render::Edl;
+use crate::render::{DrawOptions, Edl};
 use eframe::egui;
 use glam::DVec3;
 
@@ -29,16 +29,19 @@ impl Workbench {
                 rs,
                 &self.camera,
                 [(size.x * pixels) as u32, (size.y * pixels) as u32],
-                settings.point_size * pixels,
-                Edl {
-                    radius: 1.4 * pixels,
-                    strength: if settings.edl {
-                        settings.edl_strength
-                    } else {
-                        0.
+                &DrawOptions {
+                    point_size: settings.point_size * pixels,
+                    edl: Edl {
+                        radius: 1.4 * pixels,
+                        strength: if settings.edl {
+                            settings.edl_strength
+                        } else {
+                            0.
+                        },
                     },
+                    segments: segments.as_deref(),
+                    clip: self.display_clip().map(|c| c.unit_matrix()),
                 },
-                segments.as_deref(),
             );
             let response =
                 ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
@@ -52,6 +55,7 @@ impl Workbench {
             self.draw_selection(ui, &response);
             self.draw_measure(ui, response.rect);
             self.draw_align(ui, response.rect);
+            self.draw_box(ui, response.rect);
             self.draw_pivot(ui, &response);
         });
     }

@@ -2,6 +2,7 @@
 //! smoke tests live in submodules as further `impl Workbench` blocks.
 mod actions;
 mod align;
+mod crop;
 mod dialogs;
 mod jobs;
 mod measure;
@@ -106,6 +107,7 @@ pub struct Workbench {
     selection: selection::SelectionState,
     measure: measure::Measure,
     align: align::Align,
+    crop: crop::Crop,
     transform_edit: tree::TransformEdit,
     undo: undo::UndoStack,
     dialog: Option<dialogs::Dialog>,
@@ -161,6 +163,7 @@ impl Workbench {
             selection: Default::default(),
             measure: Default::default(),
             align: Default::default(),
+            crop: Default::default(),
             transform_edit: Default::default(),
             undo: Default::default(),
             dialog: None,
@@ -278,6 +281,7 @@ impl eframe::App for Workbench {
         self.status_bar(ui);
         self.side_panel(ui);
         self.align_panel(ui);
+        self.crop_panel(ui);
         if self.project.is_some() || self.smoke.colors {
             self.viewport(ui, frame);
         } else {

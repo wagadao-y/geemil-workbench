@@ -31,7 +31,8 @@ pub struct SmokeOptions {
     /// noise (0.1 m radius, 4 neighbours), align-icp (ICP of the first scan
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
     /// align-apply (apply the previewed result), ortho (parallel projection,
-    /// top view).
+    /// top view), box (a 2 m slice at the median height, display clipped),
+    /// box-crop (exclude everything outside that box).
     pub script: Vec<String>,
 }
 
@@ -333,6 +334,18 @@ impl Workbench {
                 self.perform(ctx, Action::ToggleOrtho);
                 self.perform(ctx, Action::View(super::actions::ViewPreset::Top));
             }
+            "box" => {
+                self.smoke_box();
+                if let Some(region) = self.crop.region {
+                    let inside = self
+                        .points
+                        .iter()
+                        .filter(|p| region.contains(p.position.into()))
+                        .count();
+                    eprintln!("Smoke box: {region:?}, {inside} displayed points inside");
+                }
+            }
+            "box-crop" => self.exclude_box(ctx, false),
             "align-icp" => self.smoke_icp(ctx),
             "align-pairs" => {
                 self.smoke_pairs();

@@ -213,6 +213,9 @@ impl Workbench {
                 Tool::Align => {
                     ui.weak(t.hint_align);
                 }
+                Tool::Box => {
+                    ui.weak(t.hint_box);
+                }
                 Tool::Measure => {
                     match self.measure.distance() {
                         Some((d, h, v)) => ui.strong((t.measure_result)(d, h, v)),

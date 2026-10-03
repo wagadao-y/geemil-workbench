@@ -31,6 +31,11 @@ struct Uniform {
     tint: [f32; 4],
     /// View depth of a vertex for EDL as `dot(depth, (position, 1))`.
     depth: [f32; 4],
+    /// Maps a vertex into box coordinates; points outside `[-1, 1]` are not
+    /// drawn when `clip_on` is 1.
+    clip: [[f32; 4]; 4],
+    clip_on: f32,
+    padding2: [f32; 3],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -54,6 +59,16 @@ struct Targets {
     depth: wgpu::TextureView,
     output: wgpu::TextureView,
     edl_bind: wgpu::BindGroup,
+}
+/// How to draw the uploaded points.
+pub struct DrawOptions<'a> {
+    /// Splat diameter in physical pixels.
+    pub point_size: f32,
+    pub edl: Edl,
+    /// Ranges of points to move or tint; `None` draws everything as uploaded.
+    pub segments: Option<&'a [Segment]>,
+    /// Maps the project frame into a box outside of which nothing is drawn.
+    pub clip: Option<DMat4>,
 }
 /// Instances drawn with one transform: a range of uploaded points and the
 /// world-space motion to apply to them, e.g. a transform being previewed.
@@ -226,17 +241,20 @@ impl PointRenderer {
             }
         }
     }
-    /// Draws the uploaded points; `segments` moves ranges of them, and `None`
-    /// draws everything where it was uploaded.
+    /// Draws the uploaded points.
     pub fn draw(
         &mut self,
         rs: &eframe::egui_wgpu::RenderState,
         camera: &Camera,
         size: [u32; 2],
-        point_size: f32,
-        edl: Edl,
-        segments: Option<&[Segment]>,
+        options: &DrawOptions,
     ) -> egui::TextureId {
+        let DrawOptions {
+            point_size,
+            edl,
+            segments,
+            clip,
+        } = *options;
         let limit = self.device.limits().max_texture_dimension_2d;
         let size = size.map(|v| v.clamp(1, limit));
         if self.targets.as_ref().is_none_or(|t| t.size != size) {
@@ -308,6 +326,12 @@ impl PointRenderer {
                 padding: 0.,
                 tint: segment.tint,
                 depth: depth.as_vec4().to_array(),
+                clip: clip
+                    .map_or(DMat4::IDENTITY, |c| c * to_world)
+                    .as_mat4()
+                    .to_cols_array_2d(),
+                clip_on: clip.is_some() as u32 as f32,
+                padding2: [0.; 3],
             };
             slot[..UNIFORM_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&uniform));
         }

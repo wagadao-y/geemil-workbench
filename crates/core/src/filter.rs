@@ -5,7 +5,7 @@
 //! add an exclusion layer instead of rewriting points.
 use crate::edit::{LayerWriter, is_excluded};
 use crate::storage::{position, valid};
-use crate::{Bounds, JobControl, LayerKind, Project, Scan, Stage};
+use crate::{Bounds, CropBox, JobControl, LayerKind, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use glam::DVec3;
 use std::{
@@ -286,6 +286,57 @@ impl Project {
                 "min_neighbours": min_neighbours, "scans": scan_ids}),
             job,
             |cache, chunk, job| noise_chunk(cache, chunk, radius, min_neighbours, job),
+        )
+    }
+    /// Excludes the points of `scan_ids` inside `crop` (or outside it, for
+    /// cropping to it) as a new layer. Chunks entirely on the kept side are
+    /// not read.
+    pub fn exclude_box(
+        &mut self,
+        crop: &CropBox,
+        inside: bool,
+        scan_ids: &[Uuid],
+        job: &JobControl,
+    ) -> Result<u64> {
+        ensure!(
+            crop.size.iter().all(|s| s.is_finite() && *s > 0.)
+                && crop.center.iter().chain([&crop.yaw]).all(|v| v.is_finite()),
+            "Invalid box"
+        );
+        let unit = crop.unit_matrix();
+        self.filter(
+            scan_ids,
+            Stage::BoxCrop,
+            LayerKind::Box { inside },
+            serde_json::json!({"kind": "box", "box": crop, "inside": inside, "scans": scan_ids}),
+            job,
+            |cache, chunk, job| {
+                let to_box = unit * cache.project.world_matrix(cache.scan);
+                let info = &cache.scan.chunks[chunk as usize];
+                let mut mask = vec![0u8; (info.count as usize).div_ceil(8)];
+                // The chunk's bounds in box coordinates, conservatively.
+                let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
+                for c in info.bounds.corners() {
+                    let q = to_box.transform_point3(c);
+                    lo = lo.min(q);
+                    hi = hi.max(q);
+                }
+                let disjoint = lo.cmpgt(DVec3::ONE).any() || hi.cmplt(-DVec3::ONE).any();
+                let within = lo.cmpge(-DVec3::ONE).all() && hi.cmple(DVec3::ONE).all();
+                if (inside && disjoint) || (!inside && within) {
+                    return Ok((mask, 0));
+                }
+                let points = cache.get(chunk, job)?;
+                let mut count = 0;
+                for (p, index) in points.positions.iter().zip(&points.indices) {
+                    let q = to_box.transform_point3(*p);
+                    if q.abs().cmple(DVec3::ONE).all() == inside {
+                        mask[*index as usize / 8] |= 1 << (index % 8);
+                        count += 1;
+                    }
+                }
+                Ok((mask, count))
+            },
         )
     }
     /// Runs `judge` on every chunk of the scans on worker threads and writes

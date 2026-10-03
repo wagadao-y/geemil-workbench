@@ -173,6 +173,44 @@ pub enum LayerKind {
     /// Isolated point removal: points with fewer than `min_neighbours` other
     /// points within `radius` metres.
     Noise { radius: f64, min_neighbours: u32 },
+    /// A 3D box crop: the points inside the box, or outside it.
+    Box { inside: bool },
+}
+/// A box in the project frame, turned about the vertical axis.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct CropBox {
+    pub center: [f64; 3],
+    /// Full edge lengths along the box's own axes, in metres.
+    pub size: [f64; 3],
+    /// Turn about Z, in radians.
+    pub yaw: f64,
+}
+impl CropBox {
+    /// Maps the project frame onto box coordinates in which the box is
+    /// `[-1, 1]` on every axis.
+    pub fn unit_matrix(&self) -> DMat4 {
+        DMat4::from_scale(DVec3::from(self.size).map(|s| 2. / s))
+            * DMat4::from_rotation_z(-self.yaw)
+            * DMat4::from_translation(-DVec3::from(self.center))
+    }
+    pub fn contains(&self, p: DVec3) -> bool {
+        self.unit_matrix()
+            .transform_point3(p)
+            .abs()
+            .cmple(DVec3::ONE)
+            .all()
+    }
+    /// The eight corners in the project frame.
+    pub fn corners(&self) -> [DVec3; 8] {
+        let to_world = self.unit_matrix().inverse();
+        std::array::from_fn(|i| {
+            to_world.transform_point3(DVec3::new(
+                if i & 1 == 0 { -1. } else { 1. },
+                if i & 2 == 0 { -1. } else { 1. },
+                if i & 4 == 0 { -1. } else { 1. },
+            ))
+        })
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {

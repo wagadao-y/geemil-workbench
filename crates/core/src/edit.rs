@@ -417,6 +417,8 @@ impl LayerWriter {
                     radius,
                     min_neighbours,
                 } => format!("Noise filter {radius} m, {min_neighbours} neighbours"),
+                LayerKind::Box { inside: true } => format!("Box: inside ({total} points)"),
+                LayerKind::Box { inside: false } => format!("Box: outside ({total} points)"),
             },
             mask_file: relative,
             masks,

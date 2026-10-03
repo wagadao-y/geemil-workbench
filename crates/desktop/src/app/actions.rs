@@ -86,6 +86,7 @@ impl Action {
             Self::Tool(Tool::Polygon) => icon::POLYGON,
             Self::Tool(Tool::Measure) => icon::RULER,
             Self::Tool(Tool::Align) => icon::CROSSHAIR,
+            Self::Tool(Tool::Box) => icon::CUBE_FOCUS,
             Self::Shortcuts => icon::KEYBOARD,
             Self::About => icon::INFO,
         }
@@ -124,6 +125,7 @@ impl Action {
             Self::Tool(Tool::Polygon) => t.tool_polygon.into(),
             Self::Tool(Tool::Measure) => t.tool_measure.into(),
             Self::Tool(Tool::Align) => t.tool_align.into(),
+            Self::Tool(Tool::Box) => t.tool_box.into(),
             Self::Shortcuts => t.shortcuts.into(),
             Self::About => t.about.into(),
         }
@@ -150,6 +152,7 @@ impl Action {
             Self::Tool(Tool::Polygon) => Key::P,
             Self::Tool(Tool::Measure) => Key::M,
             Self::Tool(Tool::Align) => Key::A,
+            Self::Tool(Tool::Box) => Key::B,
             Self::Exclude => Key::Delete,
             Self::ClearSelection => Key::Escape,
             Self::FitView => Key::F,
@@ -183,6 +186,7 @@ const KEYED: &[Action] = &[
     Action::Tool(Tool::Polygon),
     Action::Tool(Tool::Measure),
     Action::Tool(Tool::Align),
+    Action::Tool(Tool::Box),
     Action::Exclude,
     Action::ClearSelection,
     Action::FitView,

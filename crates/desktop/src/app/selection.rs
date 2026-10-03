@@ -24,19 +24,24 @@ pub(super) enum Tool {
     Polygon,
     Measure,
     Align,
+    Box,
 }
 /// Tools in toolbar and menu order.
-pub(super) const TOOLS: [Tool; 5] = [
+pub(super) const TOOLS: [Tool; 6] = [
     Tool::Navigate,
     Tool::Rect,
     Tool::Polygon,
+    Tool::Box,
     Tool::Measure,
     Tool::Align,
 ];
 impl Tool {
     /// Tools that pick points with a click leave the left drag for orbiting.
     pub(super) fn orbits(self) -> bool {
-        matches!(self, Tool::Navigate | Tool::Measure | Tool::Align)
+        matches!(
+            self,
+            Tool::Navigate | Tool::Measure | Tool::Align | Tool::Box
+        )
     }
 }
 
@@ -281,7 +286,7 @@ impl Workbench {
         let camera = self.camera;
         let s = &mut self.selection;
         match s.tool {
-            Tool::Navigate | Tool::Measure | Tool::Align => {}
+            Tool::Navigate | Tool::Measure | Tool::Align | Tool::Box => {}
             Tool::Polygon => {
                 // The first click of a double click already added the last vertex.
                 if response.double_clicked() {
