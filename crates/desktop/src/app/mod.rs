@@ -36,6 +36,18 @@ use std::{
 use uuid::Uuid;
 use view::ViewLoader;
 
+/// What the points are coloured by.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub(super) enum ColorMode {
+    /// The colour stored with each point.
+    #[default]
+    Rgb,
+    /// A colour ramp over the height of the displayed points.
+    Height,
+    /// One colour per scan.
+    Scan,
+}
+
 /// Preferences kept between sessions.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -46,6 +58,7 @@ pub(super) struct Settings {
     point_size: f32,
     edl: bool,
     edl_strength: f32,
+    color_mode: ColorMode,
     /// Last filter parameters, offered again next time.
     subsample_size: f64,
     subsample_merged: bool,
@@ -66,6 +79,7 @@ impl Default for Settings {
             point_size: 2.,
             edl: true,
             edl_strength: 1.,
+            color_mode: ColorMode::Rgb,
             subsample_size: 0.01,
             subsample_merged: false,
             noise_radius: 0.05,
@@ -105,6 +119,9 @@ pub struct Workbench {
     points_segments: Vec<ViewSegment>,
     points_generation: u64,
     points_origin: [f64; 3],
+    /// Height range for colouring by height, and what it was taken from.
+    height_range: Option<[f64; 2]>,
+    height_for: Option<(Uuid, Vec<Uuid>)>,
     view_ms: f64,
     dirty: bool,
     last_request: Instant,
@@ -162,6 +179,8 @@ impl Workbench {
             points_segments: vec![],
             points_generation: 0,
             points_origin: [0.; 3],
+            height_range: None,
+            height_for: None,
             view_ms: 0.,
             dirty: false,
             last_request: Instant::now(),

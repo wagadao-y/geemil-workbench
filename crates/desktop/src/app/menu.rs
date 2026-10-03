@@ -81,6 +81,15 @@ impl Workbench {
                         self.menu_item(ui, Action::View(preset), &mut chosen);
                     }
                     ui.separator();
+                    ui.label(t.color_by);
+                    for (mode, label) in [
+                        (super::ColorMode::Rgb, t.color_rgb),
+                        (super::ColorMode::Height, t.color_height),
+                        (super::ColorMode::Scan, t.color_scan),
+                    ] {
+                        ui.radio_value(&mut self.settings.color_mode, mode, label);
+                    }
+                    ui.separator();
                     self.menu_item(ui, Action::ToggleOrtho, &mut chosen);
                     self.menu_item(ui, Action::ToggleEdl, &mut chosen);
                     ui.add_enabled(
@@ -189,6 +198,19 @@ impl Workbench {
                 }
                 ui.label(t.point_size);
                 ui.add(egui::Slider::new(&mut self.settings.point_size, 1.0..=8.0).step_by(0.5));
+                ui.label(t.color_by);
+                let mode = &mut self.settings.color_mode;
+                egui::ComboBox::from_id_salt("color mode")
+                    .selected_text(match mode {
+                        super::ColorMode::Rgb => t.color_rgb,
+                        super::ColorMode::Height => t.color_height,
+                        super::ColorMode::Scan => t.color_scan,
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(mode, super::ColorMode::Rgb, t.color_rgb);
+                        ui.selectable_value(mode, super::ColorMode::Height, t.color_height);
+                        ui.selectable_value(mode, super::ColorMode::Scan, t.color_scan);
+                    });
             });
         });
         if let Some(action) = chosen {

@@ -33,7 +33,8 @@ pub struct SmokeOptions {
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
     /// align-apply (apply the previewed result), ortho (parallel projection,
     /// top view), box (a 2 m slice at the median height, display clipped),
-    /// box-crop (exclude everything outside that box).
+    /// box-crop (exclude everything outside that box), color-height and
+    /// color-scan (colour modes).
     pub script: Vec<String>,
 }
 
@@ -352,6 +353,8 @@ impl Workbench {
                 self.perform(ctx, Action::ToggleOrtho);
                 self.perform(ctx, Action::View(super::actions::ViewPreset::Top));
             }
+            "color-height" => self.settings.color_mode = super::ColorMode::Height,
+            "color-scan" => self.settings.color_mode = super::ColorMode::Scan,
             "box" => {
                 self.smoke_box();
                 if let Some(region) = self.crop.region {

@@ -1,3 +1,4 @@
+use super::ColorMode;
 use super::Workbench;
 use crate::render::{DrawOptions, Edl};
 use eframe::egui;
@@ -41,6 +42,9 @@ impl Workbench {
                     },
                     segments: segments.as_deref(),
                     clip: self.display_clip().map(|c| c.unit_matrix()),
+                    height_ramp: (self.settings.color_mode == ColorMode::Height)
+                        .then_some(self.height_range)
+                        .flatten(),
                 },
             );
             let response =

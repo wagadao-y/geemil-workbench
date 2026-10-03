@@ -35,7 +35,11 @@ struct Uniform {
     /// drawn when `clip_on` is 1.
     clip: [[f32; 4]; 4],
     clip_on: f32,
-    padding2: [f32; 3],
+    /// 1 to colour by height with `ramp`.
+    ramp_on: f32,
+    padding2: [f32; 2],
+    /// Height scaled to 0..1 over the ramp as `dot(ramp, (position, 1))`.
+    ramp: [f32; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -69,6 +73,8 @@ pub struct DrawOptions<'a> {
     pub segments: Option<&'a [Segment]>,
     /// Maps the project frame into a box outside of which nothing is drawn.
     pub clip: Option<DMat4>,
+    /// Colour by height from the first to the second value (project Z).
+    pub height_ramp: Option<[f64; 2]>,
 }
 /// Instances drawn with one transform: a range of uploaded points and the
 /// world-space motion to apply to them, e.g. a transform being previewed.
@@ -254,6 +260,7 @@ impl PointRenderer {
             edl,
             segments,
             clip,
+            height_ramp,
         } = *options;
         let limit = self.device.limits().max_texture_dimension_2d;
         let size = size.map(|v| v.clamp(1, limit));
@@ -331,7 +338,15 @@ impl PointRenderer {
                     .as_mat4()
                     .to_cols_array_2d(),
                 clip_on: clip.is_some() as u32 as f32,
-                padding2: [0.; 3],
+                ramp_on: height_ramp.is_some() as u32 as f32,
+                padding2: [0.; 2],
+                ramp: height_ramp
+                    .map_or(glam::DVec4::ZERO, |[low, high]| {
+                        let z = to_world.row(2) - glam::DVec4::new(0., 0., 0., low);
+                        z / (high - low).max(1e-9)
+                    })
+                    .as_vec4()
+                    .to_array(),
             };
             slot[..UNIFORM_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&uniform));
         }

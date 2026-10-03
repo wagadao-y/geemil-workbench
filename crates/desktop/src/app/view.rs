@@ -1,8 +1,23 @@
 //! Background LOD loading for the viewport. Requests carry a generation and an
 //! epoch: a newer request supersedes refinement, and a new epoch (project,
 //! visibility or budget change) cancels everything in flight.
+use super::ColorMode;
 use super::{Workbench, jobs::Notice, jobs::is_cancelled};
 use crate::render::Segment;
+
+/// Distinct sRGB colours for colouring by scan (Tableau 10).
+const SCAN_COLORS: [[u8; 3]; 10] = [
+    [78, 121, 167],
+    [242, 142, 43],
+    [225, 87, 89],
+    [118, 183, 178],
+    [89, 161, 79],
+    [237, 201, 72],
+    [176, 122, 161],
+    [255, 157, 167],
+    [156, 117, 95],
+    [186, 176, 172],
+];
 use eframe::egui;
 use geemil_core::{Camera, JobControl, LoadedView, Project, ViewCache};
 use std::{
@@ -176,6 +191,7 @@ impl Workbench {
                         .view_loaded(result.interactive, view.samples.len());
                     self.points = view.samples;
                     self.points_segments = view.segments;
+                    self.update_height_range();
                     self.points_generation = result.generation;
                     self.points_origin = result.origin;
                     self.view_ms = result.elapsed_ms;
@@ -218,16 +234,51 @@ impl Workbench {
     }
     pub(super) fn draw_segments(&self) -> Option<Vec<Segment>> {
         let shown = self.shown_segments()?;
+        let scans: Vec<_> = self
+            .project
+            .as_ref()
+            .map(|p| p.scans().map(|s| s.id).collect())
+            .unwrap_or_default();
         Some(
             shown
                 .into_iter()
-                .map(|s| Segment {
-                    range: s.range.start as u32..s.range.end as u32,
-                    motion: s.motion,
-                    tint: self.align_tint(s.scan),
+                .map(|s| {
+                    let mut tint = self.align_tint(s.scan);
+                    if tint[3] == 0. && self.settings.color_mode == ColorMode::Scan {
+                        let i = scans.iter().position(|id| *id == s.scan).unwrap_or(0);
+                        let [r, g, b] = SCAN_COLORS[i % SCAN_COLORS.len()];
+                        tint = [r as f32 / 255., g as f32 / 255., b as f32 / 255., 1.];
+                    }
+                    Segment {
+                        range: s.range.start as u32..s.range.end as u32,
+                        motion: s.motion,
+                        tint,
+                    }
                 })
                 .collect(),
         )
+    }
+    /// The height range to colour by: the 1st to 99th percentile of the
+    /// displayed points' heights, taken once per project state and visibility
+    /// so colours stay put while the camera moves.
+    fn update_height_range(&mut self) {
+        let Some(p) = &self.project else { return };
+        let key = (p.current().id, self.visible.iter().copied().collect());
+        if self.height_for.as_ref() == Some(&key) || self.points.is_empty() {
+            return;
+        }
+        let step = (self.points.len() / 20_000).max(1);
+        let mut heights: Vec<f64> = self
+            .points
+            .iter()
+            .step_by(step)
+            .map(|s| s.position[2])
+            .collect();
+        heights.sort_by(f64::total_cmp);
+        let at = |q: f64| heights[((heights.len() - 1) as f64 * q) as usize];
+        let (low, high) = (at(0.01), at(0.99));
+        self.height_range = Some([low, high.max(low + 1e-3)]);
+        self.height_for = Some(key);
     }
 }
 
