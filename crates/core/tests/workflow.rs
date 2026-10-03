@@ -1,5 +1,6 @@
 use geemil_core::{
-    Camera, CoreError, ImportOptions, JobControl, Pose, Project, Selection, Stage, interchange,
+    Camera, CoreError, ImportOptions, JobControl, Pose, Project, Selection, SelectionMode, Stage,
+    interchange,
 };
 use glam::DVec3;
 use std::{collections::BTreeMap, fs::File, io::BufReader, sync::atomic::Ordering};
@@ -146,6 +147,7 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
         camera,
         polygon: vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
         depth_meters: 0.1,
+        mode: SelectionMode::ExcludeInside,
     };
     let mut all_depths = vec![];
     for scan in project.scans() {
@@ -419,4 +421,179 @@ fn user_facing_errors_are_typed() {
         find(p.export_e57(&text, &JobControl::default()).unwrap_err()),
         Some(CoreError::OutputExists(text.clone()))
     );
+}
+
+#[test]
+fn cropping_excludes_everything_outside_the_polygon_at_any_depth() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.e57");
+    interchange::create_demo(&source).unwrap();
+    let mut project = Project::create(&dir.path().join("p"), "Test").unwrap();
+    let options = ImportOptions {
+        chunk_points: 128,
+        lod_points: 2,
+        ..Default::default()
+    };
+    let job = JobControl::default();
+    project.import_file(&source, options, &job).unwrap();
+    let ids: Vec<_> = project.scans().map(|s| s.id).collect();
+    let bounds = project.bounds();
+    // Close to the cloud, so the far plane of `contains` would cut it off.
+    let camera = Camera {
+        target: bounds.center().to_array(),
+        yaw: 0.3,
+        pitch: 0.4,
+        distance: 0.05,
+        ..Camera::default()
+    };
+    let crop = Selection {
+        camera,
+        polygon: vec![[0.3, 0.2], [0.8, 0.35], [0.6, 0.9], [0.25, 0.7]],
+        depth_meters: 0.1,
+        mode: SelectionMode::ExcludeOutside,
+    };
+    let test = crop.prepare();
+    let (mut total, mut outside) = (0u64, 0u64);
+    for scan in project.scans() {
+        let world = project.world_matrix(scan);
+        for c in 0..scan.chunks.len() {
+            let data = project.read_chunk(scan, c as u32).unwrap();
+            for p in data.chunks_exact(scan.stride).filter(|p| p[28] != 0) {
+                let pos = std::array::from_fn(|i| {
+                    f64::from_le_bytes(p[i * 8..i * 8 + 8].try_into().unwrap())
+                });
+                let p = world.transform_point3(DVec3::from(pos));
+                total += 1;
+                if !test.covers(p) {
+                    outside += 1;
+                    assert!(test.excludes(p, 0.), "depth must not matter");
+                } else {
+                    assert!(!test.excludes(p, f64::INFINITY));
+                }
+            }
+        }
+    }
+    assert!(outside > 0 && outside < total, "{outside} of {total}");
+    // Points beyond the far plane are kept when seen through the polygon.
+    let far = DVec3::from(camera.target) + (DVec3::from(camera.target) - camera.eye()) * 1e6;
+    assert!(test.covers(far) && crop.contains(far).is_none());
+    let excluded = project.delete_selection(&crop, &ids, &job).unwrap();
+    assert_eq!(excluded, outside);
+    // The recorded operation names the mode; older records default to inside.
+    let op = &project.current().operation;
+    assert_eq!(op["selection"]["mode"], "exclude_outside");
+    assert!(op["nearest"].is_null());
+    let mut legacy = op["selection"].clone();
+    legacy.as_object_mut().unwrap().remove("mode");
+    let legacy: Selection = serde_json::from_value(legacy).unwrap();
+    assert_eq!(legacy.mode, SelectionMode::ExcludeInside);
+    // Cropping again removes nothing more.
+    assert_eq!(project.delete_selection(&crop, &ids, &job).unwrap(), 0);
+}
+
+#[test]
+fn selection_nearest_matches_the_recorded_exclusion() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.e57");
+    interchange::create_demo(&source).unwrap();
+    let mut project = Project::create(&dir.path().join("p"), "Test").unwrap();
+    let job = JobControl::default();
+    project
+        .import_file(&source, ImportOptions::default(), &job)
+        .unwrap();
+    let ids: Vec<_> = project.scans().map(|s| s.id).collect();
+    let bounds = project.bounds();
+    let selection = Selection {
+        camera: Camera {
+            target: bounds.center().to_array(),
+            distance: bounds.radius() * 2.,
+            ..Camera::default()
+        },
+        polygon: vec![[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
+        depth_meters: 0.2,
+        mode: SelectionMode::ExcludeInside,
+    };
+    let nearest = project
+        .selection_nearest(&selection, &ids, &job)
+        .unwrap()
+        .unwrap();
+    assert!(project.delete_selection(&selection, &ids, &job).unwrap() > 0);
+    assert_eq!(project.current().operation["nearest"], nearest);
+}
+
+/// What the app previews: displayed samples judged with the exact nearest depth.
+/// They must carry exactly the exclusion bits that committing produces.
+#[test]
+fn preview_of_displayed_points_matches_the_committed_exclusion() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.e57");
+    interchange::create_demo(&source).unwrap();
+    let job = JobControl::default();
+    for mode in [SelectionMode::ExcludeInside, SelectionMode::ExcludeOutside] {
+        let mut project = Project::create(&dir.path().join(format!("{mode:?}")), "Test").unwrap();
+        let options = ImportOptions {
+            chunk_points: 256,
+            lod_points: 16,
+            ..Default::default()
+        };
+        project.import_file(&source, options, &job).unwrap();
+        let ids: Vec<_> = project.scans().map(|s| s.id).collect();
+        let bounds = project.bounds();
+        let camera = Camera {
+            target: bounds.center().to_array(),
+            yaw: 0.8,
+            pitch: 0.3,
+            distance: bounds.radius() * 1.5,
+            aspect: 1.5,
+            ..Camera::default()
+        };
+        let selection = Selection {
+            camera,
+            polygon: vec![[0.3, 0.25], [0.75, 0.35], [0.6, 0.8], [0.35, 0.65]],
+            depth_meters: 0.3,
+            mode,
+        };
+        let limit = match mode {
+            SelectionMode::ExcludeInside => {
+                project
+                    .selection_nearest(&selection, &ids, &job)
+                    .unwrap()
+                    .unwrap()
+                    + selection.depth_meters
+            }
+            SelectionMode::ExcludeOutside => f64::INFINITY,
+        };
+        let test = selection.prepare();
+        // A small budget, so the view mixes LOD samples and full chunks.
+        let mut previews = vec![];
+        for id in &ids {
+            let samples = project.load_view(&camera, 3000, &[*id], &job).unwrap();
+            let marks: Vec<_> = samples
+                .iter()
+                .map(|s| test.excludes(DVec3::from(s.position), limit))
+                .collect();
+            previews.push((*id, samples, marks));
+        }
+        let excluded = project.delete_selection(&selection, &ids, &job).unwrap();
+        assert!(excluded > 0, "{mode:?}");
+        let (mut marked, mut checked) = (0, 0);
+        for (id, samples, marks) in previews {
+            let scan = project.scans().find(|s| s.id == id).unwrap();
+            for (sample, mark) in samples.iter().zip(marks) {
+                let mask = project.exclusion_mask(scan, sample.chunk).unwrap();
+                let bit = mask[sample.index as usize / 8] & (1 << (sample.index % 8)) != 0;
+                assert_eq!(
+                    bit, mark,
+                    "{mode:?} chunk {} index {}",
+                    sample.chunk, sample.index
+                );
+                marked += mark as u32;
+                checked += 1;
+            }
+        }
+        assert!(
+            marked > 0 && marked < checked,
+            "{mode:?}: {marked} of {checked}"
+        );
+    }
 }

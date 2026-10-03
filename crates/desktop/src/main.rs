@@ -16,6 +16,15 @@ fn main() -> eframe::Result<()> {
             .map(std::path::PathBuf::from),
         orbit: args.iter().any(|a| a == "--smoke-orbit"),
         colors: args.iter().any(|a| a == "--smoke-colors"),
+        select: args
+            .iter()
+            .position(|a| a == "--smoke-select")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|mode| match mode.to_str() {
+                Some("inside") => Some(geemil_core::SelectionMode::ExcludeInside),
+                Some("outside") => Some(geemil_core::SelectionMode::ExcludeOutside),
+                _ => None,
+            }),
     };
     let mut gpu = eframe::egui_wgpu::WgpuConfiguration::default();
     // Use the Windows graphics API without probing Vulkan drivers on startup.

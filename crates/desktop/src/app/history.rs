@@ -83,11 +83,15 @@ fn revision_label(t: &Strings, p: &Project, r: &Revision) -> String {
         Some("create") => Some(t.revision_created.into()),
         Some("import") => text("file").map(t.revision_import),
         // The layer created by a selection is appended to that revision's layers.
-        Some("selection") => r
-            .layers
-            .last()
-            .and_then(|id| layer(*id))
-            .map(|l| (t.revision_exclude)(&t.count(l.excluded))),
+        Some("selection") => r.layers.last().and_then(|id| layer(*id)).map(|l| {
+            let crop = op["selection"]["mode"] == "exclude_outside";
+            let label = if crop {
+                t.revision_crop
+            } else {
+                t.revision_exclude
+            };
+            label(&t.count(l.excluded))
+        }),
         Some("layer") => id("id").and_then(layer).map(|l| {
             let enabled = op.get("enabled").and_then(|v| v.as_bool());
             (t.revision_layer)(&layer_label(t, l), enabled.unwrap_or(true))

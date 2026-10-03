@@ -1,5 +1,5 @@
 //! Camera input: orbit, pan, zoom, and double-click to orbit around a point.
-use super::Workbench;
+use super::{Workbench, selection::Tool};
 use eframe::egui;
 use geemil_core::{Camera, Sample};
 use glam::DVec3;
@@ -20,7 +20,9 @@ impl Workbench {
     /// tied to the camera it was drawn with.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
         let mut moved = false;
-        if !self.select_mode && response.dragged_by(egui::PointerButton::Primary) {
+        if self.selection.tool == Tool::Navigate
+            && response.dragged_by(egui::PointerButton::Primary)
+        {
             let delta = ctx.input(|i| i.pointer.delta());
             self.camera.yaw -= delta.x as f64 * 0.007;
             self.camera.pitch = (self.camera.pitch + delta.y as f64 * 0.007).clamp(-1.5, 1.5);
@@ -50,9 +52,9 @@ impl Workbench {
         if moved {
             self.flight = None;
             self.dirty = true;
-            self.polygon.clear();
+            self.selection.clear();
         }
-        if !self.select_mode
+        if self.selection.tool == Tool::Navigate
             && response.double_clicked()
             && let Some(pos) = response.interact_pointer_pos()
         {
@@ -70,7 +72,7 @@ impl Workbench {
                     to: target,
                     start: Instant::now(),
                 });
-                self.polygon.clear();
+                self.selection.clear();
             }
         }
     }
@@ -92,7 +94,8 @@ impl Workbench {
     }
     /// Marks the orbit centre, which is always the viewport centre, while it matters.
     pub(super) fn draw_pivot(&self, ui: &egui::Ui, response: &egui::Response) {
-        let orbiting = !self.select_mode && response.dragged_by(egui::PointerButton::Primary);
+        let orbiting = self.selection.tool == Tool::Navigate
+            && response.dragged_by(egui::PointerButton::Primary);
         if !(orbiting || self.flight.is_some()) {
             return;
         }

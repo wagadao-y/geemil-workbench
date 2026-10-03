@@ -2,7 +2,7 @@
 //! and check sRGB colour probes end to end. See README "CLIと検証".
 use super::Workbench;
 use eframe::egui;
-use geemil_core::{Camera, Sample};
+use geemil_core::{Camera, Sample, SelectionMode};
 use glam::DVec3;
 use std::{
     path::PathBuf,
@@ -17,12 +17,15 @@ pub struct SmokeOptions {
     pub orbit: bool,
     /// Replace the view with fixed colour probes and check them in the capture.
     pub colors: bool,
+    /// Select the centre of the view after one second and preview this exclusion.
+    pub select: Option<SelectionMode>,
 }
 
 pub(super) struct SmokeTest {
     screenshot: Option<PathBuf>,
     orbit: bool,
     pub(super) colors: bool,
+    select: Option<SelectionMode>,
     requested: bool,
     probes: Vec<(egui::Pos2, [u8; 4])>,
     camera: Camera,
@@ -35,6 +38,7 @@ impl SmokeTest {
             screenshot: options.screenshot,
             orbit: options.orbit,
             colors: options.colors,
+            select: options.select,
             requested: false,
             probes: vec![],
             camera: Camera::default(),
@@ -105,6 +109,14 @@ impl Workbench {
             self.dirty = true;
             ctx.request_repaint();
         }
+        // After a second the viewport aspect is final, which the selection keeps.
+        if let Some(mode) = smoke
+            .select
+            .take_if(|_| smoke.started.elapsed() > Duration::from_secs(1))
+        {
+            self.selection
+                .select_rect(self.camera, [0.35, 0.3], [0.65, 0.7], mode);
+        }
         for event in ctx.input(|i| i.events.clone()) {
             if let egui::Event::Screenshot { image, .. } = event {
                 if smoke.colors {
@@ -138,6 +150,9 @@ impl Workbench {
                     self.points.len(),
                     self.view_ms
                 );
+                if let Some(preview) = self.selection.preview_summary() {
+                    eprintln!("Smoke test preview: {preview}");
+                }
                 let bytes: Vec<_> = image.pixels.iter().flat_map(|p| p.to_array()).collect();
                 if let Err(e) = image::save_buffer(
                     path,

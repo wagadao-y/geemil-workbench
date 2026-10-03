@@ -1,14 +1,13 @@
 use super::Workbench;
 use crate::render::Edl;
 use eframe::egui;
-use geemil_core::Selection;
 use glam::DVec3;
 
 impl Workbench {
     pub(super) fn viewport(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.advance_flight(ctx);
-            self.edit_tools(ui, ctx);
+            self.selection_tools(ui, ctx);
             self.display_settings(ui);
             ui.small(self.t.controls_hint);
             let size = ui.available_size().max(egui::vec2(1., 1.));
@@ -17,10 +16,12 @@ impl Workbench {
                 self.camera.aspect = aspect;
                 self.dirty = true;
             }
+            self.update_preview(ctx);
             self.renderer.upload(
                 &self.points,
                 DVec3::from(self.points_origin),
                 self.points_generation,
+                self.selection.marks(),
             );
             let pixels = ctx.pixels_per_point();
             let rs = frame.wgpu_render_state().unwrap();
@@ -38,36 +39,9 @@ impl Workbench {
                 ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
             self.smoke_probes(response.rect);
             self.camera_input(ctx, &response);
-            self.selection_input(&response);
-            self.draw_selection(ui, response.rect);
+            self.selection_input(ctx, &response);
+            self.draw_selection(ui, &response);
             self.draw_pivot(ui, &response);
-        });
-    }
-    fn edit_tools(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let t = self.t;
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.select_mode, false, t.navigate);
-            ui.selectable_value(&mut self.select_mode, true, t.select);
-            ui.checkbox(&mut self.lasso, t.polygon);
-            ui.label(t.depth);
-            ui.add(
-                egui::DragValue::new(&mut self.depth)
-                    .speed(0.05)
-                    .range(0.001..=1_000_000.)
-                    .suffix(" m"),
-            );
-            if ui
-                .add_enabled(
-                    self.job.is_none() && self.polygon.len() >= 3,
-                    egui::Button::new(t.exclude_selection),
-                )
-                .clicked()
-            {
-                self.delete(ctx);
-            }
-            if ui.button(t.clear_selection).clicked() {
-                self.polygon.clear();
-            }
         });
     }
     fn display_settings(&mut self, ui: &mut egui::Ui) {
@@ -97,93 +71,5 @@ impl Workbench {
                 egui::Slider::new(&mut self.edl_strength, 0.1..=5.0).text(t.edl_strength),
             );
         });
-    }
-    /// Rectangle drag or polygon clicks, stored in normalized viewport coordinates.
-    fn selection_input(&mut self, response: &egui::Response) {
-        if !self.select_mode || self.job.is_some() {
-            return;
-        }
-        let rect = response.rect;
-        let normalize = |p: egui::Pos2| {
-            egui::pos2(
-                ((p.x - rect.left()) / rect.width()).clamp(0., 1.),
-                ((p.y - rect.top()) / rect.height()).clamp(0., 1.),
-            )
-        };
-        if self.lasso {
-            if response.clicked_by(egui::PointerButton::Primary)
-                && let Some(pos) = response.interact_pointer_pos()
-            {
-                if self.polygon.is_empty() {
-                    self.selection_camera = Some(self.camera);
-                }
-                self.polygon.push(normalize(pos));
-            }
-            return;
-        }
-        if response.drag_started_by(egui::PointerButton::Primary)
-            && let Some(pos) = response.interact_pointer_pos()
-        {
-            self.drag_start = Some(normalize(pos));
-            self.selection_camera = Some(self.camera);
-            self.polygon.clear();
-        }
-        if response.dragged_by(egui::PointerButton::Primary)
-            && let (Some(start), Some(pos)) = (self.drag_start, response.interact_pointer_pos())
-        {
-            let end = normalize(pos);
-            self.polygon = vec![
-                start,
-                egui::pos2(end.x, start.y),
-                end,
-                egui::pos2(start.x, end.y),
-            ];
-        }
-        if response.drag_stopped_by(egui::PointerButton::Primary) {
-            self.drag_start = None;
-        }
-    }
-    fn draw_selection(&self, ui: &egui::Ui, rect: egui::Rect) {
-        if self.polygon.len() < 2 {
-            return;
-        }
-        let points: Vec<_> = self
-            .polygon
-            .iter()
-            .map(|p| {
-                egui::pos2(
-                    rect.left() + p.x * rect.width(),
-                    rect.top() + p.y * rect.height(),
-                )
-            })
-            .collect();
-        ui.painter().add(egui::Shape::closed_line(
-            points,
-            egui::Stroke::new(2., egui::Color32::from_rgb(80, 220, 190)),
-        ));
-    }
-    /// Excludes the selection from the visible scans, judged on original points
-    /// with the camera captured when the selection started.
-    fn delete(&mut self, ctx: &egui::Context) {
-        if self.polygon.len() < 3 || self.job.is_some() {
-            return;
-        }
-        if let Some(p) = &self.project {
-            let mut project = (**p).clone();
-            let selection = Selection {
-                camera: self.selection_camera.unwrap_or(self.camera),
-                polygon: self
-                    .polygon
-                    .iter()
-                    .map(|p| [p.x as f64, p.y as f64])
-                    .collect(),
-                depth_meters: self.depth,
-            };
-            let ids = self.visible.iter().copied().collect::<Vec<_>>();
-            self.start(ctx, move |job| {
-                project.delete_selection(&selection, &ids, &job)?;
-                Ok(project)
-            });
-        }
     }
 }

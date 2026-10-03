@@ -7,6 +7,8 @@ use wgpu::util::DeviceExt;
 // linear shader output to sRGB bytes, and texture sampling decodes them again.
 // The point pass uses the same format, so the EDL pass also reads linear RGB.
 const VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// sRGB colour of points an exclusion would remove.
+const HIGHLIGHT: [u8; 4] = [255, 48, 48, 255];
 /// Per-pixel view depth for EDL; 0 marks background.
 const VIEW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
@@ -62,7 +64,7 @@ pub struct PointRenderer {
     targets: Option<Targets>,
     id: Option<egui::TextureId>,
     origin: DVec3,
-    uploaded_generation: u64,
+    uploaded: (u64, u64),
 }
 impl PointRenderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -161,22 +163,39 @@ impl PointRenderer {
             targets: None,
             id: None,
             origin: DVec3::ZERO,
-            uploaded_generation: 0,
+            uploaded: (0, 0),
         }
     }
-    pub fn upload(&mut self, points: &[Sample], origin: DVec3, generation: u64) {
-        if generation == self.uploaded_generation && origin == self.origin {
+    /// Uploads `points` unless the same generation and highlight revision are
+    /// resident. `highlight` marks points to draw in `HIGHLIGHT`, with a revision
+    /// that changes whenever the marks do; revision 0 means no highlight.
+    pub fn upload(
+        &mut self,
+        points: &[Sample],
+        origin: DVec3,
+        generation: u64,
+        highlight: Option<(&[bool], u64)>,
+    ) {
+        let key = (generation, highlight.map_or(0, |(_, revision)| revision));
+        if key == self.uploaded && origin == self.origin {
             return;
         }
         self.origin = origin;
-        self.uploaded_generation = generation;
+        self.uploaded = key;
+        let marks = highlight.map(|(marks, _)| marks);
         let vertices: Vec<_> = points
             .iter()
-            .map(|p| Vertex {
+            .enumerate()
+            .map(|(i, p)| Vertex {
                 position: (DVec3::from(p.position) - origin).as_vec3().to_array(),
                 // These are sRGB code values; points.wgsl decodes RGB before
                 // writing to VIEW_FORMAT. Alpha remains a linear coverage value.
-                color: p.color.map(|c| c as f32 / 255.),
+                color: if marks.is_some_and(|m| m.get(i) == Some(&true)) {
+                    HIGHLIGHT
+                } else {
+                    p.color
+                }
+                .map(|c| c as f32 / 255.),
             })
             .collect();
         self.count = vertices.len() as u32;

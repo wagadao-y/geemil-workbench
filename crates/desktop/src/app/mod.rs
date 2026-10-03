@@ -3,6 +3,7 @@
 mod history;
 mod jobs;
 mod navigation;
+mod selection;
 mod sidebar;
 mod smoke;
 mod status;
@@ -59,13 +60,7 @@ pub struct Workbench {
     edl_strength: f32,
     flight: Option<navigation::Flight>,
 
-    // Screen-space selection.
-    select_mode: bool,
-    lasso: bool,
-    polygon: Vec<egui::Pos2>,
-    drag_start: Option<egui::Pos2>,
-    selection_camera: Option<Camera>,
-    depth: f64,
+    selection: selection::SelectionState,
 
     // Sidebar inputs.
     translation: [f64; 3],
@@ -113,12 +108,7 @@ impl Workbench {
             edl: true,
             edl_strength: 1.,
             flight: None,
-            select_mode: false,
-            lasso: false,
-            polygon: vec![],
-            drag_start: None,
-            selection_camera: None,
-            depth: 0.5,
+            selection: Default::default(),
             translation: [0.; 3],
             rotation: [0.; 3],
             branch_name: t.default_branch_name.into(),
@@ -156,8 +146,7 @@ impl Workbench {
         self.points_origin = self.camera.target;
         self.project = Some(Arc::new(project));
         self.status = self.t.status_saved.into();
-        self.polygon.clear();
-        self.selection_camera = None;
+        self.selection.clear();
         self.dirty = true;
         self.sync_pose();
     }
@@ -165,7 +154,7 @@ impl Workbench {
         if let Some(p) = &self.project {
             frame_bounds(&mut self.camera, &p.bounds());
             self.dirty = true;
-            self.polygon.clear();
+            self.selection.clear();
         }
     }
     /// Loads the selected scan's stored transform into the alignment inputs.
