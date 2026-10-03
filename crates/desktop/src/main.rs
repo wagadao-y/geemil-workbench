@@ -8,13 +8,15 @@ fn main() -> eframe::Result<()> {
         .first()
         .filter(|a| !a.to_string_lossy().starts_with("--"))
         .map(std::path::PathBuf::from);
-    let screenshot = args
-        .iter()
-        .position(|a| a == "--smoke-test")
-        .and_then(|i| args.get(i + 1))
-        .map(std::path::PathBuf::from);
-    let smoke_orbit = args.iter().any(|a| a == "--smoke-orbit");
-    let smoke_colors = args.iter().any(|a| a == "--smoke-colors");
+    let smoke = app::SmokeOptions {
+        screenshot: args
+            .iter()
+            .position(|a| a == "--smoke-test")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from),
+        orbit: args.iter().any(|a| a == "--smoke-orbit"),
+        colors: args.iter().any(|a| a == "--smoke-colors"),
+    };
     let mut gpu = eframe::egui_wgpu::WgpuConfiguration::default();
     // Use the Windows graphics API without probing Vulkan drivers on startup.
     // WGPU_BACKEND remains available for diagnosing a different backend.
@@ -33,14 +35,6 @@ fn main() -> eframe::Result<()> {
                 .with_min_inner_size([800., 500.]),
             ..Default::default()
         },
-        Box::new(move |cc| {
-            Ok(Box::new(app::Workbench::new(
-                cc,
-                project,
-                screenshot,
-                smoke_orbit,
-                smoke_colors,
-            )))
-        }),
+        Box::new(move |cc| Ok(Box::new(app::Workbench::new(cc, project, smoke)))),
     )
 }
