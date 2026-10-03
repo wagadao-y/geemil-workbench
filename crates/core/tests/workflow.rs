@@ -676,3 +676,60 @@ fn unlimited_inside_exclusion_is_the_complement_of_cropping() {
     assert!(inside > 0 && outside > 0);
     assert_eq!(inside + outside, total);
 }
+
+#[test]
+fn uncoloured_e57_shows_intensity_as_grey() {
+    use e57::{Record, RecordDataType as T, RecordName as N, RecordValue as V};
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("intensity.e57");
+    let mut writer = e57::E57Writer::from_file(&input, "fixture").unwrap();
+    let schema = vec![
+        Record {
+            name: N::CartesianX,
+            data_type: T::F64,
+        },
+        Record {
+            name: N::CartesianY,
+            data_type: T::F64,
+        },
+        Record {
+            name: N::CartesianZ,
+            data_type: T::F64,
+        },
+        Record {
+            name: N::Intensity,
+            data_type: T::Integer { min: 0, max: 1000 },
+        },
+    ];
+    let mut scan = writer.add_pointcloud("scan", schema).unwrap();
+    for (i, intensity) in [0i64, 500, 1000].into_iter().enumerate() {
+        scan.add_point(vec![
+            V::Double(i as f64),
+            V::Double(0.),
+            V::Double(0.),
+            V::Integer(intensity),
+        ])
+        .unwrap();
+    }
+    scan.finalize().unwrap();
+    writer.finalize().unwrap();
+    let mut p = Project::create(&dir.path().join("p"), "Intensity").unwrap();
+    p.import_file(&input, ImportOptions::default(), &JobControl::default())
+        .unwrap();
+    let scan = p.scans().next().unwrap();
+    let mut colours: Vec<_> = p
+        .points(scan, 0)
+        .unwrap()
+        .into_iter()
+        .map(|s| (s.position[0] as i64, s.color))
+        .collect();
+    colours.sort();
+    assert_eq!(
+        colours,
+        vec![
+            (0, [0, 0, 0, 255]),
+            (1, [128, 128, 128, 255]),
+            (2, [255, 255, 255, 255])
+        ]
+    );
+}

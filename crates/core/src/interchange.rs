@@ -68,7 +68,14 @@ pub fn decode(bytes: &[u8], prototype: &[Record]) -> Result<Vec<RecordValue>> {
         })
         .collect())
 }
-fn geometry(pc: &PointCloud, values: &[RecordValue]) -> Result<([f64; 3], [u8; 4], bool)> {
+/// Position, display colour and validity of an E57 record. Without colour,
+/// intensity is shown as grey, stretched over `grey` (the scan's typical
+/// intensity range) when given, else over its declared limits.
+fn geometry(
+    pc: &PointCloud,
+    values: &[RecordValue],
+    grey: Option<(f64, f64)>,
+) -> Result<([f64; 3], [u8; 4], bool)> {
     let value = |name: RecordName| -> Result<Option<f64>> {
         pc.prototype
             .iter()
@@ -109,7 +116,38 @@ fn geometry(pc: &PointCloud, values: &[RecordValue]) -> Result<([f64; 3], [u8; 4
         p = [0.; 3];
     }
     let mut color = [180, 195, 210, 255];
-    if pc.has_color() && value(RecordName::IsColorInvalid)?.unwrap_or(0.) == 0. {
+    let colored = pc.has_color() && value(RecordName::IsColorInvalid)?.unwrap_or(0.) == 0.;
+    // Without colour, show intensity as grey, as scanner software does.
+    if !colored
+        && let Some(i) = pc
+            .prototype
+            .iter()
+            .position(|p| p.name == RecordName::Intensity)
+    {
+        let dtype = &pc.prototype[i].data_type;
+        let v = values[i].to_f64(dtype)?;
+        let given = pc.intensity_limits.as_ref().and_then(|l| {
+            Some((
+                l.intensity_min.as_ref()?.to_f64(dtype).ok()?,
+                l.intensity_max.as_ref()?.to_f64(dtype).ok()?,
+            ))
+        });
+        let (min, max) = grey.or(given).unwrap_or(match *dtype {
+            RecordDataType::Integer { min, max } => (min as f64, max as f64),
+            RecordDataType::ScaledInteger {
+                min,
+                max,
+                scale,
+                offset,
+            } => (min as f64 * scale + offset, max as f64 * scale + offset),
+            _ => (0., 1.),
+        });
+        let grey = ((v - min) / (max - min).max(f64::EPSILON) * 255.)
+            .clamp(0., 255.)
+            .round() as u8;
+        color = [grey, grey, grey, 255];
+    }
+    if colored {
         for (i, name) in [
             RecordName::ColorRed,
             RecordName::ColorGreen,
@@ -305,6 +343,36 @@ fn copy_images(
     Ok(result)
 }
 
+/// For a scan without colour, the 1st to 99th percentile of the intensity of
+/// its first points, so grey uses the range the scan really has rather than
+/// the declared limits (often much wider). None when there is nothing to do.
+fn intensity_range<T: Read + std::io::Seek>(
+    reader: &mut E57Reader<T>,
+    pc: &PointCloud,
+) -> Result<Option<(f64, f64)>> {
+    let Some(i) = pc
+        .prototype
+        .iter()
+        .position(|r| r.name == RecordName::Intensity)
+        .filter(|_| !pc.has_color())
+    else {
+        return Ok(None);
+    };
+    let dtype = &pc.prototype[i].data_type;
+    let mut values = vec![];
+    for record in reader.pointcloud_raw(pc)?.take(500_000) {
+        values.push(record?[i].to_f64(dtype)?);
+    }
+    values.retain(|v| v.is_finite());
+    if values.len() < 100 {
+        return Ok(None);
+    }
+    values.sort_by(f64::total_cmp);
+    let at = |q: f64| values[((values.len() - 1) as f64 * q) as usize];
+    let (low, high) = (at(0.01), at(0.99));
+    Ok((high > low).then_some((low, high)))
+}
+
 struct GeometryBatch {
     data: Vec<u8>,
     bounds: Bounds,
@@ -315,6 +383,7 @@ struct GeometryBatch {
 fn convert_e57_batch(
     pc: &PointCloud,
     values: Vec<Vec<RecordValue>>,
+    grey: Option<(f64, f64)>,
     job: &JobControl,
 ) -> Result<GeometryBatch> {
     let stride = 32 + raw_size(&pc.prototype);
@@ -326,7 +395,7 @@ fn convert_e57_batch(
         if i % 1024 == 0 {
             job.check()?;
         }
-        let (p, color, ok) = geometry(pc, &values)?;
+        let (p, color, ok) = geometry(pc, &values, grey)?;
         data.extend(make_record(p, color, ok, &encode(&values)));
         match &mut bounds {
             Some(b) => b.include(p),
@@ -427,11 +496,12 @@ fn import_e57(
         );
         let batch_points = (options.worker_memory_bytes / bytes_per_point).clamp(1, 8192);
         let reservation = batch_points * bytes_per_point;
+        let grey = intensity_range(&mut reader, pc)?;
         let worker_pc = pc.clone();
         let worker_job = job.clone();
         let mut pool =
             OrderedPool::new(workers, options.worker_memory_bytes, job, move |values| {
-                convert_e57_batch(&worker_pc, values, &worker_job)
+                convert_e57_batch(&worker_pc, values, grey, &worker_job)
             })?;
         let mut batch = Vec::with_capacity(batch_points);
         let mut read_count = 0;
