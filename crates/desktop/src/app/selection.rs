@@ -47,7 +47,9 @@ impl Default for SelectionState {
         Self {
             tool: Tool::Navigate,
             mode: SelectionMode::ExcludeInside,
-            limit_depth: true,
+            // Like CloudCompare: everything seen through the polygon, unless
+            // the user limits the depth.
+            limit_depth: false,
             depth: 0.5,
             polygon: vec![],
             closed: false,

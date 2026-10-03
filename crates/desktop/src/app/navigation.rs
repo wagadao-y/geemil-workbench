@@ -15,7 +15,7 @@ pub(super) struct Flight {
 }
 
 impl Workbench {
-    /// Orbit (left, outside selection mode), pan (right/middle), zoom (wheel)
+    /// Orbit (left, outside selection mode), pan (right), zoom (wheel)
     /// and double-click picking. Any camera change drops the selection, which is
     /// tied to the camera it was drawn with.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
@@ -29,9 +29,7 @@ impl Workbench {
                 (self.camera.pitch + delta.y as f64 * 0.007).clamp(-MAX_PITCH, MAX_PITCH);
             moved = true;
         }
-        if response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle)
-        {
+        if response.dragged_by(egui::PointerButton::Secondary) {
             let delta = ctx.input(|i| i.pointer.delta());
             let forward = (DVec3::from(self.camera.target) - self.camera.eye()).normalize();
             let right = forward.cross(DVec3::Z).normalize();

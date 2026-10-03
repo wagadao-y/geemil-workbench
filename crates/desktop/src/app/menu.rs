@@ -47,8 +47,16 @@ impl Workbench {
                         },
                     );
                     ui.separator();
+                    // Revisions are how a project is saved, so they live here.
+                    self.menu_item(ui, Action::Save, &mut chosen);
+                    self.menu_item(ui, Action::SaveAs, &mut chosen);
+                    self.menu_item(ui, Action::Revisions, &mut chosen);
+                    self.menu_item(ui, Action::Discard, &mut chosen);
+                    ui.separator();
                     self.menu_item(ui, Action::Import, &mut chosen);
                     self.menu_item(ui, Action::ExportE57, &mut chosen);
+                    ui.separator();
+                    self.menu_item(ui, Action::Cleanup, &mut chosen);
                     ui.separator();
                     self.menu_item(ui, Action::Quit, &mut chosen);
                 });
@@ -78,14 +86,6 @@ impl Workbench {
                         egui::Slider::new(&mut self.settings.edl_strength, 0.1..=5.0)
                             .text(t.edl_strength),
                     );
-                });
-                ui.menu_button(t.menu_revision, |ui| {
-                    self.menu_item(ui, Action::Save, &mut chosen);
-                    self.menu_item(ui, Action::SaveAs, &mut chosen);
-                    self.menu_item(ui, Action::Revisions, &mut chosen);
-                    self.menu_item(ui, Action::Discard, &mut chosen);
-                    ui.separator();
-                    self.menu_item(ui, Action::Cleanup, &mut chosen);
                 });
                 ui.menu_button(t.menu_tools, |ui| {
                     for tool in [Tool::Navigate, Tool::Rect, Tool::Polygon, Tool::Measure] {

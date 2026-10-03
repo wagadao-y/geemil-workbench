@@ -9,7 +9,6 @@ pub struct Strings {
     pub menu_file: &'static str,
     pub menu_edit: &'static str,
     pub menu_view: &'static str,
-    pub menu_revision: &'static str,
     pub menu_tools: &'static str,
     pub menu_help: &'static str,
 
@@ -200,7 +199,6 @@ pub static JA: Strings = Strings {
     menu_file: "ファイル",
     menu_edit: "編集",
     menu_view: "表示",
-    menu_revision: "リビジョン",
     menu_tools: "ツール",
     menu_help: "ヘルプ",
 
@@ -235,7 +233,7 @@ pub static JA: Strings = Strings {
     tool_rect: "矩形選択",
     tool_polygon: "多角形選択",
     tool_measure: "距離計測",
-    hint_navigate: "左ドラッグ: 回転　右・中ドラッグ: 平行移動　ホイール: 拡大縮小　ダブルクリック: 回転中心",
+    hint_navigate: "左ドラッグ: 回転　右ドラッグ: 平行移動　ホイール: 拡大縮小　ダブルクリック: 回転中心",
     hint_rect: "ドラッグで矩形を選択　Delete: 除外を実行　Esc: 選択を解除",
     hint_polygon: "クリックで頂点を追加　ダブルクリック／Enter: 閉じる　Delete: 除外を実行　Esc: 選択を解除",
     hint_measure: "2点をクリックして距離を計測　Esc: 計測をやり直す",
@@ -375,7 +373,7 @@ pub static JA: Strings = Strings {
         ("7 / 1 / 3 / 5", "上面・正面・側面・等角"),
         ("E", "陰影強調（EDL）の切り替え"),
         ("左ドラッグ", "回転（カメラ操作）"),
-        ("右・中ドラッグ", "平行移動"),
+        ("右ドラッグ", "平行移動"),
         ("ホイール", "拡大縮小"),
         ("ダブルクリック", "クリックした点を回転中心にする"),
     ],
