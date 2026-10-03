@@ -20,13 +20,18 @@ pub(crate) fn parent_of(state: &Revision, id: Uuid) -> Option<Uuid> {
 
 /// Folder transforms above `id` and its own, outermost first.
 pub(crate) fn correction(state: &Revision, id: Uuid) -> DMat4 {
+    correction_with(state, id, None)
+}
+
+/// [`correction`] with the own transform of one scan or folder replaced.
+fn correction_with(state: &Revision, id: Uuid, replaced: Option<(Uuid, Pose)>) -> DMat4 {
     let own = |id| {
-        state
-            .transforms
-            .get(&id)
-            .copied()
-            .unwrap_or_default()
-            .matrix()
+        match replaced {
+            Some((r, pose)) if r == id => Some(pose),
+            _ => state.transforms.get(&id).copied(),
+        }
+        .unwrap_or_default()
+        .matrix()
     };
     let mut matrix = own(id);
     let mut parent = parent_of(state, id);
@@ -74,6 +79,12 @@ impl Project {
     /// The additional transform of a scan or folder, including all folders above.
     pub fn correction(&self, id: Uuid) -> DMat4 {
         correction(self.current(), id)
+    }
+    /// [`Project::world_matrix`] as it would be with `pose` as the own transform
+    /// of `item` (a scan or folder), for previewing an edit before applying it.
+    pub fn world_matrix_with(&self, scan: &Scan, item: Uuid, pose: Pose) -> DMat4 {
+        correction_with(self.current(), scan.id, Some((item, pose)))
+            * scan.original_pose.unwrap_or_default().matrix()
     }
     pub fn parent_of(&self, id: Uuid) -> Option<Uuid> {
         parent_of(self.current(), id)

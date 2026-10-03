@@ -22,6 +22,7 @@ impl Workbench {
                 self.selection.marks(),
             );
             let pixels = ctx.pixels_per_point();
+            let segments = self.draw_segments();
             let rs = frame.wgpu_render_state().unwrap();
             let settings = &self.settings;
             let id = self.renderer.draw(
@@ -37,6 +38,7 @@ impl Workbench {
                         0.
                     },
                 },
+                segments.as_deref(),
             );
             let response =
                 ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));

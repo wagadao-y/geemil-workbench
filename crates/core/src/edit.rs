@@ -10,6 +10,22 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Samples of a view in the common project frame, with the transforms they
+/// were placed with so a renderer can move them before the next load.
+#[derive(Clone, Debug, Default)]
+pub struct LoadedView {
+    pub samples: Vec<Sample>,
+    pub segments: Vec<ViewSegment>,
+}
+/// The samples of one scan within a [`LoadedView`].
+#[derive(Clone, Debug)]
+pub struct ViewSegment {
+    pub scan: Uuid,
+    pub range: std::ops::Range<usize>,
+    /// [`Project::world_matrix`] of the scan when the view was loaded.
+    pub world: DMat4,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Camera {
     pub target: [f64; 3],
@@ -513,6 +529,7 @@ impl Project {
         job: &JobControl,
     ) -> Result<Vec<Sample>> {
         self.load_view_cached(camera, budget, scan_ids, job, &mut ViewCache::new(0))
+            .map(|view| view.samples)
     }
     pub fn load_view_cached(
         &self,
@@ -521,7 +538,7 @@ impl Project {
         scan_ids: &[Uuid],
         job: &JobControl,
         cache: &mut ViewCache,
-    ) -> Result<Vec<Sample>> {
+    ) -> Result<LoadedView> {
         cache.prepare(self);
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
@@ -573,6 +590,7 @@ impl Project {
             }
         }
         let mut result = Vec::with_capacity(budget.min(2_000_000));
+        let mut segments: Vec<ViewSegment> = vec![];
         let mut remaining_lod: usize = cut
             .iter()
             .map(|(si, ni)| scans[*si].nodes[*ni as usize].lod_count as usize)
@@ -595,22 +613,36 @@ impl Project {
             let full = node.chunk.is_some() && node.point_count as usize <= quota;
             let samples = cache.samples(self, scan, ni, full, job)?;
             let sample_count = samples.len();
+            // `cut` is ordered by scan, so each scan's samples are contiguous.
+            if segments.last().is_none_or(|s| s.scan != scan.id) {
+                segments.push(ViewSegment {
+                    scan: scan.id,
+                    range: result.len()..result.len(),
+                    world: worlds[si],
+                });
+            }
+            let world = worlds[si];
+            let to_world = |s: &Sample| Sample {
+                position: world.transform_point3(DVec3::from(s.position)).to_array(),
+                ..*s
+            };
             if quota >= sample_count {
-                result.extend_from_slice(&samples);
-                continue;
-            }
-            for (i, s) in samples.iter().enumerate() {
-                // Spread a reduced quota over the whole node instead of cropping
-                // a prefix, which would introduce a spatial bias.
-                if quota < sample_count
-                    && (i + 1) * quota / sample_count == i * quota / sample_count
-                {
-                    continue;
+                result.extend(samples.iter().map(to_world));
+            } else {
+                for (i, s) in samples.iter().enumerate() {
+                    // Spread a reduced quota over the whole node instead of
+                    // cropping a prefix, which would introduce a spatial bias.
+                    if (i + 1) * quota / sample_count != i * quota / sample_count {
+                        result.push(to_world(s));
+                    }
                 }
-                result.push(s.clone());
             }
+            segments.last_mut().unwrap().range.end = result.len();
         }
-        Ok(result)
+        Ok(LoadedView {
+            samples: result,
+            segments,
+        })
     }
 }
 

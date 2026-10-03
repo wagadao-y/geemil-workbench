@@ -27,7 +27,7 @@ fn main() -> Result<()> {
             project.load_view_cached(&camera, budget, &ids, &JobControl::default(), &mut cache)?;
         println!(
             "step={step} points={} elapsed_ms={:.1}",
-            points.len(),
+            points.samples.len(),
             start.elapsed().as_secs_f64() * 1000.
         );
         println!("cache {:?}", cache.stats());

@@ -2,8 +2,9 @@
 //! epoch: a newer request supersedes refinement, and a new epoch (project,
 //! visibility or budget change) cancels everything in flight.
 use super::{Workbench, jobs::Notice, jobs::is_cancelled};
+use crate::render::Segment;
 use eframe::egui;
-use geemil_core::{Camera, JobControl, Project, Sample, ViewCache};
+use geemil_core::{Camera, JobControl, LoadedView, Project, ViewCache};
 use std::{
     sync::{
         Arc,
@@ -25,7 +26,7 @@ struct ViewRequest {
 }
 struct ViewResult {
     generation: u64,
-    result: anyhow::Result<Vec<Sample>>,
+    result: anyhow::Result<LoadedView>,
     origin: [f64; 3],
     elapsed_ms: f64,
     epoch: u64,
@@ -170,9 +171,11 @@ impl Workbench {
                 continue;
             }
             match result.result {
-                Ok(points) => {
-                    self.smoke.view_loaded(result.interactive, points.len());
-                    self.points = points;
+                Ok(view) => {
+                    self.smoke
+                        .view_loaded(result.interactive, view.samples.len());
+                    self.points = view.samples;
+                    self.points_segments = view.segments;
                     self.points_generation = result.generation;
                     self.points_origin = result.origin;
                     self.view_ms = result.elapsed_ms;
@@ -182,5 +185,32 @@ impl Workbench {
                 Err(e) => self.error = Some(Notice::new(self.t, &e)),
             }
         }
+    }
+    /// Where to draw each loaded scan now: transforms applied since the load,
+    /// a transform being previewed and visibility take effect before the next
+    /// load arrives. `None` draws the points as loaded.
+    pub(super) fn draw_segments(&self) -> Option<Vec<Segment>> {
+        let project = self.project.as_ref()?;
+        if self.points_segments.is_empty() {
+            return None;
+        }
+        let preview = self.transform_preview();
+        Some(
+            self.points_segments
+                .iter()
+                .filter(|s| self.visible.contains(&s.scan))
+                .filter_map(|s| {
+                    let scan = project.scans().find(|scan| scan.id == s.scan)?;
+                    let world = match preview {
+                        Some((item, pose)) => project.world_matrix_with(scan, item, pose),
+                        None => project.world_matrix(scan),
+                    };
+                    Some(Segment {
+                        range: s.range.start as u32..s.range.end as u32,
+                        motion: world * s.world.inverse(),
+                    })
+                })
+                .collect(),
+        )
     }
 }

@@ -25,7 +25,9 @@ pub struct SmokeOptions {
     pub dialog: Option<String>,
     /// Steps run one by one once the view loaded, each followed by a state
     /// line: exclude, undo, redo, save, folder (new folder with the first scan),
-    /// remove (take out the first scan), measure (measure two picked points).
+    /// remove (take out the first scan), measure (measure two picked points),
+    /// preview (edit the first scan's transform without applying it),
+    /// apply-transform (apply the edited transform).
     pub script: Vec<String>,
 }
 
@@ -105,6 +107,7 @@ impl Workbench {
                     color,
                 })
                 .collect();
+            self.points_segments.clear();
             self.points_origin = [0.; 3];
             self.points_generation += 1;
             self.settings.point_size = 8.;
@@ -280,6 +283,32 @@ impl Workbench {
                 let mut points = self.points.iter().step_by((self.points.len() / 2).max(1));
                 if let (Some(a), Some(b)) = (points.next(), points.next()) {
                     self.measure_points(a.position.into(), b.position.into());
+                }
+            }
+            "preview" => {
+                let first = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| Some((p.scans().next()?.id, p.bounds().radius())));
+                if let Some((id, radius)) = first {
+                    self.selected = Some(id);
+                    self.edit_transform_inputs(id, [radius * 0.4, 0., 0.], [0., 0., 30.]);
+                }
+                let moved = self.draw_segments().unwrap_or_default();
+                let moved = moved
+                    .iter()
+                    .filter(|s| !s.motion.abs_diff_eq(glam::DMat4::IDENTITY, 1e-9))
+                    .map(|s| s.range.len())
+                    .sum::<usize>();
+                eprintln!(
+                    "Smoke preview: {:?}, {moved} of {} points moved",
+                    self.transform_preview().map(|(_, pose)| pose.translation),
+                    self.points.len()
+                );
+            }
+            "apply-transform" => {
+                if let Some((id, pose)) = self.transform_preview() {
+                    self.apply_edit(|p| p.set_transform(id, pose));
                 }
             }
             other => eprintln!("Unknown smoke step {other}"),

@@ -1,6 +1,7 @@
 use eframe::{egui, egui_wgpu::wgpu};
 use geemil_core::{Camera, Sample};
-use glam::DVec3;
+use glam::{DMat4, DVec3};
+use std::ops::Range;
 use wgpu::util::DeviceExt;
 
 // The point pass writes linear RGB to an sRGB target, so the hardware encodes
@@ -51,11 +52,22 @@ struct Targets {
     output: wgpu::TextureView,
     edl_bind: wgpu::BindGroup,
 }
+/// Instances drawn with one transform: a range of uploaded points and the
+/// world-space motion to apply to them, e.g. a transform being previewed.
+pub struct Segment {
+    pub range: Range<u32>,
+    pub motion: DMat4,
+}
 pub struct PointRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     pipeline: wgpu::RenderPipeline,
+    /// One `Uniform` per segment, `uniform_stride` bytes apart, selected with
+    /// a dynamic offset.
     uniform: wgpu::Buffer,
+    uniform_stride: u64,
+    uniform_slots: usize,
+    layout: wgpu::BindGroupLayout,
     bind: wgpu::BindGroup,
     vertices: wgpu::Buffer,
     count: u32,
@@ -81,26 +93,15 @@ impl PointRenderer {
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(UNIFORM_SIZE),
                 },
                 count: None,
             }],
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: std::mem::size_of::<Uniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
-        });
+        let alignment = device.limits().min_uniform_buffer_offset_alignment as u64;
+        let uniform_stride = UNIFORM_SIZE.div_ceil(alignment) * alignment;
+        let (uniform, bind) = uniform_slots(&device, &layout, uniform_stride, 1);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
             bind_group_layouts: &[Some(&layout)],
@@ -155,6 +156,9 @@ impl PointRenderer {
             queue,
             pipeline,
             uniform,
+            uniform_stride,
+            uniform_slots: 1,
+            layout,
             bind,
             vertices,
             count: 0,
@@ -217,6 +221,8 @@ impl PointRenderer {
             }
         }
     }
+    /// Draws the uploaded points; `segments` moves ranges of them, and `None`
+    /// draws everything where it was uploaded.
     pub fn draw(
         &mut self,
         rs: &eframe::egui_wgpu::RenderState,
@@ -224,6 +230,7 @@ impl PointRenderer {
         size: [u32; 2],
         point_size: f32,
         edl: Edl,
+        segments: Option<&[Segment]>,
     ) -> egui::TextureId {
         let limit = self.device.limits().max_texture_dimension_2d;
         let size = size.map(|v| v.clamp(1, limit));
@@ -246,16 +253,50 @@ impl PointRenderer {
             self.targets = Some(targets);
         }
         let targets = self.targets.as_ref().unwrap();
-        let matrix = camera.relative_matrix()
-            * glam::DMat4::from_translation(self.origin - DVec3::from(camera.target));
-        let uniform = Uniform {
-            matrix: matrix.as_mat4().to_cols_array_2d(),
-            viewport: [size[0] as f32, size[1] as f32],
-            size: point_size,
-            padding: 0.,
-        };
-        self.queue
-            .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
+        let all = [Segment {
+            range: 0..self.count,
+            motion: DMat4::IDENTITY,
+        }];
+        let segments: Vec<_> = segments
+            .unwrap_or(&all)
+            .iter()
+            .map(|s| {
+                (
+                    s.range.start.min(self.count)..s.range.end.min(self.count),
+                    s,
+                )
+            })
+            .filter(|(range, _)| !range.is_empty())
+            .collect();
+        if segments.len() > self.uniform_slots {
+            self.uniform_slots = segments.len().next_power_of_two();
+            (self.uniform, self.bind) = uniform_slots(
+                &self.device,
+                &self.layout,
+                self.uniform_stride,
+                self.uniform_slots,
+            );
+        }
+        // Vertices are relative to `origin`; compose in f64 so large
+        // coordinates keep their precision before narrowing to f32.
+        let view = camera.relative_matrix() * DMat4::from_translation(-DVec3::from(camera.target));
+        let mut uniforms = vec![0u8; segments.len() * self.uniform_stride as usize];
+        for ((_, segment), slot) in segments
+            .iter()
+            .zip(uniforms.chunks_mut(self.uniform_stride as usize))
+        {
+            let matrix = view * segment.motion * DMat4::from_translation(self.origin);
+            let uniform = Uniform {
+                matrix: matrix.as_mat4().to_cols_array_2d(),
+                viewport: [size[0] as f32, size[1] as f32],
+                size: point_size,
+                padding: 0.,
+            };
+            slot[..UNIFORM_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&uniform));
+        }
+        if !uniforms.is_empty() {
+            self.queue.write_buffer(&self.uniform, 0, &uniforms);
+        }
         let edl = EdlUniform {
             radius: edl.radius,
             strength: edl.strength,
@@ -305,9 +346,16 @@ impl PointRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind, &[]);
-            pass.set_vertex_buffer(0, self.vertices.slice(..));
-            pass.draw(0..6, 0..self.count);
+            let vertex = std::mem::size_of::<Vertex>() as u64;
+            for (i, (range, _)) in segments.iter().enumerate() {
+                pass.set_bind_group(0, &self.bind, &[(i as u64 * self.uniform_stride) as u32]);
+                pass.set_vertex_buffer(
+                    0,
+                    self.vertices
+                        .slice(range.start as u64 * vertex..range.end as u64 * vertex),
+                );
+                pass.draw(0..6, 0..range.len() as u32);
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -392,6 +440,35 @@ impl PointRenderer {
             edl_bind,
         }
     }
+}
+
+const UNIFORM_SIZE: u64 = std::mem::size_of::<Uniform>() as u64;
+
+fn uniform_slots(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    stride: u64,
+    slots: usize,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("point segments"),
+        size: stride * slots as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("point segments"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &buffer,
+                offset: 0,
+                size: wgpu::BufferSize::new(UNIFORM_SIZE),
+            }),
+        }],
+    });
+    (buffer, bind)
 }
 
 fn edl_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {

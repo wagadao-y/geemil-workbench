@@ -11,7 +11,9 @@ mod storage;
 mod tree;
 mod view_cache;
 
-pub use edit::{Camera, PreparedSelection, Projector, Selection, SelectionMode};
+pub use edit::{
+    Camera, LoadedView, PreparedSelection, Projector, Selection, SelectionMode, ViewSegment,
+};
 pub use error::{CoreError, Stage};
 pub use history::CleanupReport;
 pub use model::*;

@@ -276,25 +276,39 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
     let base = p.manifest.current;
     let a = p
         .load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
-        .unwrap();
+        .unwrap()
+        .samples;
     let misses = cache.stats().misses;
     let b = p
         .load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
-        .unwrap();
+        .unwrap()
+        .samples;
     assert_eq!(a, b);
     assert_eq!(cache.stats().misses, misses);
     assert!(cache.stats().hits > 0);
-    p.set_transform(
-        id,
-        Pose {
-            translation: [0.25, 0., 0.],
-            ..Pose::default()
-        },
-    )
-    .unwrap();
+    let pose = Pose {
+        translation: [0.25, 0., 0.],
+        ..Pose::default()
+    };
+    let scan = p.scans().next().unwrap().clone();
+    let previewed = p.world_matrix_with(&scan, id, pose);
+    p.set_transform(id, pose).unwrap();
+    assert!(previewed.abs_diff_eq(p.world_matrix(&scan), 1e-12));
+    let misses = cache.stats().misses;
     let moved = p
         .load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
         .unwrap();
+    // Samples are cached in scan coordinates, so moving a scan reads nothing.
+    assert_eq!(cache.stats().misses, misses);
+    assert_eq!(moved.segments.len(), 1);
+    assert_eq!(moved.segments[0].scan, id);
+    assert_eq!(moved.segments[0].range, 0..moved.samples.len());
+    assert!(
+        moved.segments[0]
+            .world
+            .abs_diff_eq(p.world_matrix(&scan), 1e-12)
+    );
+    let moved = moved.samples;
     assert_eq!(a.len(), moved.len());
     for (a, b) in a.iter().zip(moved) {
         assert!((a.position[0] + 0.25 - b.position[0]).abs() < 1e-12);
@@ -313,6 +327,7 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
     assert!(
         p.load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
             .unwrap()
+            .samples
             .is_empty()
     );
     p.switch(base).unwrap();
@@ -320,12 +335,14 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
         a,
         p.load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
             .unwrap()
+            .samples
     );
     let mut small = ViewCache::new(128);
     assert_eq!(
         a,
         p.load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut small)
             .unwrap()
+            .samples
     );
     assert!(small.stats().resident_bytes <= 128);
 }

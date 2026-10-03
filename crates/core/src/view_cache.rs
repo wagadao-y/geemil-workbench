@@ -4,7 +4,6 @@ use crate::{
     storage::{point_color, position, valid},
 };
 use anyhow::Result;
-use glam::DVec3;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use uuid::Uuid;
 
@@ -26,10 +25,11 @@ struct Entry {
     bytes: usize,
 }
 
-/// Revision-scoped LRU of decoded, masked, world-space node samples.
-/// Camera changes reuse the same nodes; revision/project changes invalidate them.
+/// LRU of decoded, masked node samples in scan-local coordinates. Camera and
+/// transform changes reuse them; a different project or set of active
+/// exclusion layers invalidates them. Layer masks never change once written.
 pub struct ViewCache {
-    epoch: Option<(PathBuf, Uuid)>,
+    epoch: Option<(PathBuf, Vec<Uuid>)>,
     entries: HashMap<Key, Entry>,
     limit: usize,
     clock: u64,
@@ -49,8 +49,7 @@ impl ViewCache {
         self.stats
     }
     pub(crate) fn prepare(&mut self, project: &Project) {
-        // Every edit gives the state a new id, so stale samples never survive.
-        let epoch = (project.root.clone(), project.current().id);
+        let epoch = (project.root.clone(), project.current().layers.clone());
         if self.epoch.as_ref() != Some(&epoch) {
             self.entries.clear();
             self.stats.resident_bytes = 0;
@@ -94,10 +93,9 @@ impl ViewCache {
         } else {
             project.read_lod(scan, node)?
         };
-        let world = project.world_matrix(scan);
         let mut masks = HashMap::new();
         let mut result = Vec::with_capacity(samples.len());
-        for (i, mut sample) in samples.into_iter().enumerate() {
+        for (i, sample) in samples.into_iter().enumerate() {
             if i % 8192 == 0 {
                 job.check()?;
             }
@@ -110,9 +108,6 @@ impl ViewCache {
                     continue;
                 }
             }
-            sample.position = world
-                .transform_point3(DVec3::from(sample.position))
-                .to_array();
             result.push(sample);
         }
         job.check()?;

@@ -26,6 +26,33 @@ pub(super) struct TransformEdit {
     loaded: Option<(Uuid, Uuid)>,
     translation: [f64; 3],
     rotation: [f64; 3],
+    /// The inputs as loaded; differing inputs are previewed until applied.
+    initial: ([f64; 3], [f64; 3]),
+}
+impl TransformEdit {
+    /// The applied transform of `id` in the current state.
+    fn load(p: &Project, id: Uuid) -> Self {
+        let pose = p.current().transforms.get(&id).copied().unwrap_or_default();
+        let (x, y, z) = DQuat::from_array(pose.rotation_xyzw).to_euler(glam::EulerRot::XYZ);
+        // Adding zero turns -0.0 into 0.0 for display.
+        let rotation = [x, y, z].map(|v| v.to_degrees() + 0.);
+        Self {
+            loaded: Some((id, p.current().id)),
+            translation: pose.translation,
+            rotation,
+            initial: (pose.translation, rotation),
+        }
+    }
+    fn changed(&self) -> bool {
+        (self.translation, self.rotation) != self.initial
+    }
+    fn pose(&self) -> Pose {
+        let [x, y, z] = self.rotation.map(f64::to_radians);
+        Pose {
+            translation: self.translation,
+            rotation_xyzw: DQuat::from_euler(glam::EulerRot::XYZ, x, y, z).to_array(),
+        }
+    }
 }
 
 fn within(p: &Project, id: Uuid, ancestor: Uuid) -> bool {
@@ -406,14 +433,7 @@ impl Workbench {
         let key = (id, p.current().id);
         let edit = &mut self.transform_edit;
         if edit.loaded != Some(key) {
-            let pose = p.current().transforms.get(&id).copied().unwrap_or_default();
-            let (x, y, z) = DQuat::from_array(pose.rotation_xyzw).to_euler(glam::EulerRot::XYZ);
-            *edit = TransformEdit {
-                loaded: Some(key),
-                translation: pose.translation,
-                // Adding zero turns -0.0 into 0.0 for display.
-                rotation: [x, y, z].map(|v| v.to_degrees() + 0.),
-            };
+            *edit = TransformEdit::load(p, id);
         }
         ui.strong(format!("{} {}", icon::ARROWS_OUT_CARDINAL, t.transform));
         if p.groups().iter().any(|g| g.id == id) {
@@ -432,16 +452,11 @@ impl Workbench {
             ui.end_row();
         });
         let idle = self.job.is_none();
-        let pose = Pose {
-            translation: edit.translation,
-            rotation_xyzw: DQuat::from_euler(
-                glam::EulerRot::XYZ,
-                edit.rotation[0].to_radians(),
-                edit.rotation[1].to_radians(),
-                edit.rotation[2].to_radians(),
-            )
-            .to_array(),
-        };
+        let pose = edit.pose();
+        let changed = edit.changed();
+        if changed {
+            ui.small(t.transform_previewing);
+        }
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
@@ -461,7 +476,33 @@ impl Workbench {
             {
                 self.apply_edit(|p| p.set_transform(id, Pose::default()));
             }
+            if changed && ui.button(format!("{} {}", icon::X, t.revert)).clicked() {
+                let edit = &mut self.transform_edit;
+                (edit.translation, edit.rotation) = edit.initial;
+            }
         });
+    }
+    /// Fills the transform editor of `id` as if the user had typed the values.
+    pub(super) fn edit_transform_inputs(
+        &mut self,
+        id: Uuid,
+        translation: [f64; 3],
+        rotation: [f64; 3],
+    ) {
+        let Some(p) = &self.project else { return };
+        self.transform_edit = TransformEdit {
+            translation,
+            rotation,
+            ..TransformEdit::load(p, id)
+        };
+    }
+    /// The edited, not yet applied transform of the selected item, which the
+    /// viewport shows in place of the applied one.
+    pub(super) fn transform_preview(&self) -> Option<(Uuid, Pose)> {
+        let (project, id) = (self.project.as_ref()?, self.selected?);
+        let edit = &self.transform_edit;
+        (edit.loaded == Some((id, project.current().id)) && edit.changed())
+            .then(|| (id, edit.pose()))
     }
     fn layers(&mut self, ui: &mut egui::Ui, p: &Project) {
         let t = self.t;

@@ -21,7 +21,7 @@ pub use smoke::SmokeOptions;
 use crate::i18n::{self, Strings};
 use crate::render::PointRenderer;
 use eframe::egui;
-use geemil_core::{Bounds, Camera, CleanupReport, Project, Sample};
+use geemil_core::{Bounds, Camera, CleanupReport, Project, Sample, ViewSegment};
 use jobs::{ActiveJob, Notice};
 use serde::{Deserialize, Serialize};
 use smoke::SmokeTest;
@@ -79,6 +79,8 @@ pub struct Workbench {
     // Displayed samples and view refinement.
     view: ViewLoader,
     points: Vec<Sample>,
+    /// The scan and load-time transform of each range of `points`.
+    points_segments: Vec<ViewSegment>,
     points_generation: u64,
     points_origin: [f64; 3],
     view_ms: f64,
@@ -133,6 +135,7 @@ impl Workbench {
             cleanup_report: None,
             view: ViewLoader::spawn(cc.egui_ctx.clone()),
             points: vec![],
+            points_segments: vec![],
             points_generation: 0,
             points_origin: [0.; 3],
             view_ms: 0.,
