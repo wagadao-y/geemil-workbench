@@ -17,15 +17,16 @@ pub struct SmokeOptions {
     pub orbit: bool,
     /// Replace the view with fixed colour probes and check them in the capture.
     pub colors: bool,
-    /// Select the centre of the view after one second and preview this exclusion.
-    pub select: Option<SelectionMode>,
+    /// Select the centre of the view after one second and preview this exclusion
+    /// (mode, whether an inside exclusion limits its depth).
+    pub select: Option<(SelectionMode, bool)>,
 }
 
 pub(super) struct SmokeTest {
     screenshot: Option<PathBuf>,
     orbit: bool,
     pub(super) colors: bool,
-    select: Option<SelectionMode>,
+    select: Option<(SelectionMode, bool)>,
     requested: bool,
     probes: Vec<(egui::Pos2, [u8; 4])>,
     camera: Camera,
@@ -110,12 +111,12 @@ impl Workbench {
             ctx.request_repaint();
         }
         // After a second the viewport aspect is final, which the selection keeps.
-        if let Some(mode) = smoke
+        if let Some((mode, limit_depth)) = smoke
             .select
             .take_if(|_| smoke.started.elapsed() > Duration::from_secs(1))
         {
             self.selection
-                .select_rect(self.camera, [0.35, 0.3], [0.65, 0.7], mode);
+                .select_rect(self.camera, [0.35, 0.3], [0.65, 0.7], mode, limit_depth);
         }
         for event in ctx.input(|i| i.events.clone()) {
             if let egui::Event::Screenshot { image, .. } = event {

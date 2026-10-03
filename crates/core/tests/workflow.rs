@@ -146,7 +146,7 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
     let selection = Selection {
         camera,
         polygon: vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
-        depth_meters: 0.1,
+        depth_meters: Some(0.1),
         mode: SelectionMode::ExcludeInside,
     };
     let mut all_depths = vec![];
@@ -449,7 +449,7 @@ fn cropping_excludes_everything_outside_the_polygon_at_any_depth() {
     let crop = Selection {
         camera,
         polygon: vec![[0.3, 0.2], [0.8, 0.35], [0.6, 0.9], [0.25, 0.7]],
-        depth_meters: 0.1,
+        depth_meters: Some(0.1),
         mode: SelectionMode::ExcludeOutside,
     };
     let test = crop.prepare();
@@ -510,7 +510,7 @@ fn selection_nearest_matches_the_recorded_exclusion() {
             ..Camera::default()
         },
         polygon: vec![[0.4, 0.4], [0.6, 0.4], [0.6, 0.6], [0.4, 0.6]],
-        depth_meters: 0.2,
+        depth_meters: Some(0.2),
         mode: SelectionMode::ExcludeInside,
     };
     let nearest = project
@@ -529,8 +529,13 @@ fn preview_of_displayed_points_matches_the_committed_exclusion() {
     let source = dir.path().join("source.e57");
     interchange::create_demo(&source).unwrap();
     let job = JobControl::default();
-    for mode in [SelectionMode::ExcludeInside, SelectionMode::ExcludeOutside] {
-        let mut project = Project::create(&dir.path().join(format!("{mode:?}")), "Test").unwrap();
+    let cases = [
+        (SelectionMode::ExcludeInside, Some(0.3)),
+        (SelectionMode::ExcludeInside, None),
+        (SelectionMode::ExcludeOutside, None),
+    ];
+    for (i, (mode, depth_meters)) in cases.into_iter().enumerate() {
+        let mut project = Project::create(&dir.path().join(i.to_string()), "Test").unwrap();
         let options = ImportOptions {
             chunk_points: 256,
             lod_points: 16,
@@ -550,20 +555,19 @@ fn preview_of_displayed_points_matches_the_committed_exclusion() {
         let selection = Selection {
             camera,
             polygon: vec![[0.3, 0.25], [0.75, 0.35], [0.6, 0.8], [0.35, 0.65]],
-            depth_meters: 0.3,
+            depth_meters,
             mode,
         };
-        let limit = match mode {
-            SelectionMode::ExcludeInside => {
-                project
-                    .selection_nearest(&selection, &ids, &job)
-                    .unwrap()
-                    .unwrap()
-                    + selection.depth_meters
-            }
-            SelectionMode::ExcludeOutside => f64::INFINITY,
-        };
         let test = selection.prepare();
+        let limit = if test.depth_limited() {
+            project
+                .selection_nearest(&selection, &ids, &job)
+                .unwrap()
+                .unwrap()
+                + depth_meters.unwrap()
+        } else {
+            f64::INFINITY
+        };
         // A small budget, so the view mixes LOD samples and full chunks.
         let mut previews = vec![];
         for id in &ids {
@@ -575,7 +579,7 @@ fn preview_of_displayed_points_matches_the_committed_exclusion() {
             previews.push((*id, samples, marks));
         }
         let excluded = project.delete_selection(&selection, &ids, &job).unwrap();
-        assert!(excluded > 0, "{mode:?}");
+        assert!(excluded > 0, "{mode:?} {depth_meters:?}");
         let (mut marked, mut checked) = (0, 0);
         for (id, samples, marks) in previews {
             let scan = project.scans().find(|s| s.id == id).unwrap();
@@ -596,4 +600,52 @@ fn preview_of_displayed_points_matches_the_committed_exclusion() {
             "{mode:?}: {marked} of {checked}"
         );
     }
+}
+
+/// Without a depth, excluding inside removes exactly what cropping keeps, at
+/// any distance in front of the camera.
+#[test]
+fn unlimited_inside_exclusion_is_the_complement_of_cropping() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.e57");
+    interchange::create_demo(&source).unwrap();
+    let job = JobControl::default();
+    let options = ImportOptions {
+        chunk_points: 128,
+        lod_points: 2,
+        ..Default::default()
+    };
+    let mut counts = vec![];
+    for mode in [SelectionMode::ExcludeInside, SelectionMode::ExcludeOutside] {
+        let mut project = Project::create(&dir.path().join(format!("{mode:?}")), "Test").unwrap();
+        project.import_file(&source, options, &job).unwrap();
+        let ids: Vec<_> = project.scans().map(|s| s.id).collect();
+        let bounds = project.bounds();
+        // Inside the cloud: some points lie behind the camera, some beyond the far plane.
+        let selection = Selection {
+            camera: Camera {
+                target: bounds.center().to_array(),
+                yaw: 0.3,
+                pitch: 0.4,
+                distance: 0.05,
+                ..Camera::default()
+            },
+            polygon: vec![[0.3, 0.2], [0.8, 0.35], [0.6, 0.9], [0.25, 0.7]],
+            depth_meters: None,
+            mode,
+        };
+        let total: u64 = project.scans().map(|s| s.records).sum();
+        counts.push((
+            project.delete_selection(&selection, &ids, &job).unwrap(),
+            total,
+        ));
+        assert!(project.current().operation["nearest"].is_null());
+        assert!(project.current().operation["selection"]["depth_meters"].is_null());
+    }
+    let [(inside, total), (outside, _)] = counts[..] else {
+        unreachable!()
+    };
+    // The demo has no invalid records, so every point is in exactly one result.
+    assert!(inside > 0 && outside > 0);
+    assert_eq!(inside + outside, total);
 }

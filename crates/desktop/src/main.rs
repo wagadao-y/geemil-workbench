@@ -21,8 +21,9 @@ fn main() -> eframe::Result<()> {
             .position(|a| a == "--smoke-select")
             .and_then(|i| args.get(i + 1))
             .and_then(|mode| match mode.to_str() {
-                Some("inside") => Some(geemil_core::SelectionMode::ExcludeInside),
-                Some("outside") => Some(geemil_core::SelectionMode::ExcludeOutside),
+                Some("inside") => Some((geemil_core::SelectionMode::ExcludeInside, true)),
+                Some("inside-all") => Some((geemil_core::SelectionMode::ExcludeInside, false)),
+                Some("outside") => Some((geemil_core::SelectionMode::ExcludeOutside, false)),
                 _ => None,
             }),
     };

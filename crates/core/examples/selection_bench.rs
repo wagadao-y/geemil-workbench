@@ -12,7 +12,9 @@ fn main() -> Result<()> {
     );
     let mut project = Project::load(Path::new(&args[0]))?;
     let half: f64 = args.get(1).map(|s| s.parse()).transpose()?.unwrap_or(0.05);
-    let depth: f64 = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(0.5);
+    // "inf" (or any non-finite depth) excludes at any depth.
+    let depth = Some(args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(0.5))
+        .filter(|d: &f64| d.is_finite());
     let mode = match args.get(3).map(String::as_str) {
         None | Some("inside") => SelectionMode::ExcludeInside,
         Some("outside") => SelectionMode::ExcludeOutside,

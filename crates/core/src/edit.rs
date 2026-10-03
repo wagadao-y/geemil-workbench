@@ -111,8 +111,9 @@ impl Projector {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectionMode {
-    /// Points inside the polygon, from the nearest one to `depth_meters` behind it:
-    /// clearing noise in front of the camera while moving through a cloud.
+    /// Points seen through the polygon, optionally only from the nearest one to
+    /// `depth_meters` behind it: clearing noise in front of the camera while
+    /// moving through a cloud.
     #[default]
     ExcludeInside,
     /// Everything not seen through the polygon, at any depth: cropping.
@@ -122,8 +123,9 @@ pub enum SelectionMode {
 pub struct Selection {
     pub camera: Camera,
     pub polygon: Vec<[f64; 2]>,
-    /// Used by `ExcludeInside` only.
-    pub depth_meters: f64,
+    /// `ExcludeInside` only: the thickness behind the nearest selected point, or
+    /// None for any depth (like CloudCompare's segmentation).
+    pub depth_meters: Option<f64>,
     #[serde(default)]
     pub mode: SelectionMode,
 }
@@ -145,6 +147,7 @@ impl Selection {
         PreparedSelection {
             polygon: &self.polygon,
             mode: self.mode,
+            depth: self.depth_meters,
             matrix: self.camera.matrix(),
             projector: self.camera.projector(),
             min,
@@ -155,6 +158,7 @@ impl Selection {
 pub struct PreparedSelection<'a> {
     polygon: &'a [[f64; 2]],
     mode: SelectionMode,
+    depth: Option<f64>,
     matrix: DMat4,
     projector: Projector,
     /// Polygon bounding box in normalized viewport coordinates.
@@ -177,12 +181,20 @@ impl PreparedSelection<'_> {
         let ndc = clip.truncate() / clip.w;
         self.inside_polygon([(ndc.x + 1.) * 0.5, (1. - ndc.y) * 0.5])
     }
-    /// Whether an exclusion removes `p`. `limit` is the nearest selected depth plus
-    /// `depth_meters` (see `Project::selection_nearest`); `ExcludeOutside` ignores it.
+    /// Whether this exclusion needs the nearest selected depth as its base.
+    pub fn depth_limited(&self) -> bool {
+        self.mode == SelectionMode::ExcludeInside && self.depth.is_some()
+    }
+    /// Whether an exclusion removes `p`. When `depth_limited`, `limit` is the
+    /// nearest selected depth plus `depth_meters` (see `Project::selection_nearest`);
+    /// otherwise it is ignored.
     pub fn excludes(&self, p: DVec3, limit: f64) -> bool {
-        match self.mode {
-            SelectionMode::ExcludeInside => self.contains(p).is_some_and(|depth| depth <= limit),
-            SelectionMode::ExcludeOutside => !self.covers(p),
+        match (self.mode, self.depth) {
+            (SelectionMode::ExcludeInside, Some(_)) => {
+                self.contains(p).is_some_and(|depth| depth <= limit)
+            }
+            (SelectionMode::ExcludeInside, None) => self.covers(p),
+            (SelectionMode::ExcludeOutside, _) => !self.covers(p),
         }
     }
     fn inside_polygon(&self, uv: [f64; 2]) -> bool {
@@ -199,9 +211,17 @@ impl PreparedSelection<'_> {
         inside
     }
     /// False only when no point in `bounds` (local coordinates, placed by `world`)
-    /// can be selected at a view depth of at most `max_depth`. Conservative: the
-    /// box is culled only if all corners lie outside one clip-space half-space.
+    /// can be selected by `contains` at a view depth of at most `max_depth`.
     pub fn may_contain(&self, bounds: &Bounds, world: DMat4, max_depth: f64) -> bool {
+        self.may_hit(bounds, world, Some(max_depth))
+    }
+    /// False only when no point in `bounds` is covered (see `covers`).
+    pub fn may_cover(&self, bounds: &Bounds, world: DMat4) -> bool {
+        self.may_hit(bounds, world, None)
+    }
+    /// Conservative: the box is culled only if all corners lie outside one
+    /// clip-space half-space. `depth` adds the near/far planes and a depth limit.
+    fn may_hit(&self, bounds: &Bounds, world: DMat4, depth: Option<f64>) -> bool {
         // Keep rounding in the corner transforms from culling points on the faces.
         let margin = DVec3::splat(bounds.radius() * 1e-6 + 1e-9);
         let padded = Bounds {
@@ -215,10 +235,11 @@ impl PreparedSelection<'_> {
         let x = [2. * self.min[0] - 1., 2. * self.max[0] - 1.];
         let y = [1. - 2. * self.max[1], 1. - 2. * self.min[1]];
         let outside = |test: &dyn Fn(DVec4) -> bool| corners.iter().all(|c| test(*c));
-        !(outside(&|c| c.w <= 0.)
-            || outside(&|c| c.z < 0.)
-            || outside(&|c| c.z > c.w)
-            || outside(&|c| c.w > max_depth)
+        let beyond_depth = depth.is_some_and(|max_depth| {
+            outside(&|c| c.z < 0.) || outside(&|c| c.z > c.w) || outside(&|c| c.w > max_depth)
+        });
+        !(beyond_depth
+            || outside(&|c| c.w <= 0.)
             || outside(&|c| c.x < x[0] * c.w)
             || outside(&|c| c.x > x[1] * c.w)
             || outside(&|c| c.y < y[0] * c.w)
@@ -231,7 +252,9 @@ fn validate(selection: &Selection) -> Result<()> {
         "Invalid selection polygon"
     );
     ensure!(
-        selection.depth_meters.is_finite() && selection.depth_meters > 0.,
+        selection
+            .depth_meters
+            .is_none_or(|depth| depth.is_finite() && depth > 0.),
         "Depth must be positive"
     );
     Ok(())
@@ -341,11 +364,11 @@ impl Project {
         validate(selection)?;
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let test = selection.prepare();
-        // ExcludeInside first finds the nearest surviving ORIGINAL point,
-        // independent of LOD. Chunks keep their own nearest depth so the second
-        // pass can skip them. Cropping has no depth and visits every chunk.
-        let (nearest, limit, chunk_nearest) = match selection.mode {
-            SelectionMode::ExcludeInside => {
+        // A depth-limited exclusion first finds the nearest surviving ORIGINAL
+        // point, independent of LOD. Chunks keep their own nearest depth so the
+        // second pass can skip them. Without a depth there is no first pass.
+        let (nearest, limit, chunk_nearest) = match (selection.mode, selection.depth_meters) {
+            (SelectionMode::ExcludeInside, Some(depth_meters)) => {
                 let depths = self.chunk_nearest(&test, &scans, job)?;
                 let nearest = depths
                     .iter()
@@ -355,13 +378,9 @@ impl Project {
                 if !nearest.is_finite() {
                     return Ok(0);
                 }
-                (
-                    Some(nearest),
-                    nearest + selection.depth_meters,
-                    Some(depths),
-                )
+                (Some(nearest), nearest + depth_meters, Some(depths))
             }
-            SelectionMode::ExcludeOutside => (None, f64::INFINITY, None),
+            _ => (None, f64::INFINITY, None),
         };
         let id = Uuid::new_v4();
         let relative = format!("layers/{id}.mask");
@@ -379,10 +398,13 @@ impl Project {
                     chunk as u64,
                     scan.chunks.len() as u64,
                 );
-                if chunk_nearest
-                    .as_ref()
-                    .is_some_and(|depths| depths[index][chunk] > limit)
-                {
+                let skip = match (&chunk_nearest, selection.mode) {
+                    (Some(depths), _) => depths[index][chunk] > limit,
+                    (None, SelectionMode::ExcludeInside) => !test.may_cover(&c.bounds, world),
+                    // A box inside a non-convex polygon may still have outside points.
+                    (None, SelectionMode::ExcludeOutside) => false,
+                };
+                if skip {
                     continue;
                 }
                 let data = self.read_chunk(scan, chunk as u32)?;
@@ -630,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_culling_never_skips_a_selectable_point() {
+    fn chunk_culling_never_skips_a_selectable_or_covered_point() {
         // Deterministic pseudo-random values in [0, 1).
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut next = move || {
@@ -649,7 +671,7 @@ mod tests {
                 ..Camera::default()
             },
             polygon: vec![[0.42, 0.40], [0.61, 0.44], [0.55, 0.63], [0.40, 0.58]],
-            depth_meters: 1.,
+            depth_meters: Some(1.),
             mode: SelectionMode::ExcludeInside,
         };
         let test = selection.prepare();
@@ -657,7 +679,7 @@ mod tests {
             DQuat::from_rotation_z(0.3),
             DVec3::new(-2., 1., 0.25),
         );
-        let (mut kept, mut culled, mut selectable) = (0, 0, 0);
+        let (mut kept, mut culled, mut selectable, mut covered_samples) = (0, 0, 0, 0);
         for _ in 0..4000 {
             let center = DVec3::new(next(), next(), next()) * 16. - 8.;
             let half = DVec3::new(next(), next(), next()) * 1.5 + DVec3::splat(0.01);
@@ -667,6 +689,7 @@ mod tests {
             };
             let max_depth = 6. + next() * 10.;
             let may_contain = test.may_contain(&bounds, world, max_depth);
+            let may_cover = test.may_cover(&bounds, world);
             if may_contain {
                 kept += 1;
             } else {
@@ -683,10 +706,14 @@ mod tests {
                         .is_some_and(|depth| depth <= max_depth);
                     assert!(!selected || may_contain, "culled a selectable point");
                     selectable += selected as u32;
+                    let covered = test.covers(world.transform_point3(local));
+                    assert!(!covered || may_cover, "culled a covered point");
+                    covered_samples += covered as u32;
                 }
             }
         }
         assert!(selectable > 100, "only {selectable} selectable samples");
+        assert!(covered_samples > selectable, "{covered_samples} covered");
         // The cull must actually skip most boxes away from the small polygon.
         assert!(culled > kept, "kept {kept}, culled {culled}");
     }

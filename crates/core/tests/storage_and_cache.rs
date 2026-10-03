@@ -206,7 +206,7 @@ fn legacy_conversion_preserves_references_revisions_and_masks() {
         &Selection {
             camera,
             polygon: vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
-            depth_meters: 0.1,
+            depth_meters: Some(0.1),
             mode: SelectionMode::ExcludeInside,
         },
         &ids,
@@ -299,7 +299,7 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
         &Selection {
             camera,
             polygon: vec![[0., 0.], [1., 0.], [1., 1.], [0., 1.]],
-            depth_meters: 1000.,
+            depth_meters: Some(1000.),
             mode: SelectionMode::ExcludeInside,
         },
         &[id],

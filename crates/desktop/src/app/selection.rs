@@ -28,6 +28,8 @@ pub(super) enum Tool {
 pub(super) struct SelectionState {
     pub(super) tool: Tool,
     mode: SelectionMode,
+    /// Limit an inside exclusion to `depth` behind the nearest point.
+    limit_depth: bool,
     depth: f64,
     polygon: Vec<egui::Pos2>,
     /// A closed polygon takes no more vertices; the next click starts a new one.
@@ -44,6 +46,7 @@ impl Default for SelectionState {
         Self {
             tool: Tool::Navigate,
             mode: SelectionMode::ExcludeInside,
+            limit_depth: true,
             depth: 0.5,
             polygon: vec![],
             closed: false,
@@ -69,10 +72,12 @@ impl SelectionState {
         min: [f32; 2],
         max: [f32; 2],
         mode: SelectionMode,
+        limit_depth: bool,
     ) {
         self.clear();
         self.tool = Tool::Rect;
         self.mode = mode;
+        self.limit_depth = limit_depth;
         self.camera = Some(camera);
         self.polygon = vec![
             egui::pos2(min[0], min[1]),
@@ -113,7 +118,8 @@ impl SelectionState {
                 .iter()
                 .map(|p| [p.x as f64, p.y as f64])
                 .collect(),
-            depth_meters: self.depth,
+            depth_meters: (self.mode == SelectionMode::ExcludeInside && self.limit_depth)
+                .then_some(self.depth),
             mode: self.mode,
         })
     }
@@ -152,7 +158,7 @@ struct MarksInput {
     polygon: Vec<egui::Pos2>,
     camera: Camera,
     mode: SelectionMode,
-    depth: f64,
+    depth: Option<f64>,
     nearest: Nearest,
     points: u64,
 }
@@ -182,9 +188,9 @@ impl Workbench {
                 t.exclude_outside,
             );
             let inside = s.mode == SelectionMode::ExcludeInside;
-            ui.add_enabled(inside, egui::Label::new(t.depth));
+            ui.add_enabled(inside, egui::Checkbox::new(&mut s.limit_depth, t.depth));
             ui.add_enabled(
-                inside,
+                inside && s.limit_depth,
                 egui::DragValue::new(&mut s.depth)
                     .speed(0.05)
                     .range(0.001..=1_000_000.)
@@ -302,7 +308,8 @@ impl Workbench {
         };
         let s = &mut self.selection;
         let preview = &mut s.preview;
-        if selection.mode == SelectionMode::ExcludeInside {
+        let test = selection.prepare();
+        if test.depth_limited() {
             let input = NearestInput {
                 polygon: s.polygon.clone(),
                 camera: selection.camera,
@@ -335,10 +342,9 @@ impl Workbench {
             points: self.points_generation,
         };
         if preview.marks_for.as_ref() != Some(&input) {
-            let test = selection.prepare();
-            let limit = match (selection.mode, preview.nearest) {
-                (SelectionMode::ExcludeOutside, _) => f64::INFINITY,
-                (_, Nearest::Displayed(d) | Nearest::Exact(Some(d))) => d + selection.depth_meters,
+            let limit = match (selection.depth_meters, preview.nearest) {
+                _ if !test.depth_limited() => f64::INFINITY,
+                (Some(depth), Nearest::Displayed(d) | Nearest::Exact(Some(d))) => d + depth,
                 // Nothing inside the polygon: nothing to exclude.
                 _ => f64::NEG_INFINITY,
             };

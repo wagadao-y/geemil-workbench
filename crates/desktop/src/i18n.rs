@@ -139,7 +139,7 @@ pub static JA: Strings = Strings {
     tool_polygon: "多角形選択",
     exclude_inside: "範囲内を除外",
     exclude_outside: "範囲外を除外",
-    depth: "奥行き",
+    depth: "奥行きを制限",
     exclude_selection: "除外を実行",
     preview_count: |points| format!("除外予定 {points} 点（表示中の点）"),
     preview_searching: "手前の点を確認中",
