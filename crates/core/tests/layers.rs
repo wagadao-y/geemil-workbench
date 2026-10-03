@@ -165,7 +165,7 @@ fn hidden_layers_take_no_part_in_filters_or_exports() {
     let crop = geemil_core::CropBox {
         center: bounds.center().to_array(),
         size,
-        yaw: 0.,
+        rotation: [0., 0., 0., 1.],
     };
     let into = p.create_layer("Kept".into()).unwrap();
     let moved = p

@@ -558,7 +558,12 @@ impl Project {
     ) -> Result<u64> {
         ensure!(
             crop.size.iter().all(|s| s.is_finite() && *s > 0.)
-                && crop.center.iter().chain([&crop.yaw]).all(|v| v.is_finite()),
+                && crop
+                    .center
+                    .iter()
+                    .chain(crop.rotation.iter())
+                    .all(|v| v.is_finite())
+                && (glam::DQuat::from_array(crop.rotation).length_squared() - 1.).abs() < 1e-6,
             "Invalid box"
         );
         let unit = crop.unit_matrix();

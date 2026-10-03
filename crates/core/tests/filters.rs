@@ -222,6 +222,29 @@ fn filters_reject_invalid_parameters_and_cancel_without_a_layer() {
 }
 
 #[test]
+fn tilted_box_uses_its_local_axes_for_clipping() {
+    use geemil_core::CropBox;
+    use glam::{DQuat, DVec3};
+    // Turning 90 degrees about X exchanges the box's Y and Z extents.
+    let crop = CropBox {
+        center: [10., -20., 30.],
+        size: [2., 4., 6.],
+        rotation: DQuat::from_rotation_x(std::f64::consts::FRAC_PI_2).to_array(),
+    };
+    assert!(crop.contains(DVec3::new(10., -22.5, 30.)));
+    assert!(!crop.contains(DVec3::new(10., -20., 32.5)));
+    assert!(!crop.contains(DVec3::new(11.1, -20., 30.)));
+    let corners = crop.corners();
+    let min = corners.iter().copied().fold(DVec3::INFINITY, DVec3::min);
+    let max = corners
+        .iter()
+        .copied()
+        .fold(DVec3::NEG_INFINITY, DVec3::max);
+    assert!(min.distance(DVec3::new(9., -23., 28.)) < 1e-10);
+    assert!(max.distance(DVec3::new(11., -17., 32.)) < 1e-10);
+}
+
+#[test]
 fn box_crop_matches_brute_force_and_inside_complements_outside() {
     use geemil_core::{CropBox, Pose};
     use glam::{DQuat, DVec3};
@@ -229,7 +252,7 @@ fn box_crop_matches_brute_force_and_inside_complements_outside() {
     let crop = CropBox {
         center: [500004.5, 4000001.2, 0.5],
         size: [3., 1.5, 2.],
-        yaw: 0.4,
+        rotation: DQuat::from_euler(glam::EulerRot::XYZ, 0.3, -0.2, 0.4).to_array(),
     };
     for (name, chunk_points) in [("small", 64), ("large", 65_536)] {
         let mut p = project(dir.path(), name, chunk_points);

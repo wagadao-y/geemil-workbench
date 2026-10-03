@@ -49,7 +49,6 @@ impl Workbench {
                     ui.separator();
                     // Revisions are how a project is saved, so they live here.
                     self.menu_item(ui, Action::Save, &mut chosen);
-                    self.menu_item(ui, Action::SaveAs, &mut chosen);
                     self.menu_item(ui, Action::Revisions, &mut chosen);
                     self.menu_item(ui, Action::Discard, &mut chosen);
                     ui.separator();

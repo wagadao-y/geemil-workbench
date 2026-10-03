@@ -10,7 +10,7 @@ use glam::{DMat4, DVec3};
 use uuid::Uuid;
 
 const BOX: egui::Color32 = egui::Color32::from_rgb(235, 235, 235);
-const AXES: [(DVec3, egui::Color32); 3] = [
+pub(super) const AXES: [(DVec3, egui::Color32); 3] = [
     (DVec3::X, egui::Color32::from_rgb(235, 75, 75)),
     (DVec3::Y, egui::Color32::from_rgb(95, 205, 95)),
     (DVec3::Z, egui::Color32::from_rgb(85, 145, 255)),
@@ -24,7 +24,7 @@ const GRAB: f32 = 7.;
 const RING_SEGMENTS: usize = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Handle {
+pub(super) enum Handle {
     Move(usize),
     Turn(usize),
 }
@@ -96,7 +96,7 @@ pub(super) fn item_box(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<(D
 }
 
 /// Projects world points to the screen within `rect`.
-fn screen(camera: &Camera, rect: egui::Rect) -> impl Fn(DVec3) -> Option<egui::Pos2> {
+pub(super) fn screen(camera: &Camera, rect: egui::Rect) -> impl Fn(DVec3) -> Option<egui::Pos2> {
     let projector = camera.projector();
     move |p| {
         projector.project(p).map(|(uv, _)| {
@@ -149,7 +149,7 @@ pub(super) fn draw_box_edges(
 }
 
 /// Metres per screen point at `p`, or none behind the eye.
-fn metres_per_point(camera: &Camera, rect: egui::Rect, p: DVec3) -> Option<f64> {
+pub(super) fn metres_per_point(camera: &Camera, rect: egui::Rect, p: DVec3) -> Option<f64> {
     let height = if camera.ortho {
         2. * camera.half_height()
     } else {
@@ -169,7 +169,7 @@ fn plane_basis(axis: DVec3) -> (DVec3, DVec3) {
 }
 
 /// The ray through a screen position: its origin and unit direction.
-fn ray(camera: &Camera, rect: egui::Rect, pos: egui::Pos2) -> (DVec3, DVec3) {
+pub(super) fn ray(camera: &Camera, rect: egui::Rect, pos: egui::Pos2) -> (DVec3, DVec3) {
     let x = 2. * ((pos.x - rect.left()) / rect.width()) as f64 - 1.;
     let y = 1. - 2. * ((pos.y - rect.top()) / rect.height()) as f64;
     let inverse = camera.matrix().inverse();
@@ -180,7 +180,7 @@ fn ray(camera: &Camera, rect: egui::Rect, pos: egui::Pos2) -> (DVec3, DVec3) {
 
 /// Where the ray meets the plane through `center` square to `axis`, unless it
 /// runs nearly along the plane.
-fn plane_hit(origin: DVec3, dir: DVec3, center: DVec3, axis: DVec3) -> Option<DVec3> {
+pub(super) fn plane_hit(origin: DVec3, dir: DVec3, center: DVec3, axis: DVec3) -> Option<DVec3> {
     let along = dir.dot(axis);
     (along.abs() > 0.05).then(|| origin + dir * ((center - origin).dot(axis) / along))
 }
@@ -192,17 +192,17 @@ fn segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
 }
 
 /// The screen geometry of the handles around `center`.
-struct Handles {
-    center: egui::Pos2,
+pub(super) struct Handles {
+    pub(super) center: egui::Pos2,
     /// Arrow tips.
-    tips: [Option<egui::Pos2>; 3],
+    pub(super) tips: [Option<egui::Pos2>; 3],
     /// Ring outlines; points behind the eye are left out.
     rings: [Vec<egui::Pos2>; 3],
     /// Arrow length and ring radius in metres.
-    arm: f64,
+    pub(super) arm: f64,
 }
 impl Handles {
-    fn new(camera: &Camera, rect: egui::Rect, center: DVec3) -> Option<Self> {
+    pub(super) fn new(camera: &Camera, rect: egui::Rect, center: DVec3) -> Option<Self> {
         let to_screen = screen(camera, rect);
         let mpp = metres_per_point(camera, rect, center)?;
         let (arm, radius) = (ARM * mpp, RING * mpp);
@@ -224,7 +224,7 @@ impl Handles {
         })
     }
     /// The handle under `pos`: arrows before rings.
-    fn hit(&self, pos: egui::Pos2) -> Option<Handle> {
+    pub(super) fn hit(&self, pos: egui::Pos2) -> Option<Handle> {
         let arrows = (0..3).filter_map(|i| {
             let tip = self.tips[i]?;
             Some((segment_distance(pos, self.center, tip), Handle::Move(i)))
@@ -241,6 +241,47 @@ impl Handles {
             .filter(|(d, _)| *d <= GRAB)
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, handle)| handle)
+    }
+}
+
+impl Handles {
+    pub(super) fn draw(&self, painter: &egui::Painter, active: Option<Handle>) {
+        let width = |handle| if active == Some(handle) { 4. } else { 2.5 };
+        let color = |i: usize, handle| {
+            if active == Some(handle) {
+                egui::Color32::from_rgb(255, 230, 90)
+            } else {
+                AXES[i].1
+            }
+        };
+        let outline = |w: f32| egui::Stroke::new(w + 2., egui::Color32::from_black_alpha(160));
+        for (i, ring) in self.rings.iter().enumerate() {
+            let handle = Handle::Turn(i);
+            let w = width(handle);
+            painter.add(egui::Shape::line(ring.clone(), outline(w)));
+            painter.add(egui::Shape::line(
+                ring.clone(),
+                egui::Stroke::new(w, color(i, handle)),
+            ));
+        }
+        for (i, tip) in self.tips.iter().enumerate() {
+            let Some(tip) = *tip else { continue };
+            let handle = Handle::Move(i);
+            let w = width(handle);
+            let c = color(i, handle);
+            painter.line_segment([self.center, tip], outline(w));
+            painter.line_segment([self.center, tip], egui::Stroke::new(w, c));
+            let dir = (tip - self.center).normalized();
+            let side = egui::vec2(-dir.y, dir.x);
+            let head = vec![tip + dir * 10., tip + side * 5., tip - side * 5.];
+            painter.add(egui::Shape::convex_polygon(head, c, outline(0.)));
+        }
+        painter.circle(
+            self.center,
+            3.5,
+            egui::Color32::WHITE,
+            egui::Stroke::new(1., egui::Color32::BLACK),
+        );
     }
 }
 
@@ -395,42 +436,7 @@ impl Workbench {
             .as_ref()
             .map(|d| d.handle)
             .or(self.gizmo.hover);
-        let width = |handle| if active == Some(handle) { 4. } else { 2.5 };
-        let color = |i: usize, handle| {
-            if active == Some(handle) {
-                egui::Color32::from_rgb(255, 230, 90)
-            } else {
-                AXES[i].1
-            }
-        };
-        let outline = |w: f32| egui::Stroke::new(w + 2., egui::Color32::from_black_alpha(160));
-        for (i, ring) in handles.rings.iter().enumerate() {
-            let handle = Handle::Turn(i);
-            let w = width(handle);
-            painter.add(egui::Shape::line(ring.clone(), outline(w)));
-            painter.add(egui::Shape::line(
-                ring.clone(),
-                egui::Stroke::new(w, color(i, handle)),
-            ));
-        }
-        for (i, tip) in handles.tips.iter().enumerate() {
-            let Some(tip) = *tip else { continue };
-            let handle = Handle::Move(i);
-            let w = width(handle);
-            let c = color(i, handle);
-            painter.line_segment([handles.center, tip], outline(w));
-            painter.line_segment([handles.center, tip], egui::Stroke::new(w, c));
-            let dir = (tip - handles.center).normalized();
-            let side = egui::vec2(-dir.y, dir.x);
-            let head = vec![tip + dir * 10., tip + side * 5., tip - side * 5.];
-            painter.add(egui::Shape::convex_polygon(head, c, outline(0.)));
-        }
-        painter.circle(
-            handles.center,
-            3.5,
-            egui::Color32::WHITE,
-            egui::Stroke::new(1., egui::Color32::BLACK),
-        );
+        handles.draw(&painter, active);
         if let Some(drag) = &self.gizmo.drag
             && let Some(pos) = ui.ctx().pointer_hover_pos()
         {

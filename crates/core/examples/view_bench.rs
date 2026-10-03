@@ -25,11 +25,18 @@ fn main() -> Result<()> {
     for step in 0..8 {
         camera.yaw += 0.025;
         let start = Instant::now();
-        let points =
-            project.load_view_cached(&camera, budget, &ids, &JobControl::default(), &mut cache)?;
+        let job = JobControl::default();
+        let picks = project.select_view(&camera, budget, &ids, &job)?;
+        let select_ms = start.elapsed().as_secs_f64() * 1000.;
+        let load_start = Instant::now();
+        let mut points = 0;
+        for pick in &picks {
+            points += project.view_node(pick, &job, &mut cache)?.samples.len();
+        }
+        let load_ms = load_start.elapsed().as_secs_f64() * 1000.;
         println!(
-            "step={step} points={} elapsed_ms={:.1}",
-            points.nodes.iter().map(|n| n.samples.len()).sum::<usize>(),
+            "step={step} nodes={} points={points} select_ms={select_ms:.1} load_ms={load_ms:.1} elapsed_ms={:.1}",
+            picks.len(),
             start.elapsed().as_secs_f64() * 1000.
         );
         println!("cache {:?}", cache.stats());

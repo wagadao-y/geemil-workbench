@@ -39,7 +39,7 @@ impl Workbench {
                     },
                     marks_revision,
                     nodes: &nodes,
-                    clip: self.display_clip().map(|c| c.unit_matrix()),
+                    highlight_box: self.display_highlight_box().map(|c| c.unit_matrix()),
                     height_ramp: (self.settings.color_mode == ColorMode::Height)
                         .then_some(self.height_range)
                         .flatten(),
@@ -52,6 +52,7 @@ impl Workbench {
             self.smoke_probes(response.rect);
             if self.job.is_none() {
                 self.gizmo_input(&response);
+                self.crop_input(&response);
             }
             self.camera_input(ctx, &response);
             if self.job.is_none() {

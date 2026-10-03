@@ -35,10 +35,10 @@ struct Uniform {
     tint: [f32; 4],
     /// View depth of a vertex for EDL as `dot(depth, (position, 1))`.
     depth: [f32; 4],
-    /// Maps a vertex into box coordinates; points outside `[-1, 1]` are not
-    /// drawn when `clip_on` is 1.
-    clip: [[f32; 4]; 4],
-    clip_on: f32,
+    /// Maps a vertex into box coordinates; points inside `[-1, 1]` are
+    /// highlighted when `box_highlight_on` is 1.
+    highlight_box: [[f32; 4]; 4],
+    box_highlight_on: f32,
     /// 1 to colour by height with `ramp`.
     ramp_on: f32,
     padding2: [f32; 2],
@@ -73,8 +73,8 @@ pub struct DrawOptions<'a> {
     /// Splat diameter in physical pixels.
     pub point_size: f32,
     pub edl: Edl,
-    /// Maps the project frame into a box outside of which nothing is drawn.
-    pub clip: Option<DMat4>,
+    /// Maps the project frame into a box whose interior points are highlighted.
+    pub highlight_box: Option<DMat4>,
     /// Colour by height from the first to the second value (project Z).
     pub height_ramp: Option<[f64; 2]>,
     /// Changes whenever the nodes' marks do.
@@ -317,7 +317,7 @@ impl PointRenderer {
         let DrawOptions {
             point_size,
             edl,
-            clip,
+            highlight_box,
             height_ramp,
             marks_revision,
             nodes,
@@ -387,11 +387,11 @@ impl PointRenderer {
                 padding: 0.,
                 tint: segment.tint,
                 depth: depth.as_vec4().to_array(),
-                clip: clip
+                highlight_box: highlight_box
                     .map_or(DMat4::IDENTITY, |c| c * to_world)
                     .as_mat4()
                     .to_cols_array_2d(),
-                clip_on: clip.is_some() as u32 as f32,
+                box_highlight_on: highlight_box.is_some() as u32 as f32,
                 ramp_on: height_ramp.is_some() as u32 as f32,
                 padding2: [0.; 2],
                 ramp: height_ramp

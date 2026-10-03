@@ -204,21 +204,21 @@ impl LabelPatch {
             .map(|i| &self.blocks[i])
     }
 }
-/// A box in the project frame, turned about the vertical axis.
+/// An oriented box in the project frame.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct CropBox {
     pub center: [f64; 3],
     /// Full edge lengths along the box's own axes, in metres.
     pub size: [f64; 3],
-    /// Turn about Z, in radians.
-    pub yaw: f64,
+    /// Unit quaternion (x, y, z, w) orienting the box's axes in the project.
+    pub rotation: [f64; 4],
 }
 impl CropBox {
     /// Maps the project frame onto box coordinates in which the box is
     /// `[-1, 1]` on every axis.
     pub fn unit_matrix(&self) -> DMat4 {
         DMat4::from_scale(DVec3::from(self.size).map(|s| 2. / s))
-            * DMat4::from_rotation_z(-self.yaw)
+            * DMat4::from_quat(DQuat::from_array(self.rotation).conjugate())
             * DMat4::from_translation(-DVec3::from(self.center))
     }
     pub fn contains(&self, p: DVec3) -> bool {

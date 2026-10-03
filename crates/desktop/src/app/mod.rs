@@ -320,7 +320,11 @@ impl eframe::App for Workbench {
         self.dialogs(&ctx);
         self.request_view();
         self.update_title(&ctx);
-        if self.dirty || self.refine_pending || self.job.is_some() {
+        if self.dirty
+            || self.refine_pending
+            || self.job.is_some()
+            || self.renderer.as_ref().is_some_and(|r| r.pending())
+        {
             ctx.request_repaint_after(Duration::from_millis(33));
         }
     }

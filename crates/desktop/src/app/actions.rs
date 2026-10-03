@@ -3,6 +3,7 @@ use super::{
     Workbench,
     dialogs::{AfterDiscard, Dialog, Filter},
     jobs::Notice,
+    revisions::listed_revision,
     selection::Tool,
 };
 use crate::i18n::Strings;
@@ -41,7 +42,6 @@ pub(super) enum Action {
     ToggleEdl,
     ToggleOrtho,
     Save,
-    SaveAs,
     Revisions,
     Discard,
     Cleanup,
@@ -74,7 +74,6 @@ impl Action {
             Self::ToggleEdl => icon::CIRCLE_HALF,
             Self::ToggleOrtho => icon::PERSPECTIVE,
             Self::Save => icon::FLOPPY_DISK,
-            Self::SaveAs => icon::FLOPPY_DISK_BACK,
             Self::Revisions => icon::GIT_BRANCH,
             Self::Discard => icon::ARROW_COUNTER_CLOCKWISE,
             Self::Cleanup => icon::BROOM,
@@ -114,7 +113,6 @@ impl Action {
             Self::ToggleEdl => t.edl.into(),
             Self::ToggleOrtho => t.ortho.into(),
             Self::Save => t.save.into(),
-            Self::SaveAs => t.save_as.into(),
             Self::Revisions => t.revisions.into(),
             Self::Discard => t.discard.into(),
             Self::Cleanup => t.cleanup.into(),
@@ -140,7 +138,6 @@ impl Action {
             Self::Open => ctrl(Key::O),
             Self::Import => ctrl(Key::I),
             Self::Save => ctrl(Key::S),
-            Self::SaveAs => KeyboardShortcut::new(Modifiers::COMMAND | Modifiers::SHIFT, Key::S),
             Self::Undo => ctrl(Key::Z),
             Self::Redo => ctrl(Key::Y),
             _ => return None,
@@ -180,7 +177,6 @@ const KEYED: &[Action] = &[
     Action::NewProject,
     Action::Open,
     Action::Import,
-    Action::SaveAs,
     Action::Save,
     Action::Undo,
     Action::Redo,
@@ -215,7 +211,7 @@ impl Workbench {
             Action::Undo => idle && self.undo.can_undo(),
             Action::Redo => idle && self.undo.can_redo(),
             Action::Exclude => idle && self.selection.is_ready(),
-            Action::Save | Action::SaveAs | Action::Discard => idle && unsaved,
+            Action::Save | Action::Discard => idle && unsaved,
             Action::Revisions | Action::Cleanup => idle && project.is_some(),
             Action::Subsample | Action::RemoveNoise | Action::RemoveOutliers => {
                 idle && !self.visible.is_empty()
@@ -317,6 +313,7 @@ impl Workbench {
                     self.align.clear();
                 }
                 self.gizmo.cancel();
+                self.crop.cancel();
             }
             Action::Exclude => self.exclude(ctx),
             Action::NewFolder => {
@@ -339,13 +336,6 @@ impl Workbench {
                 self.selection.clear();
             }
             Action::Save => {
-                let n = self
-                    .project
-                    .as_ref()
-                    .map_or(1, |p| p.manifest.revisions.len());
-                self.save_revision((t.default_revision_name)(n));
-            }
-            Action::SaveAs => {
                 let n = self
                     .project
                     .as_ref()
@@ -390,6 +380,7 @@ impl Workbench {
                 ))
             }
             Action::Tool(tool) => {
+                self.crop.cancel();
                 self.selection.tool = tool;
                 if tool != Tool::Measure {
                     self.measure.clear();
@@ -508,7 +499,14 @@ impl Workbench {
     pub(super) fn open_project(&mut self, path: &std::path::Path) {
         match Project::load(path) {
             Ok(p) => {
-                let choose = p.manifest.revisions.len() > 1 || p.has_unsaved_changes();
+                let choose = p
+                    .manifest
+                    .revisions
+                    .iter()
+                    .filter(|r| listed_revision(r))
+                    .count()
+                    > 1
+                    || p.has_unsaved_changes();
                 self.undo.clear();
                 self.install(p, true);
                 self.status = self.t.status_opened.into();

@@ -34,7 +34,7 @@ pub struct SmokeOptions {
     /// noise (0.1 m radius, 4 neighbours), sor (6 neighbours, 1 sigma), align-icp (ICP of the first scan
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
     /// align-apply (apply the previewed result), ortho (parallel projection,
-    /// top view), box (a 2 m slice at the median height, display clipped),
+    /// top view), box (a 2 m slice at the median height, inside highlighted),
     /// box-crop (move everything outside that box to the "deleted" layer),
     /// transform and transform-folder (the move and rotate tool on the first
     /// scan or folder), show-layers (show every layer), restore (move every point of the newest
@@ -300,7 +300,12 @@ impl Workbench {
             "exclude" => self.perform(ctx, Action::Exclude),
             "undo" => self.perform(ctx, Action::Undo),
             "redo" => self.perform(ctx, Action::Redo),
-            "save" => self.perform(ctx, Action::Save),
+            "save" => {
+                if self.enabled(&Action::Save) {
+                    let n = self.project.as_ref().unwrap().manifest.revisions.len();
+                    self.save_revision((self.t.default_revision_name)(n));
+                }
+            }
             "folder" => {
                 let first = self
                     .project
@@ -389,8 +394,8 @@ impl Workbench {
             }
             "color-height" => self.settings.color_mode = super::ColorMode::Height,
             "color-scan" => self.settings.color_mode = super::ColorMode::Scan,
-            "box" => {
-                self.smoke_box();
+            "box" | "box-resize" => {
+                self.smoke_box(step == "box-resize");
                 if let Some(region) = self.crop.region {
                     let inside = self
                         .shown_points(false)

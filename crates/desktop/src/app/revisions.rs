@@ -10,6 +10,11 @@ use egui_phosphor::regular as icon;
 use geemil_core::{Project, Revision};
 use uuid::Uuid;
 
+/// The empty creation state stays in the project but is not a selectable revision.
+pub(super) fn listed_revision(revision: &Revision) -> bool {
+    revision.operation.get("kind").and_then(|k| k.as_str()) != Some("create")
+}
+
 #[derive(Default)]
 pub(super) struct RevisionsState {
     selected: Option<Uuid>,
@@ -20,7 +25,27 @@ pub(super) struct RevisionsState {
 impl RevisionsState {
     pub(super) fn new(project: Option<&Project>) -> Self {
         Self {
-            selected: project.map(|p| p.manifest.current),
+            selected: project.and_then(|p| {
+                p.manifest
+                    .draft
+                    .as_ref()
+                    .map(|d| d.id)
+                    .or_else(|| {
+                        p.manifest
+                            .revisions
+                            .iter()
+                            .find(|r| r.id == p.manifest.current && listed_revision(r))
+                            .map(|r| r.id)
+                    })
+                    .or_else(|| {
+                        p.manifest
+                            .revisions
+                            .iter()
+                            .rev()
+                            .find(|r| listed_revision(r))
+                            .map(|r| r.id)
+                    })
+            }),
             ..Default::default()
         }
     }
@@ -206,6 +231,7 @@ impl Workbench {
                     .revisions
                     .iter()
                     .rev()
+                    .filter(|r| listed_revision(r))
                     .map(|r| (r.id, r.parent)),
             );
             let rows = graph_layout(&nodes);
@@ -226,11 +252,11 @@ impl Workbench {
                             ui.allocate_exact_size(egui::vec2(width, ROW), egui::Sense::click());
                         let is_draft = draft.is_some_and(|d| d.id == row.id);
                         let revision = project.manifest.revisions.iter().find(|r| r.id == row.id);
-                        let selected = state.selected == Some(row.id) && !is_draft;
+                        let selected = state.selected == Some(row.id);
                         let painter = ui.painter_at(rect);
                         if selected {
                             painter.rect_filled(rect, 3., ui.visuals().selection.bg_fill);
-                        } else if response.hovered() && !is_draft {
+                        } else if response.hovered() {
                             painter.rect_filled(
                                 rect,
                                 3.,
@@ -297,9 +323,6 @@ impl Workbench {
                         let pos =
                             egui::pos2(text_rect.left(), rect.center().y - galley.size().y / 2.);
                         painter.galley(pos, galley, text);
-                        if is_draft {
-                            continue;
-                        }
                         if response.clicked() {
                             state.selected = Some(row.id);
                             state.confirm_delete = None;
@@ -312,6 +335,8 @@ impl Workbench {
             ui.separator();
             ui.horizontal(|ui| {
                 let selected = state.selected;
+                let selected_saved =
+                    selected.filter(|id| project.manifest.revisions.iter().any(|r| r.id == *id));
                 let can_open = selected.is_some_and(|id| id != current || draft.is_some());
                 if ui
                     .add_enabled(
@@ -324,11 +349,11 @@ impl Workbench {
                 }
                 if ui
                     .add_enabled(
-                        selected.is_some(),
+                        selected_saved.is_some(),
                         egui::Button::new(format!("{} {}", icon::PENCIL_SIMPLE, t.rename)),
                     )
                     .clicked()
-                    && let Some(id) = selected
+                    && let Some(id) = selected_saved
                 {
                     let r = project.manifest.revisions.iter().find(|r| r.id == id);
                     let name = r.map(|r| revision_title(t, r)).unwrap_or_default();
@@ -342,7 +367,7 @@ impl Workbench {
                 };
                 if ui
                     .add_enabled(
-                        selected.is_some_and(|id| id != current),
+                        selected_saved.is_some_and(|id| id != current),
                         egui::Button::new(label),
                     )
                     .clicked()
@@ -355,12 +380,7 @@ impl Workbench {
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let close = if draft.is_some() {
-                        t.continue_unsaved
-                    } else {
-                        t.close
-                    };
-                    if ui.button(close).clicked() {
+                    if ui.button(t.close).clicked() {
                         keep = false;
                     }
                 });
@@ -375,17 +395,21 @@ impl Workbench {
         }
         if let Some(id) = delete {
             self.update_project(|p| p.delete_revision(id));
-            state.selected = Some(current);
+            state.selected = RevisionsState::new(self.project.as_deref()).selected;
         }
         if let Some(id) = open {
-            if project.has_unsaved_changes() {
+            if draft.is_some_and(|d| d.id == id) {
+                // The working state is already loaded; keep it and its undo history.
+                keep = false;
+            } else if project.has_unsaved_changes() {
                 self.dialog = Some(Dialog::Discard {
                     then: AfterDiscard::Switch(id),
                 });
                 return false;
+            } else {
+                self.switch_revision(id);
+                keep = false;
             }
-            self.switch_revision(id);
-            keep = false;
         }
         if !keep {
             self.dialog = None;

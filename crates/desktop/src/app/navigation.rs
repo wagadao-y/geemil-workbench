@@ -19,6 +19,9 @@ impl Workbench {
     /// and double-click picking. Any camera change drops the selection, which is
     /// tied to the camera it was drawn with.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
+        if self.crop.dragging() {
+            return;
+        }
         let mut moved = false;
         if self.selection.tool.orbits()
             && !self.gizmo.dragging()
@@ -97,6 +100,7 @@ impl Workbench {
     pub(super) fn draw_pivot(&self, ui: &egui::Ui, response: &egui::Response) {
         let orbiting = self.selection.tool.orbits()
             && !self.gizmo.dragging()
+            && !self.crop.dragging()
             && response.dragged_by(egui::PointerButton::Primary);
         if !(orbiting || self.flight.is_some()) {
             return;
