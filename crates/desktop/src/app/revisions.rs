@@ -1,4 +1,4 @@
-//! The revision list: a tree of saved revisions to open, rename or delete.
+//! The revision list: a git-style graph of saved revisions to open, rename or delete.
 use super::{
     Workbench,
     dialogs::{AfterDiscard, Dialog},
@@ -8,7 +8,6 @@ use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::{Layer, Project, Revision};
-use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -27,32 +26,113 @@ impl RevisionsState {
     }
 }
 
-/// Revisions depth first, each after its parent, oldest first among siblings.
-fn tree_order(revisions: &[Revision]) -> Vec<(usize, &Revision)> {
-    let ids: Vec<_> = revisions.iter().map(|r| r.id).collect();
-    let mut children: BTreeMap<Option<Uuid>, Vec<&Revision>> = BTreeMap::new();
-    for r in revisions {
-        let parent = r.parent.filter(|p| ids.contains(p));
-        children.entry(parent).or_default().push(r);
-    }
-    let mut out = vec![];
-    let mut stack: Vec<_> = children
-        .get(&None)
-        .into_iter()
-        .flatten()
-        .rev()
-        .map(|r| (0, *r))
-        .collect();
-    while let Some((depth, r)) = stack.pop() {
-        out.push((depth, r));
-        if out.len() > revisions.len() {
-            break;
+/// One row of the revision graph, laid out like a git history graph: newest
+/// first, a straight line while history is linear, a new lane per branch.
+#[derive(Debug, PartialEq)]
+struct GraphRow {
+    id: Uuid,
+    /// The lane this row's dot sits in.
+    lane: usize,
+    /// Lanes running through this row to rows further down.
+    through: Vec<usize>,
+    /// Lanes of children above that end in this dot.
+    from_above: Vec<usize>,
+    /// Whether a line continues down to the parent.
+    to_parent: bool,
+}
+
+/// Lays out `(id, parent)` pairs given newest first, so children come before
+/// their parents. A parent missing from the list ends the line.
+fn graph_layout(nodes: &[(Uuid, Option<Uuid>)]) -> Vec<GraphRow> {
+    let ids: Vec<_> = nodes.iter().map(|(id, _)| *id).collect();
+    // The id each lane is waiting for, top to bottom.
+    let mut lanes: Vec<Option<Uuid>> = vec![];
+    let mut rows = vec![];
+    for (id, parent) in nodes {
+        let from_above: Vec<_> = (0..lanes.len())
+            .filter(|l| lanes[*l] == Some(*id))
+            .collect();
+        let through: Vec<_> = (0..lanes.len())
+            .filter(|l| lanes[*l].is_some_and(|w| w != *id))
+            .collect();
+        let lane = from_above.first().copied().unwrap_or_else(|| {
+            lanes.iter().position(Option::is_none).unwrap_or_else(|| {
+                lanes.push(None);
+                lanes.len() - 1
+            })
+        });
+        for l in &from_above {
+            lanes[*l] = None;
         }
-        for child in children.get(&Some(r.id)).into_iter().flatten().rev() {
-            stack.push((depth + 1, child));
+        let parent = parent.filter(|p| ids.contains(p));
+        lanes[lane] = parent;
+        while lanes.last() == Some(&None) {
+            lanes.pop();
         }
+        rows.push(GraphRow {
+            id: *id,
+            lane,
+            through,
+            from_above,
+            to_parent: parent.is_some(),
+        });
     }
-    out
+    rows
+}
+
+const LANE: f32 = 16.;
+const ROW: f32 = 26.;
+
+fn lane_color(lane: usize) -> egui::Color32 {
+    const COLORS: [egui::Color32; 6] = [
+        egui::Color32::from_rgb(86, 156, 214),
+        egui::Color32::from_rgb(206, 145, 120),
+        egui::Color32::from_rgb(106, 190, 120),
+        egui::Color32::from_rgb(197, 134, 192),
+        egui::Color32::from_rgb(220, 200, 90),
+        egui::Color32::from_rgb(78, 201, 176),
+    ];
+    COLORS[lane % COLORS.len()]
+}
+
+/// Draws one row's lines and dot into `rect`.
+fn paint_graph(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    row: &GraphRow,
+    current: bool,
+    draft: bool,
+) {
+    let x = |lane: usize| rect.left() + LANE / 2. + lane as f32 * LANE;
+    let (top, mid, bottom) = (rect.top(), rect.center().y, rect.bottom());
+    let stroke = |lane| egui::Stroke::new(2., lane_color(lane));
+    for &l in &row.through {
+        painter.line_segment([egui::pos2(x(l), top), egui::pos2(x(l), bottom)], stroke(l));
+    }
+    let dot = egui::pos2(x(row.lane), mid);
+    for &l in &row.from_above {
+        // Branches above curve into the dot they started from.
+        let start = egui::pos2(x(l), top);
+        let shape = egui::epaint::CubicBezierShape::from_points_stroke(
+            [start, egui::pos2(x(l), mid), egui::pos2(dot.x, top), dot],
+            false,
+            egui::Color32::TRANSPARENT,
+            stroke(l),
+        );
+        painter.add(shape);
+    }
+    if row.to_parent {
+        painter.line_segment([dot, egui::pos2(dot.x, bottom)], stroke(row.lane));
+    }
+    let color = lane_color(row.lane);
+    if draft {
+        painter.circle(dot, 4.5, egui::Color32::BLACK, egui::Stroke::new(2., color));
+    } else if current {
+        painter.circle(dot, 6., egui::Color32::BLACK, egui::Stroke::new(2.5, color));
+        painter.circle_filled(dot, 3., color);
+    } else {
+        painter.circle_filled(dot, 4.5, color);
+    }
 }
 
 /// A revision's title: the user's name, or for revisions from versions that
@@ -146,58 +226,120 @@ impl Workbench {
             ui.heading(format!("{} {}", icon::GIT_BRANCH, t.revisions_title));
             ui.label(t.revisions_lead);
             ui.add_space(4.);
+            // Newest first; the unsaved state sits on top of its revision.
+            let mut nodes: Vec<_> = draft.map(|d| (d.id, Some(current))).into_iter().collect();
+            nodes.extend(
+                project
+                    .manifest
+                    .revisions
+                    .iter()
+                    .rev()
+                    .map(|r| (r.id, r.parent)),
+            );
+            let rows = graph_layout(&nodes);
+            let lanes = rows
+                .iter()
+                .flat_map(|r| r.through.iter().chain(&r.from_above).chain([&r.lane]))
+                .max()
+                .map_or(1, |l| l + 1);
+            let graph_width = lanes as f32 * LANE + 4.;
             egui::ScrollArea::vertical()
-                .max_height(380.)
+                .max_height(420.)
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    for (depth, r) in tree_order(&project.manifest.revisions) {
-                        ui.horizontal(|ui| {
-                            ui.add_space(depth as f32 * 18.);
-                            let selected = state.selected == Some(r.id);
-                            if let Some((id, name)) = &mut state.renaming
-                                && *id == r.id
-                            {
-                                let edit = ui.text_edit_singleline(name);
-                                edit.request_focus();
-                                if edit.lost_focus() {
-                                    rename = Some((r.id, name.clone()));
-                                }
-                                return;
-                            }
-                            let marker = if r.id == current {
-                                icon::EYE
-                            } else {
-                                icon::GIT_COMMIT
-                            };
-                            let title = format!("{marker} {}", revision_title(t, &project, r));
-                            let row = ui.selectable_label(selected, title);
-                            if row.clicked() {
-                                state.selected = Some(r.id);
-                                state.confirm_delete = None;
-                            }
-                            if row.double_clicked() {
-                                open = Some(r.id);
-                            }
-                            if r.id == current {
-                                ui.small(egui::RichText::new(t.shown_revision).strong());
-                            }
-                            ui.small(saved_time(r));
-                            ui.small(revision_summary(t, r));
-                        });
-                        if let Some(draft) = draft
-                            && r.id == current
+                    ui.spacing_mut().item_spacing.y = 0.;
+                    for row in &rows {
+                        let width = ui.available_width();
+                        let (rect, response) =
+                            ui.allocate_exact_size(egui::vec2(width, ROW), egui::Sense::click());
+                        let is_draft = draft.is_some_and(|d| d.id == row.id);
+                        let revision = project.manifest.revisions.iter().find(|r| r.id == row.id);
+                        let selected = state.selected == Some(row.id) && !is_draft;
+                        let painter = ui.painter_at(rect);
+                        if selected {
+                            painter.rect_filled(rect, 3., ui.visuals().selection.bg_fill);
+                        } else if response.hovered() && !is_draft {
+                            painter.rect_filled(
+                                rect,
+                                3.,
+                                ui.visuals().widgets.hovered.weak_bg_fill,
+                            );
+                        }
+                        let graph =
+                            egui::Rect::from_min_size(rect.min, egui::vec2(graph_width, ROW));
+                        paint_graph(&painter, graph, row, row.id == current, is_draft);
+                        let text_rect = egui::Rect::from_min_max(
+                            egui::pos2(graph.right() + 6., rect.top()),
+                            rect.max,
+                        );
+                        if let Some((id, name)) = &mut state.renaming
+                            && *id == row.id
                         {
-                            ui.horizontal(|ui| {
-                                ui.add_space((depth + 1) as f32 * 18.);
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "{} {}",
-                                        icon::PENCIL_SIMPLE,
-                                        t.unsaved_state
-                                    ))
-                                    .italics(),
+                            let edit_rect = egui::Rect::from_min_size(
+                                text_rect.min + egui::vec2(0., 2.),
+                                egui::vec2(text_rect.width().min(320.), ROW - 4.),
+                            );
+                            let edit = ui.put(edit_rect, egui::TextEdit::singleline(name));
+                            edit.request_focus();
+                            if edit.lost_focus() {
+                                rename = Some((row.id, name.clone()));
+                            }
+                            continue;
+                        }
+                        let text = ui.visuals().text_color();
+                        let weak = ui.visuals().weak_text_color();
+                        let mut job = egui::text::LayoutJob::default();
+                        let mut push = |s: &str, size: f32, color, italics, strong: bool| {
+                            job.append(
+                                s,
+                                if job.text.is_empty() { 0. } else { 10. },
+                                egui::TextFormat {
+                                    font_id: egui::FontId::proportional(size),
+                                    color: if strong {
+                                        ui.visuals().strong_text_color()
+                                    } else {
+                                        color
+                                    },
+                                    italics,
+                                    valign: egui::Align::Center,
+                                    ..Default::default()
+                                },
+                            );
+                        };
+                        match (is_draft, revision, draft) {
+                            (true, _, Some(d)) => {
+                                push(t.unsaved_state, 14., text, true, false);
+                                push(&revision_summary(t, d), 11., weak, false, false);
+                            }
+                            (false, Some(r), _) => {
+                                push(
+                                    &revision_title(t, &project, r),
+                                    14.,
+                                    text,
+                                    false,
+                                    r.id == current,
                                 );
-                                ui.small(revision_summary(t, draft));
-                            });
+                                if r.id == current {
+                                    push(t.shown_revision, 11., text, false, true);
+                                }
+                                push(&saved_time(r), 11., weak, false, false);
+                                push(&revision_summary(t, r), 11., weak, false, false);
+                            }
+                            _ => {}
+                        }
+                        let galley = ui.fonts_mut(|f| f.layout_job(job));
+                        let pos =
+                            egui::pos2(text_rect.left(), rect.center().y - galley.size().y / 2.);
+                        painter.galley(pos, galley, text);
+                        if is_draft {
+                            continue;
+                        }
+                        if response.clicked() {
+                            state.selected = Some(row.id);
+                            state.confirm_delete = None;
+                        }
+                        if response.double_clicked() {
+                            open = Some(row.id);
                         }
                     }
                 });
@@ -294,5 +436,44 @@ impl Workbench {
             Ok(()) => self.install(project, false),
             Err(e) => self.error = Some(Notice::new(self.t, &e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GraphRow, graph_layout};
+    use uuid::Uuid;
+
+    #[test]
+    fn linear_history_stays_in_one_lane_and_branches_get_their_own() {
+        // root <- a <- b, and root <- c (a fork), listed newest first.
+        let [root, a, b, c] = [(); 4].map(|_| Uuid::new_v4());
+        let rows = graph_layout(&[(c, Some(root)), (b, Some(a)), (a, Some(root)), (root, None)]);
+        let row = |id, lane, through: &[usize], from_above: &[usize], to_parent| GraphRow {
+            id,
+            lane,
+            through: through.to_vec(),
+            from_above: from_above.to_vec(),
+            to_parent,
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row(c, 0, &[], &[], true),
+                // b starts a second lane while c's line passes by.
+                row(b, 1, &[0], &[], true),
+                row(a, 1, &[0], &[1], true),
+                // Both branches meet at their common parent, in the leftmost lane.
+                row(root, 0, &[], &[0, 1], false),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_parents_end_lines_and_freed_lanes_are_reused() {
+        let [a, b, gone] = [(); 3].map(|_| Uuid::new_v4());
+        let rows = graph_layout(&[(a, Some(gone)), (b, None)]);
+        assert!(!rows[0].to_parent);
+        assert_eq!((rows[1].lane, rows[1].through.len()), (0, 0));
     }
 }
