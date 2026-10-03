@@ -370,6 +370,7 @@ impl Workbench {
             Action::Subsample => {
                 self.dialog = Some(Dialog::Filter(Filter::Subsample {
                     size: self.settings.subsample_size,
+                    merged: self.settings.subsample_merged,
                 }))
             }
             Action::RemoveNoise => {
@@ -427,7 +428,10 @@ impl Workbench {
         let mut project = (**p).clone();
         let ids: Vec<_> = self.visible.iter().copied().collect();
         match filter {
-            Filter::Subsample { size } => self.settings.subsample_size = size,
+            Filter::Subsample { size, merged } => {
+                self.settings.subsample_size = size;
+                self.settings.subsample_merged = merged;
+            }
             Filter::Noise {
                 radius,
                 min_neighbours,
@@ -447,7 +451,13 @@ impl Workbench {
         }
         self.start(ctx, true, move |job| {
             match filter {
-                Filter::Subsample { size } => project.subsample(size, &ids, &job)?,
+                Filter::Subsample {
+                    size,
+                    merged: false,
+                } => project.subsample(size, &ids, &job)?,
+                Filter::Subsample { size, merged: true } => {
+                    project.subsample_merged(size, &ids, &job)?
+                }
                 Filter::Noise {
                     radius,
                     min_neighbours,

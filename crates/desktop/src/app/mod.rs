@@ -48,6 +48,7 @@ pub(super) struct Settings {
     edl_strength: f32,
     /// Last filter parameters, offered again next time.
     subsample_size: f64,
+    subsample_merged: bool,
     noise_radius: f64,
     noise_neighbours: u32,
     icp_distance: f64,
@@ -66,6 +67,7 @@ impl Default for Settings {
             edl: true,
             edl_strength: 1.,
             subsample_size: 0.01,
+            subsample_merged: false,
             noise_radius: 0.05,
             noise_neighbours: 4,
             icp_distance: 0.5,

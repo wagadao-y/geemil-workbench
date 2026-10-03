@@ -412,7 +412,13 @@ impl LayerWriter {
             id,
             name: match kind {
                 LayerKind::Manual => format!("Manual exclusion ({total} points)"),
-                LayerKind::Subsample { size } => format!("Voxel subsampling {size} m"),
+                LayerKind::Subsample {
+                    size,
+                    merged: false,
+                } => format!("Voxel subsampling {size} m"),
+                LayerKind::Subsample { size, merged: true } => {
+                    format!("Merged voxel subsampling {size} m")
+                }
                 LayerKind::Noise {
                     radius,
                     min_neighbours,

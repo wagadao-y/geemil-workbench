@@ -28,6 +28,7 @@ pub struct SmokeOptions {
     /// remove (take out the first scan), measure (measure two picked points),
     /// preview (edit the first scan's transform without applying it),
     /// apply-transform (apply the edited transform), subsample (5 cm voxels),
+    /// subsample-merged (5 cm voxels over all visible scans),
     /// noise (0.1 m radius, 4 neighbours), sor (6 neighbours, 1 sigma), align-icp (ICP of the first scan
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
     /// align-apply (apply the previewed result), ortho (parallel projection,
@@ -136,6 +137,7 @@ impl Workbench {
                 }),
                 "subsample" => Some(Dialog::Filter(super::dialogs::Filter::Subsample {
                     size: self.settings.subsample_size,
+                    merged: self.settings.subsample_merged,
                 })),
                 "noise" => Some(Dialog::Filter(super::dialogs::Filter::Noise {
                     radius: self.settings.noise_radius,
@@ -325,7 +327,20 @@ impl Workbench {
                     self.points.len()
                 );
             }
-            "subsample" => self.run_filter(ctx, super::dialogs::Filter::Subsample { size: 0.05 }),
+            "subsample" => self.run_filter(
+                ctx,
+                super::dialogs::Filter::Subsample {
+                    size: 0.05,
+                    merged: false,
+                },
+            ),
+            "subsample-merged" => self.run_filter(
+                ctx,
+                super::dialogs::Filter::Subsample {
+                    size: 0.05,
+                    merged: true,
+                },
+            ),
             "noise" => self.run_filter(
                 ctx,
                 super::dialogs::Filter::Noise {

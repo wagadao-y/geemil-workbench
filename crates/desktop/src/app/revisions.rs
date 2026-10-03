@@ -204,7 +204,9 @@ pub(super) fn layer_label(t: &Strings, layer: &Layer) -> String {
     let points = t.count(layer.excluded);
     match layer.kind {
         LayerKind::Manual => (t.exclusion_layer)(&points),
-        LayerKind::Subsample { size } => (t.subsample_layer)(&size.to_string(), &points),
+        LayerKind::Subsample { size, merged } => {
+            (t.subsample_layer)(&size.to_string(), merged, &points)
+        }
         LayerKind::Noise {
             radius,
             min_neighbours,

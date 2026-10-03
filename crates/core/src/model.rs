@@ -171,8 +171,14 @@ pub enum LayerKind {
     /// A range exclusion drawn in the viewport.
     #[default]
     Manual,
-    /// Voxel subsampling: one original point kept per voxel of `size` metres.
-    Subsample { size: f64 },
+    /// Voxel subsampling: one original point kept per voxel of `size` metres,
+    /// per scan in scan coordinates, or with `merged` over all the scans
+    /// together in the project frame (where scans overlap, one point in all).
+    Subsample {
+        size: f64,
+        #[serde(default)]
+        merged: bool,
+    },
     /// Isolated point removal: points with fewer than `min_neighbours` other
     /// points within `radius` metres.
     Noise { radius: f64, min_neighbours: u32 },

@@ -39,6 +39,7 @@ pub(super) enum Dialog {
 pub(super) enum Filter {
     Subsample {
         size: f64,
+        merged: bool,
     },
     Noise {
         radius: f64,
@@ -235,9 +236,13 @@ impl Workbench {
                     egui::Grid::new("filter")
                         .num_columns(2)
                         .show(ui, |ui| match filter {
-                            Filter::Subsample { size } => {
+                            Filter::Subsample { size, merged } => {
                                 ui.label(t.voxel_size);
                                 ui.add(metres(size));
+                                ui.end_row();
+                                ui.label("");
+                                ui.checkbox(merged, t.subsample_merged)
+                                    .on_hover_text(t.subsample_merged_hint);
                                 ui.end_row();
                             }
                             Filter::Noise {

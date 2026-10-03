@@ -178,7 +178,10 @@ fn subsampling_keeps_the_point_nearest_each_voxel_centre_regardless_of_chunking(
         }
         assert_eq!(
             p.manifest.layers.last().unwrap().kind,
-            LayerKind::Subsample { size }
+            LayerKind::Subsample {
+                size,
+                merged: false
+            }
         );
         // Filtering what is left only considers surviving points.
         let removed = p
@@ -348,4 +351,81 @@ fn heavy_exclusions_still_fill_the_view_budget() {
         .len();
     // Excluded samples no longer use up the budget (before: about a quarter).
     assert!(after > budget * 9 / 10, "{after} of {budget}");
+}
+
+#[test]
+fn merged_subsampling_keeps_one_point_per_voxel_over_overlapping_scans() {
+    use geemil_core::Pose;
+    use glam::{DMat4, DQuat, DVec3};
+    let dir = tempfile::tempdir().unwrap();
+    let size = 0.25;
+    let mut results = vec![];
+    for (name, chunk_points) in [("small", 64), ("large", 65_536)] {
+        let mut p = project(dir.path(), name, chunk_points);
+        // The same cloud again, slightly turned and shifted: a second scan of
+        // the same place.
+        p.import_file(
+            &dir.path().join("cloud.las"),
+            ImportOptions {
+                chunk_points,
+                lod_points: 16,
+                ..Default::default()
+            },
+            &JobControl::default(),
+        )
+        .unwrap();
+        let scans = ids(&p);
+        assert_eq!(scans.len(), 2);
+        let centre = DVec3::new(500005., 4000001., 0.);
+        let pose = Pose::from_matrix(
+            DMat4::from_translation(centre + DVec3::new(0.013, -0.021, 0.004))
+                * DMat4::from_quat(DQuat::from_rotation_z(0.01))
+                * DMat4::from_translation(-centre),
+        );
+        p.set_transform(scans[1], pose).unwrap();
+        let world_points = |p: &Project| -> Vec<[f64; 3]> {
+            let mut out = vec![];
+            for scan in p.scans() {
+                let world = p.world_matrix(scan);
+                for chunk in 0..scan.chunks.len() {
+                    for s in p.points(scan, chunk as u32).unwrap() {
+                        out.push(world.transform_point3(DVec3::from(s.position)).to_array());
+                    }
+                }
+            }
+            out
+        };
+        let before = world_points(&p);
+        p.subsample_merged(size, &scans, &JobControl::default())
+            .unwrap();
+        let after = world_points(&p);
+        let centre_distance = |q: [f64; 3]| {
+            let v = voxel(q, size);
+            (0..3)
+                .map(|k| (q[k] - (v[k] as f64 + 0.5) * size).powi(2))
+                .sum::<f64>()
+        };
+        let mut nearest: BTreeMap<[i64; 3], f64> = BTreeMap::new();
+        for q in &before {
+            let d = centre_distance(*q);
+            nearest
+                .entry(voxel(*q, size))
+                .and_modify(|best| *best = best.min(d))
+                .or_insert(d);
+        }
+        let kept: BTreeSet<_> = after.iter().map(|q| voxel(*q, size)).collect();
+        assert_eq!(kept.len(), after.len(), "a voxel kept two points");
+        assert_eq!(kept.len(), nearest.len(), "a voxel lost all points");
+        for q in &after {
+            assert_eq!(centre_distance(*q), nearest[&voxel(*q, size)]);
+        }
+        // Fewer than per-scan subsampling would keep: the overlap counts once.
+        assert!(after.len() < before.len() / 2);
+        assert_eq!(
+            p.manifest.layers.last().unwrap().kind,
+            LayerKind::Subsample { size, merged: true }
+        );
+        results.push(sorted_bits(&after));
+    }
+    assert_eq!(results[0], results[1]);
 }

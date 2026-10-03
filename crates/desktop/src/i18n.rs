@@ -162,7 +162,9 @@ pub struct Strings {
     pub layers: &'static str,
     pub no_layers: &'static str,
     pub exclusion_layer: fn(points: &str) -> String,
-    pub subsample_layer: fn(size: &str, points: &str) -> String,
+    pub subsample_layer: fn(size: &str, merged: bool, points: &str) -> String,
+    pub subsample_merged: &'static str,
+    pub subsample_merged_hint: &'static str,
     pub noise_layer: fn(radius: &str, neighbours: u32, points: &str) -> String,
 
     // Revisions.
@@ -422,7 +424,12 @@ pub static JA: Strings = Strings {
     layers: "除外レイヤー",
     no_layers: "除外レイヤーはありません。",
     exclusion_layer: |points| format!("除外（{points} 点）"),
-    subsample_layer: |size, points| format!("間引き {size} m（{points} 点）"),
+    subsample_layer: |size, merged, points| {
+        let how = if merged { "まとめて" } else { "" };
+        format!("間引き {size} m{how}（{points} 点）")
+    },
+    subsample_merged: "表示中のスキャンをまとめて間引く",
+    subsample_merged_hint: "共通座標の1つのグリッドで間引き、スキャンの重なる部分でも1ボクセルに1点だけ残します。位置合わせの後、書き出す前に使います。",
     noise_layer: |radius, neighbours, points| {
         format!("ノイズ除去 {radius} m・{neighbours} 点未満（{points} 点）")
     },

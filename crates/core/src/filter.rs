@@ -7,7 +7,7 @@ use crate::edit::{LayerWriter, is_excluded};
 use crate::storage::{position, valid};
 use crate::{Bounds, CropBox, JobControl, LayerKind, Project, Scan, Stage};
 use anyhow::{Result, ensure};
-use glam::DVec3;
+use glam::{DMat4, DVec3};
 use std::{
     collections::HashMap,
     sync::{
@@ -36,6 +36,7 @@ struct ChunkCache<'a> {
     project: &'a Project,
     scan: &'a Scan,
     state: Mutex<CacheState>,
+    limit: usize,
 }
 #[derive(Default)]
 struct CacheState {
@@ -45,10 +46,14 @@ struct CacheState {
 }
 impl<'a> ChunkCache<'a> {
     fn new(project: &'a Project, scan: &'a Scan) -> Self {
+        Self::with_limit(project, scan, CACHE_BYTES)
+    }
+    fn with_limit(project: &'a Project, scan: &'a Scan, limit: usize) -> Self {
         Self {
             project,
             scan,
             state: Mutex::default(),
+            limit,
         }
     }
     fn get(&self, chunk: u32, job: &JobControl) -> Result<Arc<ChunkPoints>> {
@@ -80,7 +85,7 @@ impl<'a> ChunkCache<'a> {
         let points = Arc::new(points);
         let bytes = points.bytes();
         let mut state = self.state.lock().unwrap();
-        while state.bytes + bytes > CACHE_BYTES {
+        while state.bytes + bytes > self.limit {
             let Some(oldest) = state
                 .entries
                 .iter()
@@ -309,6 +314,76 @@ fn subsample_chunk(
     Ok((mask, count))
 }
 
+/// Merged voxel subsampling of chunk `chunk` of scan `si`, in the project
+/// frame; see `Project::subsample_merged`.
+fn merged_subsample_chunk(
+    caches: &[ChunkCache],
+    worlds: &[DMat4],
+    boxes: &[Vec<(DVec3, DVec3)>],
+    si: usize,
+    chunk: u32,
+    size: f64,
+    job: &JobControl,
+) -> Result<ChunkResult> {
+    type Score = (f64, u32, u32, u32);
+    let own = caches[si].get(chunk, job)?;
+    let (lo, hi) = boxes[si][chunk as usize];
+    let lo = (lo / size).floor() * size;
+    let hi = ((hi / size).floor() + 1.) * size;
+    let rank = |p: DVec3, scan: usize, chunk: u32, index: u32| -> ([i64; 3], Score) {
+        let key = cell(p, size);
+        let centre = (DVec3::from(key.map(|v| v as f64)) + 0.5) * size;
+        (key, (p.distance_squared(centre), scan as u32, chunk, index))
+    };
+    let better = |a: &Score, b: &Score| {
+        a.0.total_cmp(&b.0)
+            .then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
+            .is_lt()
+    };
+    let world = |scan: usize, p: &DVec3| worlds[scan].transform_point3(*p);
+    let mut best: HashMap<[i64; 3], Score> = HashMap::new();
+    for (p, index) in own.positions.iter().zip(&own.indices) {
+        let (key, score) = rank(world(si, p), si, chunk, *index);
+        let entry = best.entry(key).or_insert(score);
+        if better(&score, entry) {
+            *entry = score;
+        }
+    }
+    for (sj, cache) in caches.iter().enumerate() {
+        for (cj, (a, b)) in boxes[sj].iter().enumerate() {
+            let cj = cj as u32;
+            if (sj, cj) == (si, chunk) || a.cmpgt(hi).any() || b.cmplt(lo).any() {
+                continue;
+            }
+            let points = cache.get(cj, job)?;
+            for (p, index) in points.positions.iter().zip(&points.indices) {
+                let p = world(sj, p);
+                if !(p.cmpge(lo).all() && p.cmple(hi).all()) {
+                    continue;
+                }
+                let (key, score) = rank(p, sj, cj, *index);
+                if let Some(entry) = best.get_mut(&key)
+                    && better(&score, entry)
+                {
+                    *entry = score;
+                }
+            }
+        }
+    }
+    let count_bits = caches[si].scan.chunks[chunk as usize].count as usize;
+    let mut mask = vec![0u8; count_bits.div_ceil(8)];
+    let mut count = 0;
+    for (p, index) in own.positions.iter().zip(&own.indices) {
+        let (key, _) = rank(world(si, p), si, chunk, *index);
+        let (_, s, c, i) = best[&key];
+        if (s as usize, c, i) != (si, chunk, *index) {
+            mask[*index as usize / 8] |= 1 << (index % 8);
+            count += 1;
+        }
+    }
+    Ok((mask, count))
+}
+
 /// Isolated point removal for one chunk: a point with fewer than
 /// `min_neighbours` other points within `radius` is excluded.
 fn noise_chunk(
@@ -376,10 +451,70 @@ impl Project {
         self.filter(
             scan_ids,
             Stage::Subsampling,
-            LayerKind::Subsample { size },
+            LayerKind::Subsample {
+                size,
+                merged: false,
+            },
             serde_json::json!({"kind": "subsample", "size": size, "scans": scan_ids}),
             job,
             |cache, chunk, job| subsample_chunk(cache, chunk, size, job),
+        )
+    }
+    /// Keeps one original point per voxel of `size` metres over all of
+    /// `scan_ids` together, on one grid in the project frame, so where scans
+    /// overlap only one point of all of them remains in each voxel. Like the
+    /// per-scan version, the point nearest the voxel centre wins (ties by scan
+    /// order, chunk and index), and every chunk of every scan reaching into a
+    /// chunk's voxels takes part.
+    pub fn subsample_merged(
+        &mut self,
+        size: f64,
+        scan_ids: &[Uuid],
+        job: &JobControl,
+    ) -> Result<u64> {
+        ensure!(size.is_finite() && size > 0., "Invalid voxel size");
+        let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
+        let limit = (CACHE_BYTES / scans.len().max(1)).max(32 * 1024 * 1024);
+        let caches: Vec<_> = scans
+            .iter()
+            .map(|s| ChunkCache::with_limit(self, s, limit))
+            .collect();
+        let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
+        // Each chunk's box in the project frame.
+        let boxes: Vec<Vec<(DVec3, DVec3)>> = scans
+            .iter()
+            .zip(&worlds)
+            .map(|(scan, world)| {
+                scan.chunks
+                    .iter()
+                    .map(|c| {
+                        c.bounds.corners().fold(
+                            (DVec3::INFINITY, DVec3::NEG_INFINITY),
+                            |(lo, hi), p| {
+                                let p = world.transform_point3(p);
+                                (lo.min(p), hi.max(p))
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        let progress = Progress::new(Stage::Subsampling, &scans, 1);
+        let mut layer = LayerWriter::new(self)?;
+        for (si, scan) in scans.iter().enumerate() {
+            let masks = each_chunk(&caches[si], job, &progress, &|_, chunk, job| {
+                merged_subsample_chunk(&caches, &worlds, &boxes, si, chunk, size, job)
+            })?;
+            for (chunk, (mask, count)) in masks.into_iter().enumerate() {
+                layer.push(scan.id, chunk as u32, &mask, count)?;
+            }
+        }
+        job.check()?;
+        layer.finish(
+            self,
+            LayerKind::Subsample { size, merged: true },
+            serde_json::json!({"kind": "subsample", "size": size, "merged": true,
+                "scans": scan_ids}),
         )
     }
     /// Excludes points of `scan_ids` with fewer than `min_neighbours` other
