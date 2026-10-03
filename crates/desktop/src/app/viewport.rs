@@ -47,9 +47,11 @@ impl Workbench {
             if self.job.is_none() {
                 self.selection_input(&response);
                 self.measure_input(&response);
+                self.align_input(&response);
             }
             self.draw_selection(ui, &response);
             self.draw_measure(ui, response.rect);
+            self.draw_align(ui, response.rect);
             self.draw_pivot(ui, &response);
         });
     }

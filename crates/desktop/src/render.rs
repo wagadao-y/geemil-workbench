@@ -28,6 +28,7 @@ struct Uniform {
     viewport: [f32; 2],
     size: f32,
     padding: f32,
+    tint: [f32; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -57,6 +58,8 @@ struct Targets {
 pub struct Segment {
     pub range: Range<u32>,
     pub motion: DMat4,
+    /// sRGB colour (0..1) mixed into the points, by the fourth component.
+    pub tint: [f32; 4],
 }
 pub struct PointRenderer {
     device: wgpu::Device,
@@ -256,6 +259,7 @@ impl PointRenderer {
         let all = [Segment {
             range: 0..self.count,
             motion: DMat4::IDENTITY,
+            tint: [0.; 4],
         }];
         let segments: Vec<_> = segments
             .unwrap_or(&all)
@@ -291,6 +295,7 @@ impl PointRenderer {
                 viewport: [size[0] as f32, size[1] as f32],
                 size: point_size,
                 padding: 0.,
+                tint: segment.tint,
             };
             slot[..UNIFORM_SIZE as usize].copy_from_slice(bytemuck::bytes_of(&uniform));
         }

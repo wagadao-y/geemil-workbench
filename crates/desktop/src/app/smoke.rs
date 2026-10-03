@@ -28,7 +28,9 @@ pub struct SmokeOptions {
     /// remove (take out the first scan), measure (measure two picked points),
     /// preview (edit the first scan's transform without applying it),
     /// apply-transform (apply the edited transform), subsample (5 cm voxels),
-    /// noise (0.1 m radius, 4 neighbours).
+    /// noise (0.1 m radius, 4 neighbours), align-icp (ICP of the first scan
+    /// against the others, previewed), align-pairs (fit four coinciding pairs),
+    /// align-apply (apply the previewed result).
     pub script: Vec<String>,
 }
 
@@ -326,6 +328,15 @@ impl Workbench {
                     min_neighbours: 4,
                 },
             ),
+            "align-icp" => self.smoke_icp(ctx),
+            "align-pairs" => {
+                self.smoke_pairs();
+                eprintln!("Smoke align: {}", self.align_summary());
+            }
+            "align-apply" => {
+                eprintln!("Smoke align: {}", self.align_summary());
+                self.align_apply();
+            }
             "apply-transform" => {
                 if let Some((id, pose)) = self.transform_preview() {
                     self.apply_edit(|p| p.set_transform(id, pose));

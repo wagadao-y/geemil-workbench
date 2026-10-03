@@ -1,6 +1,7 @@
 //! Application state and frame orchestration. Panels, jobs, view loading and
 //! smoke tests live in submodules as further `impl Workbench` blocks.
 mod actions;
+mod align;
 mod dialogs;
 mod jobs;
 mod measure;
@@ -48,6 +49,8 @@ pub(super) struct Settings {
     subsample_size: f64,
     noise_radius: f64,
     noise_neighbours: u32,
+    icp_distance: f64,
+    icp_samples: usize,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -61,6 +64,8 @@ impl Default for Settings {
             subsample_size: 0.01,
             noise_radius: 0.05,
             noise_neighbours: 4,
+            icp_distance: 0.5,
+            icp_samples: 60_000,
         }
     }
 }
@@ -100,6 +105,7 @@ pub struct Workbench {
 
     selection: selection::SelectionState,
     measure: measure::Measure,
+    align: align::Align,
     transform_edit: tree::TransformEdit,
     undo: undo::UndoStack,
     dialog: Option<dialogs::Dialog>,
@@ -154,6 +160,7 @@ impl Workbench {
             flight: None,
             selection: Default::default(),
             measure: Default::default(),
+            align: Default::default(),
             transform_edit: Default::default(),
             undo: Default::default(),
             dialog: None,
@@ -260,6 +267,7 @@ impl eframe::App for Workbench {
         self.smoke_frame(&ctx);
         self.poll_job();
         self.poll_view();
+        self.align_update();
         if self.dialog.is_none() {
             self.keyboard(&ctx);
         }
@@ -269,6 +277,7 @@ impl eframe::App for Workbench {
         self.tool_options(ui);
         self.status_bar(ui);
         self.side_panel(ui);
+        self.align_panel(ui);
         if self.project.is_some() || self.smoke.colors {
             self.viewport(ui, frame);
         } else {

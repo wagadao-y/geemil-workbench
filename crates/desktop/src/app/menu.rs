@@ -89,7 +89,7 @@ impl Workbench {
                     );
                 });
                 ui.menu_button(t.menu_tools, |ui| {
-                    for tool in [Tool::Navigate, Tool::Rect, Tool::Polygon, Tool::Measure] {
+                    for tool in super::selection::TOOLS {
                         self.menu_item(ui, Action::Tool(tool), &mut chosen);
                     }
                     ui.separator();
@@ -152,7 +152,7 @@ impl Workbench {
                 self.tool_button(ui, Action::Undo, false, &mut chosen);
                 self.tool_button(ui, Action::Redo, false, &mut chosen);
                 ui.separator();
-                for tool in [Tool::Navigate, Tool::Rect, Tool::Polygon, Tool::Measure] {
+                for tool in super::selection::TOOLS {
                     let selected = self.selection.tool == tool;
                     self.tool_button(ui, Action::Tool(tool), selected, &mut chosen);
                 }
@@ -206,6 +206,9 @@ impl Workbench {
                 }
                 Tool::Rect | Tool::Polygon => {
                     self.selection_options(ui, &ctx);
+                }
+                Tool::Align => {
+                    ui.weak(t.hint_align);
                 }
                 Tool::Measure => {
                     match self.measure.distance() {

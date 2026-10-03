@@ -1,4 +1,4 @@
-struct Camera { matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, padding: f32 };
+struct Camera { matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, padding: f32, tint: vec4<f32> };
 @group(0) @binding(0) var<uniform> camera: Camera;
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -11,7 +11,9 @@ struct Out {
     var out: Out;
     out.position = camera.matrix * vec4(position,1.0);
     out.position = vec4(out.position.xy + corners[id] * camera.size / camera.viewport * out.position.w, out.position.zw);
-    out.corner = corners[id]; out.color = color;
+    out.corner = corners[id];
+    // Mix the tint in sRGB, like the colours it replaces.
+    out.color = vec4(mix(color.rgb, camera.tint.rgb, camera.tint.a), color.a);
     // View-space distance along the camera axis; screen-aligned splats keep it constant.
     out.depth = out.position.w;
     return out;

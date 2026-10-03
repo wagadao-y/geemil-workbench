@@ -15,14 +15,12 @@ pub(super) struct Flight {
 }
 
 impl Workbench {
-    /// Orbit (left, outside selection mode), pan (right), zoom (wheel)
+    /// Orbit (left, in tools that pick by clicking), pan (right), zoom (wheel)
     /// and double-click picking. Any camera change drops the selection, which is
     /// tied to the camera it was drawn with.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
         let mut moved = false;
-        if self.selection.tool == Tool::Navigate
-            && response.dragged_by(egui::PointerButton::Primary)
-        {
+        if self.selection.tool.orbits() && response.dragged_by(egui::PointerButton::Primary) {
             let delta = ctx.input(|i| i.pointer.delta());
             self.camera.yaw -= delta.x as f64 * 0.007;
             self.camera.pitch =
@@ -93,8 +91,8 @@ impl Workbench {
     }
     /// Marks the orbit centre, which is always the viewport centre, while it matters.
     pub(super) fn draw_pivot(&self, ui: &egui::Ui, response: &egui::Response) {
-        let orbiting = self.selection.tool == Tool::Navigate
-            && response.dragged_by(egui::PointerButton::Primary);
+        let orbiting =
+            self.selection.tool.orbits() && response.dragged_by(egui::PointerButton::Primary);
         if !(orbiting || self.flight.is_some()) {
             return;
         }

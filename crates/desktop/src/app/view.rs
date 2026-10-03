@@ -189,7 +189,7 @@ impl Workbench {
     /// Where to draw each loaded scan now: transforms applied since the load,
     /// a transform being previewed and visibility take effect before the next
     /// load arrives. `None` draws the points as loaded.
-    pub(super) fn draw_segments(&self) -> Option<Vec<Segment>> {
+    pub(super) fn shown_segments(&self) -> Option<Vec<Shown>> {
         let project = self.project.as_ref()?;
         if self.points_segments.is_empty() {
             return None;
@@ -205,12 +205,38 @@ impl Workbench {
                         Some((item, pose)) => project.world_matrix_with(scan, item, pose),
                         None => project.world_matrix(scan),
                     };
-                    Some(Segment {
-                        range: s.range.start as u32..s.range.end as u32,
-                        motion: world * s.world.inverse(),
+                    let loaded_to_local = s.world.inverse();
+                    Some(Shown {
+                        scan: s.scan,
+                        range: s.range.clone(),
+                        motion: world * loaded_to_local,
+                        loaded_to_local,
                     })
                 })
                 .collect(),
         )
     }
+    pub(super) fn draw_segments(&self) -> Option<Vec<Segment>> {
+        let shown = self.shown_segments()?;
+        Some(
+            shown
+                .into_iter()
+                .map(|s| Segment {
+                    range: s.range.start as u32..s.range.end as u32,
+                    motion: s.motion,
+                    tint: self.align_tint(s.scan),
+                })
+                .collect(),
+        )
+    }
+}
+
+/// A range of the displayed points that belongs to one scan.
+pub(super) struct Shown {
+    pub(super) scan: Uuid,
+    pub(super) range: std::ops::Range<usize>,
+    /// From the loaded positions to where they are drawn now.
+    pub(super) motion: glam::DMat4,
+    /// From the loaded positions to scan coordinates.
+    pub(super) loaded_to_local: glam::DMat4,
 }
