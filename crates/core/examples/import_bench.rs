@@ -90,18 +90,18 @@ fn main() -> Result<()> {
             for i in 0..actual.nodes.len() {
                 ensure!(
                     actual.nodes[i].children == expected.nodes[i].children
-                        && actual.nodes[i].chunk == expected.nodes[i].chunk,
+                        && actual.nodes[i].chunks == expected.nodes[i].chunks,
                     "Node {i} structure differs"
                 );
                 ensure!(
-                    project.read_lod(actual, i as u32)?
-                        == reference.read_lod(expected, i as u32)?,
-                    "Node {i} LOD differs"
+                    project.read_view(actual, i as u32)?
+                        == reference.read_view(expected, i as u32)?,
+                    "Node {i} display points differ"
                 );
             }
         }
         println!(
-            "All original chunks, point references, tree topology and LOD samples match the reference."
+            "All original chunks, point references, display octree and its points match the reference."
         );
     }
     Ok(())

@@ -85,7 +85,6 @@ impl Workbench {
             undo_before,
         });
         self.view.invalidate();
-        self.view.next_generation();
         self.progress = 0.;
         self.error = None;
         self.status = self.t.status_working.into();

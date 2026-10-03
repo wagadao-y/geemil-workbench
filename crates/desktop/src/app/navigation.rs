@@ -1,7 +1,7 @@
 //! Camera input: orbit, pan, zoom, and double-click to orbit around a point.
 use super::{Workbench, actions::MAX_PITCH, selection::Tool};
 use eframe::egui;
-use geemil_core::{Camera, Sample};
+use geemil_core::Camera;
 use glam::DVec3;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,10 @@ impl Workbench {
     /// tied to the camera it was drawn with.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
         let mut moved = false;
-        if self.selection.tool.orbits() && response.dragged_by(egui::PointerButton::Primary) {
+        if self.selection.tool.orbits()
+            && !self.gizmo.dragging()
+            && response.dragged_by(egui::PointerButton::Primary)
+        {
             let delta = ctx.input(|i| i.pointer.delta());
             self.camera.yaw -= delta.x as f64 * 0.007;
             self.camera.pitch =
@@ -63,7 +66,8 @@ impl Workbench {
             let viewport = [rect.width() as f64, rect.height() as f64];
             // Splat radius in logical pixels, like `viewport`.
             let radius = self.settings.point_size as f64 / 2.;
-            if let Some(target) = pick(&self.points, &self.camera, click, viewport, radius) {
+            let points = self.shown_points(true).map(|(.., p)| p);
+            if let Some(target) = pick(points, &self.camera, click, viewport, radius) {
                 self.flight = Some(Flight {
                     from: self.camera,
                     to: target,
@@ -91,8 +95,9 @@ impl Workbench {
     }
     /// Marks the orbit centre, which is always the viewport centre, while it matters.
     pub(super) fn draw_pivot(&self, ui: &egui::Ui, response: &egui::Response) {
-        let orbiting =
-            self.selection.tool.orbits() && response.dragged_by(egui::PointerButton::Primary);
+        let orbiting = self.selection.tool.orbits()
+            && !self.gizmo.dragging()
+            && response.dragged_by(egui::PointerButton::Primary);
         if !(orbiting || self.flight.is_some()) {
             return;
         }
@@ -108,7 +113,7 @@ impl Workbench {
 /// screen within a few extra pixels. `viewport` and `radius` are in the same
 /// pixel units.
 pub(super) fn pick(
-    points: &[Sample],
+    points: impl IntoIterator<Item = DVec3>,
     camera: &Camera,
     click: [f64; 2],
     viewport: [f64; 2],
@@ -118,8 +123,7 @@ pub(super) fn pick(
     let projector = camera.projector();
     let mut covering: Option<(f64, DVec3)> = None;
     let mut closest: Option<(f64, DVec3)> = None;
-    for sample in points {
-        let position = DVec3::from(sample.position);
+    for position in points {
         let Some((uv, depth)) = projector.project(position) else {
             continue;
         };
@@ -165,17 +169,17 @@ mod tests {
         let behind = sample([0., 5., 0.]);
         let front = sample([0., -5., 0.]);
         let aside = sample([3., 0., 0.]);
-        let points = [behind, front, aside.clone()];
+        let points = [behind, front, aside.clone()].map(|s| DVec3::from(s.position));
         let viewport = [1000., 1000.];
         assert_eq!(
-            pick(&points, &camera, [0.5, 0.5], viewport, 2.),
+            pick(points, &camera, [0.5, 0.5], viewport, 2.),
             Some(DVec3::new(0., -5., 0.))
         );
         // Nothing covers an empty spot, but a point a few pixels away is taken.
         let (uv, _) = camera.project(DVec3::new(3., 0., 0.)).unwrap();
         assert_eq!(
             pick(
-                std::slice::from_ref(&aside),
+                [DVec3::from(aside.position)],
                 &camera,
                 [uv[0] + 0.005, uv[1]],
                 viewport,
@@ -183,6 +187,7 @@ mod tests {
             ),
             Some(DVec3::new(3., 0., 0.))
         );
-        assert_eq!(pick(&[aside], &camera, [0.1, 0.1], viewport, 2.), None);
+        let aside = [DVec3::from(aside.position)];
+        assert_eq!(pick(aside, &camera, [0.1, 0.1], viewport, 2.), None);
     }
 }

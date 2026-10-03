@@ -46,7 +46,8 @@ fn portable_e57_roundtrip_preserves_structure_images_and_independent_poses() {
             &source,
             ImportOptions {
                 chunk_points: 256,
-                lod_points: 32,
+                view_grid: 4,
+                view_leaf_points: 32,
                 ..Default::default()
             },
             &JobControl::default(),
@@ -136,7 +137,8 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
             &source,
             ImportOptions {
                 chunk_points: 128,
-                lod_points: 2,
+                view_grid: 4,
+                view_leaf_points: 32,
                 ..Default::default()
             },
             &JobControl::default(),
@@ -343,7 +345,7 @@ fn spherical_scaled_integer_and_invalid_records_survive_roundtrip() {
     let scan = p.scans().next().unwrap();
     assert_eq!(scan.records, 2);
     assert_eq!(scan.valid_points, 1);
-    let samples = p.read_lod(scan, 0).unwrap();
+    let samples = p.read_view(scan, 0).unwrap();
     assert_eq!(samples.len(), 1);
     assert!((samples[0].position[0] - 1.234 * 0.5f64.cos() * (0.2f32 as f64).cos()).abs() < 1e-12);
     let output = dir.path().join("out.e57");
@@ -390,7 +392,8 @@ fn las_file_is_one_scan_and_laz_is_readable() {
             &source,
             ImportOptions {
                 chunk_points: 16,
-                lod_points: 4,
+                view_grid: 4,
+                view_leaf_points: 32,
                 ..Default::default()
             },
             &JobControl::default(),
@@ -399,7 +402,7 @@ fn las_file_is_one_scan_and_laz_is_readable() {
         assert_eq!(p.scans().count(), 1);
         assert_eq!(p.scans().next().unwrap().records, 100);
         let scan = p.scans().next().unwrap();
-        let view = p.read_lod(scan, 0).unwrap();
+        let view = p.read_view(scan, 0).unwrap();
         assert!(
             view.iter()
                 .all(|p| p.position[0] >= 500000. && p.color[0] == 255)
@@ -463,7 +466,8 @@ fn cropping_excludes_everything_outside_the_polygon_at_any_depth() {
     let mut project = Project::create(&dir.path().join("p"), "Test").unwrap();
     let options = ImportOptions {
         chunk_points: 128,
-        lod_points: 2,
+        view_grid: 4,
+        view_leaf_points: 32,
         ..Default::default()
     };
     let job = JobControl::default();
@@ -582,7 +586,8 @@ fn preview_of_displayed_points_matches_the_committed_exclusion() {
         let mut project = Project::create(&dir.path().join(i.to_string()), "Test").unwrap();
         let options = ImportOptions {
             chunk_points: 256,
-            lod_points: 16,
+            view_grid: 4,
+            view_leaf_points: 32,
             ..Default::default()
         };
         project.import_file(&source, options, &job).unwrap();
@@ -658,7 +663,8 @@ fn unlimited_inside_exclusion_is_the_complement_of_cropping() {
     let job = JobControl::default();
     let options = ImportOptions {
         chunk_points: 128,
-        lod_points: 2,
+        view_grid: 4,
+        view_leaf_points: 32,
         ..Default::default()
     };
     let mut counts = vec![];

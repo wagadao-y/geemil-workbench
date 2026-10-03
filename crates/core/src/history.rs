@@ -225,7 +225,7 @@ impl Project {
 
         let mut referenced = BTreeSet::new();
         for s in &self.manifest.scans {
-            referenced.extend([&s.template, &s.points_file, &s.lod_file].map(|p| p.clone()));
+            referenced.extend([&s.template, &s.points_file, &s.view_file].map(|p| p.clone()));
             referenced.insert(crate::model::scan_metadata_path(s));
         }
         for p in &self.manifest.patches {
@@ -260,7 +260,7 @@ impl Project {
                 let file = file?;
                 let file_name = file.file_name().to_string_lossy().into_owned();
                 let unused = !referenced.contains(&format!("{prefix}{file_name}"));
-                let scan_asset = [".points", ".lod", ".scan.json"]
+                let scan_asset = [".points", ".view", ".scan.json"]
                     .iter()
                     .any(|ext| file_name.ends_with(ext));
                 if unused && scan_asset {

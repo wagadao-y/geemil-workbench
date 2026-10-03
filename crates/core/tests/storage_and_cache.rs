@@ -4,6 +4,19 @@ use geemil_core::{
 };
 use std::sync::{Arc, atomic::Ordering};
 
+trait Points {
+    /// All loaded points, in scan coordinates.
+    fn points(&self) -> Vec<geemil_core::Sample>;
+}
+impl Points for geemil_core::LoadedView {
+    fn points(&self) -> Vec<geemil_core::Sample> {
+        self.nodes
+            .iter()
+            .flat_map(|n| n.samples.iter().cloned())
+            .collect()
+    }
+}
+
 fn fixture(root: &std::path::Path) -> Project {
     let input = root.join("demo.e57");
     interchange::create_demo(&input).unwrap();
@@ -36,8 +49,8 @@ fn assert_same_storage(left: &Project, right: &Project) {
         }
         for i in 0..left_scan.nodes.len() {
             assert_eq!(
-                left.read_lod(left_scan, i as u32).unwrap(),
-                right.read_lod(right_scan, i as u32).unwrap()
+                left.read_view(left_scan, i as u32).unwrap(),
+                right.read_view(right_scan, i as u32).unwrap()
             );
         }
     }
@@ -50,7 +63,8 @@ fn parallel_import_matches_one_worker_and_cancel_during_indexing_is_not_publishe
     interchange::create_demo(&input).unwrap();
     let options = ImportOptions {
         chunk_points: 1024,
-        lod_points: 32,
+        view_grid: 4,
+        view_leaf_points: 32,
         worker_memory_bytes: 1024 * 1024,
         worker_threads: 1,
     };
@@ -109,7 +123,8 @@ fn parallel_import_handles_coincident_points_with_more_than_eight_children() {
     drop(writer);
     let options = ImportOptions {
         chunk_points: 256,
-        lod_points: 16,
+        view_grid: 4,
+        view_leaf_points: 32,
         worker_threads: 1,
         worker_memory_bytes: 1024 * 1024,
     };
@@ -145,12 +160,12 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
     let a = p
         .load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
         .unwrap()
-        .samples;
+        .points();
     let misses = cache.stats().misses;
     let b = p
         .load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
         .unwrap()
-        .samples;
+        .points();
     assert_eq!(a, b);
     assert_eq!(cache.stats().misses, misses);
     assert!(cache.stats().hits > 0);
@@ -166,21 +181,11 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
     let moved = p
         .load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
         .unwrap();
-    // Samples are cached in scan coordinates, so moving a scan reads nothing.
+    // Nodes are in scan coordinates, so moving a scan reads nothing and the
+    // same points come back; the renderer places them with the new matrix.
     assert_eq!(cache.stats().misses, misses);
-    assert_eq!(moved.segments.len(), 1);
-    assert_eq!(moved.segments[0].scan, id);
-    assert_eq!(moved.segments[0].range, 0..moved.samples.len());
-    assert!(
-        moved.segments[0]
-            .world
-            .abs_diff_eq(p.world_matrix(&scan), 1e-12)
-    );
-    let moved = moved.samples;
-    assert_eq!(a.len(), moved.len());
-    for (a, b) in a.iter().zip(moved) {
-        assert!((a.position[0] + 0.25 - b.position[0]).abs() < 1e-12);
-    }
+    assert!(moved.nodes.iter().all(|n| n.scan == id));
+    assert_eq!(a, moved.points());
     let target = p.layer_named("Deleted");
     p.move_selection(
         &Selection {
@@ -197,7 +202,7 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
     assert!(
         p.load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
             .unwrap()
-            .samples
+            .points()
             .is_empty()
     );
     p.switch(base).unwrap();
@@ -205,14 +210,66 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
         a,
         p.load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut cache)
             .unwrap()
-            .samples
+            .points()
     );
     let mut small = ViewCache::new(128);
     assert_eq!(
         a,
         p.load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut small)
             .unwrap()
-            .samples
+            .points()
     );
     assert!(small.stats().resident_bytes <= 128);
+}
+
+/// The display octree is additive like Potree 2's: every valid original point
+/// is in exactly one node, with its own position and colour, and the per-chunk
+/// counts of each node match its points. Nodes refine: deeper nodes are
+/// smaller, and the tree goes below the chunks.
+#[test]
+fn display_octree_holds_every_valid_point_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("demo.e57");
+    interchange::create_demo(&input).unwrap();
+    let mut p = Project::create(&dir.path().join("p"), "Test").unwrap();
+    let options = ImportOptions {
+        chunk_points: 4096,
+        view_grid: 8,
+        view_leaf_points: 256,
+        ..Default::default()
+    };
+    p.import_file(&input, options, &JobControl::default())
+        .unwrap();
+    for scan in p.scans() {
+        let mut seen = std::collections::HashSet::new();
+        for (i, node) in scan.nodes.iter().enumerate() {
+            let samples = p.read_view(scan, i as u32).unwrap();
+            assert_eq!(samples.len(), node.count as usize);
+            let mut counts = std::collections::BTreeMap::new();
+            for s in &samples {
+                assert!(seen.insert((s.chunk, s.index)), "point in two nodes");
+                *counts.entry(s.chunk).or_insert(0u32) += 1;
+                for axis in 0..3 {
+                    assert!(s.position[axis] >= node.bounds.min[axis]);
+                    assert!(s.position[axis] <= node.bounds.max[axis]);
+                }
+            }
+            assert_eq!(counts.into_iter().collect::<Vec<_>>(), node.chunks);
+            for &c in &node.children {
+                assert!(scan.nodes[c as usize].bounds.radius() <= node.bounds.radius() + 1e-9);
+            }
+        }
+        let mut valid = 0;
+        for chunk in 0..scan.chunks.len() as u32 {
+            for s in p.points(scan, chunk).unwrap() {
+                valid += 1;
+                assert!(seen.contains(&(s.chunk, s.index)), "point missing");
+            }
+        }
+        assert_eq!(seen.len(), valid);
+        assert_eq!(valid as u64, scan.valid_points);
+        // Below the chunks: more nodes than chunks, and the root is sparse.
+        assert!(scan.nodes.len() > scan.chunks.len());
+        assert!((scan.nodes[0].count as u64) < scan.valid_points / 4);
+    }
 }

@@ -80,6 +80,11 @@ impl Project {
     pub fn correction(&self, id: Uuid) -> DMat4 {
         correction(self.current(), id)
     }
+    /// [`Project::correction`] as it would be with `pose` as the own transform
+    /// of `item`, for previewing an edit before applying it.
+    pub fn correction_with(&self, id: Uuid, item: Uuid, pose: Pose) -> DMat4 {
+        correction_with(self.current(), id, Some((item, pose)))
+    }
     /// [`Project::world_matrix`] as it would be with `pose` as the own transform
     /// of `item` (a scan or folder), for previewing an edit before applying it.
     pub fn world_matrix_with(&self, scan: &Scan, item: Uuid, pose: Pose) -> DMat4 {

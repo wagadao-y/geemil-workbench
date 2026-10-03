@@ -3,7 +3,6 @@
 use super::Workbench;
 use eframe::egui;
 use geemil_core::{Camera, Sample, SelectionMode};
-use glam::DVec3;
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -13,6 +12,8 @@ use std::{
 pub struct SmokeOptions {
     /// Save a screenshot here and close the window.
     pub screenshot: Option<PathBuf>,
+    /// The point budget instead of the default.
+    pub budget: Option<usize>,
     /// Orbit for the first two seconds; at least one view must load while moving.
     pub orbit: bool,
     /// Replace the view with fixed colour probes and check them in the capture.
@@ -35,7 +36,8 @@ pub struct SmokeOptions {
     /// align-apply (apply the previewed result), ortho (parallel projection,
     /// top view), box (a 2 m slice at the median height, display clipped),
     /// box-crop (move everything outside that box to the "deleted" layer),
-    /// show-layers (show every layer), restore (move every point of the newest
+    /// transform and transform-folder (the move and rotate tool on the first
+    /// scan or folder), show-layers (show every layer), restore (move every point of the newest
     /// layer back to the default one), color-height and color-scan (colour modes).
     pub script: Vec<String>,
 }
@@ -43,6 +45,7 @@ pub struct SmokeOptions {
 pub(super) struct SmokeTest {
     screenshot: Option<PathBuf>,
     orbit: bool,
+    budget: Option<usize>,
     pub(super) colors: bool,
     select: Option<(SelectionMode, bool)>,
     dialog: Option<String>,
@@ -58,6 +61,7 @@ impl SmokeTest {
         Self {
             screenshot: options.screenshot,
             orbit: options.orbit,
+            budget: options.budget,
             colors: options.colors,
             select: options.select,
             dialog: options.dialog,
@@ -83,6 +87,9 @@ impl SmokeTest {
 impl Workbench {
     /// Call once after construction, when the project camera is final.
     pub(super) fn smoke_setup(&mut self) {
+        if let Some(budget) = self.smoke.budget {
+            self.settings.point_budget = budget;
+        }
         if self.smoke.colors {
             // End-to-end display fixture, including point shader, sRGB attachment,
             // egui composition and the native window's captured output.
@@ -106,7 +113,7 @@ impl Workbench {
                 distance: 5.,
                 ..Camera::default()
             };
-            self.points = colors
+            let samples: Vec<_> = colors
                 .into_iter()
                 .enumerate()
                 .map(|(i, color)| Sample {
@@ -116,8 +123,11 @@ impl Workbench {
                     color,
                 })
                 .collect();
-            self.points_segments.clear();
-            self.points_origin = [0.; 3];
+            self.nodes = vec![geemil_core::LoadedNode {
+                scan: uuid::Uuid::nil(),
+                node: 0,
+                samples: samples.into(),
+            }];
             self.points_generation += 1;
             self.settings.point_size = 8.;
             self.dirty = false;
@@ -182,13 +192,14 @@ impl Workbench {
                 .select_rect(self.camera, [0.35, 0.3], [0.65, 0.7], mode, limit_depth);
         }
         if self.job.is_none()
-            && !self.points.is_empty()
+            && !self.nodes.is_empty()
             && self.smoke.started.elapsed() > Duration::from_millis(1500)
             && let Some(step) = self.smoke.script.pop_front()
         {
             self.smoke_step(ctx, &step);
             ctx.request_repaint();
         }
+        let shown = self.shown_count();
         let smoke = &mut self.smoke;
         for event in ctx.input(|i| i.events.clone()) {
             if let egui::Event::Screenshot { image, .. } = event {
@@ -219,9 +230,7 @@ impl Workbench {
                 );
                 eprintln!(
                     "Smoke test: {} updates during motion, {} final points, {:.1} ms view load",
-                    smoke.moving_updates,
-                    self.points.len(),
-                    self.view_ms
+                    smoke.moving_updates, shown, self.view_ms
                 );
                 if let Some(error) = &self.error {
                     eprintln!("Smoke test error: {} {:?}", error.message, error.detail);
@@ -251,7 +260,8 @@ impl Workbench {
         if !smoke.requested
             && smoke.script.is_empty()
             && self.job.is_none()
-            && (!self.points.is_empty() || empty)
+            && (!self.nodes.is_empty() || empty)
+            && !self.renderer.as_ref().is_some_and(|r| r.pending())
             && smoke.started.elapsed() > Duration::from_secs(3)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
@@ -268,23 +278,21 @@ impl Workbench {
         if !self.smoke.colors {
             return;
         }
-        self.smoke.probes = self
-            .points
-            .iter()
-            .filter_map(|sample| {
-                self.camera
-                    .project(DVec3::from(sample.position))
-                    .map(|(uv, _)| {
-                        (
-                            egui::pos2(
-                                rect.left() + uv[0] as f32 * rect.width(),
-                                rect.top() + uv[1] as f32 * rect.height(),
-                            ),
-                            sample.color,
-                        )
-                    })
+        let probes = self
+            .shown_points(true)
+            .filter_map(|(_, sample, world)| {
+                self.camera.project(world).map(|(uv, _)| {
+                    (
+                        egui::pos2(
+                            rect.left() + uv[0] as f32 * rect.width(),
+                            rect.top() + uv[1] as f32 * rect.height(),
+                        ),
+                        sample.color,
+                    )
+                })
             })
             .collect();
+        self.smoke.probes = probes;
     }
     fn smoke_step(&mut self, ctx: &egui::Context, step: &str) {
         use super::actions::Action;
@@ -315,9 +323,15 @@ impl Workbench {
             }
             "measure" => {
                 self.selection.tool = super::selection::Tool::Measure;
-                let mut points = self.points.iter().step_by((self.points.len() / 2).max(1));
-                if let (Some(a), Some(b)) = (points.next(), points.next()) {
-                    self.measure_points(a.position.into(), b.position.into());
+                let count = self.shown_count();
+                let points: Vec<_> = self
+                    .shown_points(true)
+                    .map(|(.., p)| p)
+                    .step_by((count / 2).max(1))
+                    .take(2)
+                    .collect();
+                if let [a, b] = points[..] {
+                    self.measure_points(a, b);
                 }
             }
             "preview" => {
@@ -329,16 +343,20 @@ impl Workbench {
                     self.selected = Some(id);
                     self.edit_transform_inputs(id, [radius * 0.4, 0., 0.], [0., 0., 30.]);
                 }
-                let moved = self.draw_segments().unwrap_or_default();
-                let moved = moved
+                let (applied, drawn) = (self.scan_worlds(false), self.scan_worlds(true));
+                let moved = self
+                    .nodes
                     .iter()
-                    .filter(|s| !s.motion.abs_diff_eq(glam::DMat4::IDENTITY, 1e-9))
-                    .map(|s| s.range.len())
+                    .filter(|n| {
+                        let (a, d) = (applied.get(&n.scan), drawn.get(&n.scan));
+                        a.zip(d).is_some_and(|(a, d)| !a.abs_diff_eq(*d, 1e-9))
+                    })
+                    .map(|n| n.samples.len())
                     .sum::<usize>();
                 eprintln!(
                     "Smoke preview: {:?}, {moved} of {} points moved",
                     self.transform_preview().map(|(_, pose)| pose.translation),
-                    self.points.len()
+                    self.shown_count()
                 );
             }
             "subsample" => self.run_filter(
@@ -375,9 +393,8 @@ impl Workbench {
                 self.smoke_box();
                 if let Some(region) = self.crop.region {
                     let inside = self
-                        .points
-                        .iter()
-                        .filter(|p| region.contains(p.position.into()))
+                        .shown_points(false)
+                        .filter(|(.., p)| region.contains(*p))
                         .count();
                     eprintln!("Smoke box: {region:?}, {inside} displayed points inside");
                 }
@@ -412,6 +429,17 @@ impl Workbench {
                     let to = geemil_core::DEFAULT_LAYER;
                     self.layer_action(ctx, super::layers::LayerAction::MoveAll { from, to });
                 }
+            }
+            "transform" | "transform-folder" => {
+                // The move and rotate tool on the first scan, or the first folder.
+                self.selection.tool = super::selection::Tool::Transform;
+                self.selected = self.project.as_ref().and_then(|p| {
+                    if step == "transform" {
+                        p.scans().next().map(|s| s.id)
+                    } else {
+                        p.groups().first().map(|g| g.id)
+                    }
+                });
             }
             "show-layers" => {
                 let codes: Vec<_> = self

@@ -275,10 +275,10 @@ impl Project {
             .map_or(DMat4::IDENTITY, |parent| self.correction(parent));
         Pose::from_matrix(above.inverse() * motion * above * own.matrix())
     }
-    /// About `budget` surviving points spread evenly over `scan`, mapped by
-    /// `world`: from the deepest LOD level that fits the budget, with leaves
-    /// read at full resolution when the LOD has too few. `region` limits them
-    /// to a box in the mapped frame.
+    /// About `budget` points of `scan` in visible layers, spread evenly over
+    /// it and mapped by `world`: whole levels of the additive display octree,
+    /// coarsest first, as far as the budget reaches. `region` limits them to
+    /// a box in the mapped frame.
     fn processing_samples(
         &self,
         scan: &Scan,
@@ -290,82 +290,38 @@ impl Project {
         if scan.nodes.is_empty() || !intersects(&scan.nodes[0].bounds, world, region) {
             return Ok(vec![]);
         }
+        let keep = |p: DVec3| region.is_none_or(|(lo, hi)| p.cmpge(lo).all() && p.cmple(hi).all());
+        let mut masks: HashMap<u32, Vec<u8>> = HashMap::new();
+        let mut result = vec![];
         let mut level = vec![0u32];
-        loop {
-            job.check()?;
-            let next: Vec<u32> = level
-                .iter()
-                .flat_map(|&n| {
-                    let node = &scan.nodes[n as usize];
-                    if node.children.is_empty() {
-                        vec![n]
-                    } else {
-                        node.children
-                            .iter()
-                            .copied()
-                            .filter(|&c| intersects(&scan.nodes[c as usize].bounds, world, region))
-                            .collect()
+        while !level.is_empty() && result.len() < budget {
+            let mut next = vec![];
+            for &node in &level {
+                job.check()?;
+                for sample in self.read_view(scan, node)? {
+                    if let std::collections::hash_map::Entry::Vacant(e) = masks.entry(sample.chunk)
+                    {
+                        e.insert(self.hidden_mask(scan, sample.chunk)?);
                     }
-                })
-                .collect();
-            let cost: usize = next
-                .iter()
-                .map(|&n| scan.nodes[n as usize].lod_count as usize)
-                .sum();
-            if next == level || cost > budget {
-                break;
+                    if is_set(&masks[&sample.chunk], sample.index as usize) {
+                        continue;
+                    }
+                    let p = world.transform_point3(DVec3::from(sample.position));
+                    if keep(p) {
+                        result.push(p);
+                    }
+                }
+                next.extend(
+                    scan.nodes[node as usize]
+                        .children
+                        .iter()
+                        .copied()
+                        .filter(|&c| intersects(&scan.nodes[c as usize].bounds, world, region)),
+                );
             }
             level = next;
         }
-        // Each node gets a share of the budget by its point count. Leaves that
-        // deserve more than their LOD samples are read at full resolution and
-        // thinned evenly, so small scans are not limited to the LOD.
-        let total: u64 = level
-            .iter()
-            .map(|&n| scan.nodes[n as usize].point_count)
-            .sum();
-        let mut result = vec![];
-        let keep = |p: DVec3| region.is_none_or(|(lo, hi)| p.cmpge(lo).all() && p.cmple(hi).all());
-        for node_id in level {
-            job.check()?;
-            let node = &scan.nodes[node_id as usize];
-            let quota = (budget as f64 * node.point_count as f64 / total.max(1) as f64).ceil();
-            match node.chunk {
-                Some(chunk) if quota > node.lod_count as f64 => {
-                    let step = (node.point_count as f64 / quota).max(1.);
-                    let points = self.points(scan, chunk)?;
-                    let mut next = 0.;
-                    for (i, sample) in points.iter().enumerate() {
-                        if (i as f64) < next {
-                            continue;
-                        }
-                        next += step;
-                        let p = world.transform_point3(DVec3::from(sample.position));
-                        if keep(p) {
-                            result.push(p);
-                        }
-                    }
-                }
-                _ => {
-                    let mut masks: HashMap<u32, Vec<u8>> = HashMap::new();
-                    for sample in self.read_lod(scan, node_id)? {
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            masks.entry(sample.chunk)
-                        {
-                            e.insert(self.hidden_mask(scan, sample.chunk)?);
-                        }
-                        if is_set(&masks[&sample.chunk], sample.index as usize) {
-                            continue;
-                        }
-                        let p = world.transform_point3(DVec3::from(sample.position));
-                        if keep(p) {
-                            result.push(p);
-                        }
-                    }
-                }
-            }
-        }
-        // A coarse level can still overshoot; thin it evenly.
+        // The last level can overshoot; thin it evenly.
         if result.len() > budget * 3 / 2 {
             let step = result.len() as f64 / budget as f64;
             result = (0..budget)

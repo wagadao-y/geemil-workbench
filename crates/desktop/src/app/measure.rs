@@ -42,7 +42,8 @@ impl Workbench {
         ];
         let viewport = [rect.width() as f64, rect.height() as f64];
         let radius = self.settings.point_size as f64 / 2.;
-        if let Some(point) = pick(&self.points, &self.camera, click, viewport, radius) {
+        let points = self.shown_points(true).map(|(.., p)| p);
+        if let Some(point) = pick(points, &self.camera, click, viewport, radius) {
             if self.measure.points.len() >= 2 {
                 self.measure.points.clear();
             }

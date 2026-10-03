@@ -19,7 +19,9 @@ fn main() -> Result<()> {
         aspect: 1.5,
         ..Camera::default()
     };
-    let mut cache = ViewCache::new(256 * 1024 * 1024);
+    // As the app: room for twice the point budget.
+    let mut cache = ViewCache::new(0);
+    cache.set_point_limit(budget * 2);
     for step in 0..8 {
         camera.yaw += 0.025;
         let start = Instant::now();
@@ -27,7 +29,7 @@ fn main() -> Result<()> {
             project.load_view_cached(&camera, budget, &ids, &JobControl::default(), &mut cache)?;
         println!(
             "step={step} points={} elapsed_ms={:.1}",
-            points.samples.len(),
+            points.nodes.iter().map(|n| n.samples.len()).sum::<usize>(),
             start.elapsed().as_secs_f64() * 1000.
         );
         println!("cache {:?}", cache.stats());

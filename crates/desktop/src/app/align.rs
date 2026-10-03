@@ -187,8 +187,7 @@ impl Workbench {
         if !self.aligning() || self.align.item.is_none() || !response.clicked() {
             return;
         }
-        let (Some(pos), Some(shown)) = (response.interact_pointer_pos(), self.shown_segments())
-        else {
+        let Some(pos) = response.interact_pointer_pos() else {
             return;
         };
         let rect = response.rect;
@@ -197,28 +196,24 @@ impl Workbench {
         let near = radius + 6.;
         let mut covering: Option<(f64, Pick)> = None;
         let mut closest: Option<(f64, Pick)> = None;
-        for segment in &shown {
-            for sample in &self.points[segment.range.clone()] {
-                let loaded = DVec3::from(sample.position);
-                let Some((uv, depth)) = projector.project(segment.motion.transform_point3(loaded))
-                else {
-                    continue;
-                };
-                let dx = uv[0] * rect.width() as f64 - (pos.x - rect.left()) as f64;
-                let dy = uv[1] * rect.height() as f64 - (pos.y - rect.top()) as f64;
-                let d2 = dx * dx + dy * dy;
-                let pick = || Pick {
-                    scan: segment.scan,
-                    local: segment.loaded_to_local.transform_point3(loaded),
-                    order: 0,
-                };
-                if d2 <= radius * radius {
-                    if covering.as_ref().is_none_or(|(best, _)| depth < *best) {
-                        covering = Some((depth, pick()));
-                    }
-                } else if d2 <= near * near && closest.as_ref().is_none_or(|(best, _)| d2 < *best) {
-                    closest = Some((d2, pick()));
+        for (scan, sample, world) in self.shown_points(true) {
+            let Some((uv, depth)) = projector.project(world) else {
+                continue;
+            };
+            let dx = uv[0] * rect.width() as f64 - (pos.x - rect.left()) as f64;
+            let dy = uv[1] * rect.height() as f64 - (pos.y - rect.top()) as f64;
+            let d2 = dx * dx + dy * dy;
+            let pick = || Pick {
+                scan,
+                local: DVec3::from(sample.position),
+                order: 0,
+            };
+            if d2 <= radius * radius {
+                if covering.as_ref().is_none_or(|(best, _)| depth < *best) {
+                    covering = Some((depth, pick()));
                 }
+            } else if d2 <= near * near && closest.as_ref().is_none_or(|(best, _)| d2 < *best) {
+                closest = Some((d2, pick()));
             }
         }
         let Some((_, mut pick)) = covering.or(closest) else {
@@ -582,18 +577,16 @@ impl Workbench {
         self.align_update();
         let world = |id| p.world_matrix(p.scans().find(|s| s.id == id).unwrap());
         let (to_other, from_first) = (world(other).inverse(), world(first));
-        let Some(shown) = self.shown_segments() else {
+        let locals: Vec<DVec3> = self
+            .shown_points(false)
+            .filter(|(scan, ..)| *scan == first)
+            .map(|(_, s, _)| DVec3::from(s.position))
+            .collect();
+        if locals.is_empty() {
             return;
-        };
-        let Some(segment) = shown.iter().find(|s| s.scan == first) else {
-            return;
-        };
-        let range = segment.range.clone();
+        }
         for k in 0..4 {
-            let sample = &self.points[range.start + (range.len() - 1) * k / 3];
-            let local = segment
-                .loaded_to_local
-                .transform_point3(DVec3::from(sample.position));
+            let local = locals[(locals.len() - 1) * k / 3];
             let reference = to_other.transform_point3(from_first.transform_point3(local));
             self.align.pairs.push(Pair {
                 moving: Some(Pick {

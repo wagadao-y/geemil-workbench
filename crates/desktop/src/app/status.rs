@@ -19,7 +19,7 @@ impl Workbench {
                         return;
                     }
                     ui.label((t.view_stats)(
-                        &t.mega_points(self.points.len()),
+                        &t.mega_points(self.shown_count()),
                         self.view_ms,
                     ));
                     ui.separator();

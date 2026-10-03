@@ -30,14 +30,16 @@ pub(super) enum Tool {
     Measure,
     Align,
     Box,
+    Transform,
 }
 /// Tools in toolbar and menu order.
-pub(super) const TOOLS: [Tool; 6] = [
+pub(super) const TOOLS: [Tool; 7] = [
     Tool::Navigate,
     Tool::Rect,
     Tool::Polygon,
     Tool::Box,
     Tool::Measure,
+    Tool::Transform,
     Tool::Align,
 ];
 impl Tool {
@@ -45,7 +47,7 @@ impl Tool {
     pub(super) fn orbits(self) -> bool {
         matches!(
             self,
-            Tool::Navigate | Tool::Measure | Tool::Align | Tool::Box
+            Tool::Navigate | Tool::Measure | Tool::Align | Tool::Box | Tool::Transform
         )
     }
 }
@@ -308,7 +310,7 @@ impl Workbench {
         let camera = self.camera;
         let s = &mut self.selection;
         match s.tool {
-            Tool::Navigate | Tool::Measure | Tool::Align | Tool::Box => {}
+            Tool::Navigate | Tool::Measure | Tool::Align | Tool::Box | Tool::Transform => {}
             Tool::Polygon => {
                 // The first click of a double click already added the last vertex.
                 if response.double_clicked() {
@@ -364,6 +366,7 @@ impl Workbench {
             }
             return;
         };
+        let worlds = self.scan_worlds(false);
         let s = &mut self.selection;
         let preview = &mut s.preview;
         let test = selection.prepare();
@@ -376,7 +379,8 @@ impl Workbench {
                 revision: project.current().id,
             };
             if preview.nearest_for.as_ref() != Some(&input) {
-                preview.nearest = displayed_nearest(&selection, &self.points);
+                let points = super::view::node_points(&self.nodes, worlds.clone());
+                preview.nearest = displayed_nearest(&selection, points.map(|(.., p)| p));
                 preview.search = Some(start_search(ctx, project, &selection, &input.visible));
                 preview.nearest_for = Some(input);
             }
@@ -406,10 +410,19 @@ impl Workbench {
                 // Nothing inside the polygon: nothing to move.
                 _ => f64::NEG_INFINITY,
             };
+            // Parallel to all loaded nodes; points of hidden scans stay unmarked.
             preview.marks = self
-                .points
+                .nodes
                 .iter()
-                .map(|p| test.excludes(p.position.into(), limit))
+                .flat_map(|node| {
+                    let world = worlds.get(&node.scan).copied();
+                    let test = &test;
+                    node.samples.iter().map(move |p| {
+                        world.is_some_and(|w| {
+                            test.excludes(w.transform_point3(p.position.into()), limit)
+                        })
+                    })
+                })
                 .collect();
             preview.marked = preview.marks.iter().filter(|m| **m).count();
             preview.marks_for = Some(input);
@@ -467,11 +480,10 @@ impl Workbench {
     }
 }
 
-fn displayed_nearest(selection: &Selection, points: &[geemil_core::Sample]) -> Nearest {
+fn displayed_nearest(selection: &Selection, points: impl Iterator<Item = glam::DVec3>) -> Nearest {
     let test = selection.prepare();
     let nearest = points
-        .iter()
-        .filter_map(|p| test.contains(p.position.into()))
+        .filter_map(|p| test.contains(p))
         .fold(f64::INFINITY, f64::min);
     if nearest.is_finite() {
         Nearest::Displayed(nearest)

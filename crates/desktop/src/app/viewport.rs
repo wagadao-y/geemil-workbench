@@ -3,7 +3,6 @@ use super::Workbench;
 use super::actions::Action;
 use crate::render::{DrawOptions, Edl};
 use eframe::egui;
-use glam::DVec3;
 
 impl Workbench {
     pub(super) fn viewport(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
@@ -17,17 +16,14 @@ impl Workbench {
                 self.dirty = true;
             }
             self.update_preview(ctx);
-            self.renderer.upload(
-                &self.points,
-                DVec3::from(self.points_origin),
-                self.points_generation,
-                self.selection.marks(),
-            );
             let pixels = ctx.pixels_per_point();
-            let segments = self.draw_segments();
+            let mut renderer = self.renderer.take().expect("renderer");
+            renderer.set_point_limit(self.settings.point_budget.saturating_mul(2));
+            let nodes = self.draw_nodes();
+            let marks_revision = self.selection.marks().map_or(0, |(_, revision)| revision);
             let rs = frame.wgpu_render_state().unwrap();
             let settings = &self.settings;
-            let id = self.renderer.draw(
+            let id = renderer.draw(
                 rs,
                 &self.camera,
                 [(size.x * pixels) as u32, (size.y * pixels) as u32],
@@ -41,16 +37,22 @@ impl Workbench {
                             0.
                         },
                     },
-                    segments: segments.as_deref(),
+                    marks_revision,
+                    nodes: &nodes,
                     clip: self.display_clip().map(|c| c.unit_matrix()),
                     height_ramp: (self.settings.color_mode == ColorMode::Height)
                         .then_some(self.height_range)
                         .flatten(),
                 },
             );
+            drop(nodes);
+            self.renderer = Some(renderer);
             let response =
                 ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
             self.smoke_probes(response.rect);
+            if self.job.is_none() {
+                self.gizmo_input(&response);
+            }
             self.camera_input(ctx, &response);
             if self.job.is_none() {
                 self.selection_input(&response);
@@ -61,6 +63,7 @@ impl Workbench {
             self.draw_measure(ui, response.rect);
             self.draw_align(ui, response.rect);
             self.draw_box(ui, response.rect);
+            self.draw_gizmo(ui, response.rect);
             self.draw_pivot(ui, &response);
             self.empty_hint(ui, response.rect);
         });

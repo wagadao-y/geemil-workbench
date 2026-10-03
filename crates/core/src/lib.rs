@@ -17,7 +17,8 @@ mod view_cache;
 
 pub use align::{IcpOptions, IcpResult, rigid_fit};
 pub use edit::{
-    Camera, LoadedView, PreparedSelection, Projector, Selection, SelectionMode, ViewSegment,
+    Camera, LoadedNode, LoadedView, PreparedSelection, Projector, Selection, SelectionMode,
+    ViewPick,
 };
 pub use error::{CoreError, Stage};
 pub use history::CleanupReport;

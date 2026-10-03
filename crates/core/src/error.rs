@@ -9,7 +9,7 @@ pub enum Stage {
     Images,
     Partitioning,
     Indexing,
-    BuildingParentLod,
+    BuildingViewTree,
     SelectionNearestDepth,
     SelectionMove,
     MovingLayer,
@@ -22,7 +22,6 @@ pub enum Stage {
     WritingLas,
     IcpSampling,
     IcpIterations,
-    ViewLod,
     ViewPoints,
 }
 impl fmt::Display for Stage {
@@ -33,7 +32,7 @@ impl fmt::Display for Stage {
             Self::Images => "Images",
             Self::Partitioning => "Partitioning",
             Self::Indexing => "Indexing",
-            Self::BuildingParentLod => "Building parent LOD",
+            Self::BuildingViewTree => "Building display octree",
             Self::SelectionNearestDepth => "Selection: nearest depth",
             Self::SelectionMove => "Selection: moving points",
             Self::MovingLayer => "Moving layer points",
@@ -46,7 +45,6 @@ impl fmt::Display for Stage {
             Self::WritingLas => "Writing LAS/LAZ",
             Self::IcpSampling => "ICP: sampling",
             Self::IcpIterations => "ICP: iterating",
-            Self::ViewLod => "View LOD",
             Self::ViewPoints => "View points",
         })
     }

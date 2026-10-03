@@ -87,6 +87,7 @@ impl Action {
             Self::Tool(Tool::Measure) => icon::RULER,
             Self::Tool(Tool::Align) => icon::CROSSHAIR,
             Self::Tool(Tool::Box) => icon::CUBE_FOCUS,
+            Self::Tool(Tool::Transform) => icon::ARROWS_OUT_CARDINAL,
             Self::Shortcuts => icon::KEYBOARD,
             Self::About => icon::INFO,
         }
@@ -126,6 +127,7 @@ impl Action {
             Self::Tool(Tool::Measure) => t.tool_measure.into(),
             Self::Tool(Tool::Align) => t.tool_align.into(),
             Self::Tool(Tool::Box) => t.tool_box.into(),
+            Self::Tool(Tool::Transform) => t.tool_transform.into(),
             Self::Shortcuts => t.shortcuts.into(),
             Self::About => t.about.into(),
         }
@@ -153,6 +155,7 @@ impl Action {
             Self::Tool(Tool::Measure) => Key::M,
             Self::Tool(Tool::Align) => Key::A,
             Self::Tool(Tool::Box) => Key::B,
+            Self::Tool(Tool::Transform) => Key::T,
             Self::Exclude => Key::Delete,
             Self::ClearSelection => Key::Escape,
             Self::FitView => Key::F,
@@ -187,6 +190,7 @@ const KEYED: &[Action] = &[
     Action::Tool(Tool::Measure),
     Action::Tool(Tool::Align),
     Action::Tool(Tool::Box),
+    Action::Tool(Tool::Transform),
     Action::Exclude,
     Action::ClearSelection,
     Action::FitView,
@@ -312,6 +316,7 @@ impl Workbench {
                 if self.selection.tool == Tool::Align {
                     self.align.clear();
                 }
+                self.gizmo.cancel();
             }
             Action::Exclude => self.exclude(ctx),
             Action::NewFolder => {

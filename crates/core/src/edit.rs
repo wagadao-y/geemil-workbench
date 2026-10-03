@@ -4,23 +4,29 @@ use crate::{Bounds, JobControl, LayerTarget, Pose, Project, Sample, Scan, Stage,
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3, DVec4};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::BinaryHeap;
 use uuid::Uuid;
 
-/// Samples of a view in the common project frame, with the transforms they
-/// were placed with so a renderer can move them before the next load.
+/// A display octree node chosen for a view, in priority order.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewPick {
+    pub scan: Uuid,
+    pub node: u32,
+    /// How many of its points to show, when the budget is below the roots.
+    pub quota: Option<usize>,
+}
+/// A shown node's points in visible layers, in scan coordinates. A renderer
+/// places them with the scan's world matrix, so transforms need no reload.
+#[derive(Clone, Debug)]
+pub struct LoadedNode {
+    pub scan: Uuid,
+    pub node: u32,
+    pub samples: std::sync::Arc<[Sample]>,
+}
+/// The nodes of a view, grouped by scan.
 #[derive(Clone, Debug, Default)]
 pub struct LoadedView {
-    pub samples: Vec<Sample>,
-    pub segments: Vec<ViewSegment>,
-}
-/// The samples of one scan within a [`LoadedView`].
-#[derive(Clone, Debug)]
-pub struct ViewSegment {
-    pub scan: Uuid,
-    pub range: std::ops::Range<usize>,
-    /// [`Project::world_matrix`] of the scan when the view was loaded.
-    pub world: DMat4,
+    pub nodes: Vec<LoadedNode>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -500,37 +506,38 @@ impl Project {
         )
     }
 
-    /// The fraction of each node's points (by index) in visible layers, from
-    /// the per-chunk layer counts.
-    fn surviving_fractions(&self, scan: &Scan) -> Vec<f64> {
-        let excluded: Vec<_> = (0..scan.chunks.len() as u32)
-            .map(|chunk| self.hidden_count(scan, chunk))
+    /// The expected number of each node's own points in visible layers, and
+    /// of the points in it and below, from the per-chunk layer counts.
+    fn visible_estimates(&self, scan: &Scan) -> (Vec<f64>, Vec<f64>) {
+        let visible: Vec<f64> = scan
+            .chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let hidden = self.hidden_count(scan, i as u32) as f64;
+                (1. - hidden / c.count.max(1) as f64).max(0.)
+            })
             .collect();
-        // (surviving, total) points below each node.
-        fn count(scan: &Scan, excluded: &[u64], node: usize, out: &mut [(f64, f64)]) -> (f64, f64) {
-            let n = &scan.nodes[node];
-            let mut sums = (0., 0.);
-            if let Some(chunk) = n.chunk {
-                let total = scan.chunks[chunk as usize].count as f64;
-                let gone = (excluded[chunk as usize] as f64).min(total);
-                sums = (total - gone, total);
+        let own: Vec<f64> = scan
+            .nodes
+            .iter()
+            .map(|n| {
+                n.chunks
+                    .iter()
+                    .map(|(c, count)| *count as f64 * visible.get(*c as usize).unwrap_or(&0.))
+                    .sum()
+            })
+            .collect();
+        let mut below = own.clone();
+        // Children come after their parents.
+        for i in (0..scan.nodes.len()).rev() {
+            for &c in &scan.nodes[i].children {
+                below[i] += below[c as usize];
             }
-            for &child in &n.children {
-                let (a, b) = count(scan, excluded, child as usize, out);
-                sums.0 += a;
-                sums.1 += b;
-            }
-            out[node] = sums;
-            sums
         }
-        let mut sums = vec![(0., 0.); scan.nodes.len()];
-        if !scan.nodes.is_empty() {
-            count(scan, &excluded, 0, &mut sums);
-        }
-        sums.iter()
-            .map(|(s, t)| if *t > 0. { s / t } else { 1. })
-            .collect()
+        (own, below)
     }
+    /// The points to show for `camera` in the project frame.
     pub fn load_view(
         &self,
         camera: &Camera,
@@ -538,30 +545,40 @@ impl Project {
         scan_ids: &[Uuid],
         job: &JobControl,
     ) -> Result<Vec<Sample>> {
-        self.load_view_cached(camera, budget, scan_ids, job, &mut ViewCache::new(0))
-            .map(|view| view.samples)
+        let view = self.load_view_cached(camera, budget, scan_ids, job, &mut ViewCache::new(0))?;
+        let mut result = vec![];
+        for node in view.nodes {
+            let Some(scan) = self.scans().find(|s| s.id == node.scan) else {
+                continue;
+            };
+            let world = self.world_matrix(scan);
+            result.extend(node.samples.iter().map(|s| Sample {
+                position: world.transform_point3(DVec3::from(s.position)).to_array(),
+                ..*s
+            }));
+        }
+        Ok(result)
     }
-    pub fn load_view_cached(
+    /// The nodes to show for `camera`, like Potree: display octree nodes are
+    /// taken largest on screen first, adding detail until the next one would
+    /// exceed `budget`. The tree is additive, so every taken node is drawn.
+    /// Only points in visible layers count against the budget.
+    pub fn select_view(
         &self,
         camera: &Camera,
         budget: usize,
         scan_ids: &[Uuid],
         job: &JobControl,
-        cache: &mut ViewCache,
-    ) -> Result<LoadedView> {
-        cache.prepare(self);
+    ) -> Result<Vec<ViewPick>> {
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
-        // Budget only the samples in visible layers, so a heavily cropped or
-        // thinned scan is shown from deeper, denser levels.
-        let surviving: Vec<_> = scans.iter().map(|s| self.surviving_fractions(s)).collect();
-        let lod = |si: usize, ni: u32| {
-            let node = &scans[si].nodes[ni as usize];
-            (node.lod_count as f64 * surviving[si][ni as usize]).ceil() as usize
+        let estimates: Vec<_> = scans.iter().map(|s| self.visible_estimates(s)).collect();
+        let cost = |si: usize, ni: u32| estimates[si].0[ni as usize].ceil() as usize;
+        let shown = |si: usize, ni: u32| {
+            estimates[si].1[ni as usize] > 0. && camera.sees(scans[si], ni, worlds[si])
         };
-        let shown = |si: usize, ni: u32| surviving[si][ni as usize] > 0.;
         let eye = camera.eye();
-        let score = |si: usize, ni: u32| {
+        let size = |si: usize, ni: u32| {
             let node = &scans[si].nodes[ni as usize];
             let center = worlds[si].transform_point3(node.bounds.center());
             // On screen, a node's size goes with its distance in perspective and
@@ -571,98 +588,92 @@ impl Project {
             } else {
                 eye.distance(center)
             };
-            let score = node.bounds.radius() / distance.max(0.0001);
-            (!node.children.is_empty() && score > 0.015).then_some((score.to_bits(), si, ni))
+            node.bounds.radius() / distance.max(0.0001)
         };
-        let mut cut = BTreeSet::new();
         let mut queue = BinaryHeap::new();
-        let mut cost = 0usize;
         for (si, scan) in scans.iter().enumerate() {
-            if !scan.nodes.is_empty() && shown(si, 0) && camera.sees(scan, 0, worlds[si]) {
-                cut.insert((si, 0u32));
-                cost += lod(si, 0);
-                if let Some(candidate) = score(si, 0) {
-                    queue.push(candidate);
-                }
+            if !scan.nodes.is_empty() && shown(si, 0) {
+                queue.push((size(si, 0).to_bits(), si, 0u32));
             }
         }
-        while let Some((_, si, ni)) = queue.pop() {
-            job.report(Stage::ViewLod, 0, budget as u64);
-            job.check()?;
-            let scan = scans[si];
-            let children: Vec<_> = scan.nodes[ni as usize]
-                .children
-                .iter()
-                .copied()
-                .filter(|id| shown(si, *id) && camera.sees(scan, *id, worlds[si]))
-                .map(|id| (si, id))
-                .collect();
-            let next_cost =
-                cost - lod(si, ni) + children.iter().map(|(si, ni)| lod(*si, *ni)).sum::<usize>();
-            if next_cost > budget {
-                continue;
+        let pick = |si: usize, node: u32, quota| ViewPick {
+            scan: scans[si].id,
+            node,
+            quota,
+        };
+        let mut taken = vec![];
+        // A budget below the roots shows each root thinned to its share.
+        let roots: usize = queue.iter().map(|(_, si, ni)| cost(*si, *ni)).sum();
+        if roots > budget {
+            for (_, si, ni) in queue.into_sorted_vec().into_iter().rev() {
+                taken.push(pick(si, ni, Some(budget * cost(si, ni) / roots)));
             }
-            cost = next_cost;
-            cut.remove(&(si, ni));
-            for (si, ni) in children {
-                cut.insert((si, ni));
-                if let Some(candidate) = score(si, ni) {
-                    queue.push(candidate);
-                }
-            }
+            return Ok(taken);
         }
-        let mut result = Vec::with_capacity(budget.min(2_000_000));
-        let mut segments: Vec<ViewSegment> = vec![];
-        let mut remaining_lod: usize = cut.iter().map(|(si, ni)| lod(*si, *ni)).sum();
-        for (si, ni) in cut {
-            job.report(Stage::ViewPoints, result.len() as u64, budget as u64);
+        let mut total = 0usize;
+        while let Some((weight, si, ni)) = queue.pop() {
             job.check()?;
-            let scan = scans[si];
-            let node = &scan.nodes[ni as usize];
-            let node_lod = lod(si, ni);
-            remaining_lod = remaining_lod.saturating_sub(node_lod);
-            // Reserve representative points for the rest of the view. Expanding one
-            // nearby leaf must not consume the budget of other nodes/scans.
-            let available = budget.saturating_sub(result.len());
-            let quota = if remaining_lod + node_lod > available {
-                available.saturating_mul(node_lod) / (remaining_lod + node_lod).max(1)
-            } else {
-                available.saturating_sub(remaining_lod)
-            };
-            let survivors = node.point_count as f64 * surviving[si][ni as usize];
-            let full = node.chunk.is_some() && survivors <= quota as f64;
-            let samples = cache.samples(self, scan, ni, full, job)?;
-            let sample_count = samples.len();
-            // `cut` is ordered by scan, so each scan's samples are contiguous.
-            if segments.last().is_none_or(|s| s.scan != scan.id) {
-                segments.push(ViewSegment {
-                    scan: scan.id,
-                    range: result.len()..result.len(),
-                    world: worlds[si],
-                });
+            let c = cost(si, ni);
+            if total + c > budget {
+                break;
             }
-            let world = worlds[si];
-            let to_world = |s: &Sample| Sample {
-                position: world.transform_point3(DVec3::from(s.position)).to_array(),
-                ..*s
-            };
-            if quota >= sample_count {
-                result.extend(samples.iter().map(to_world));
-            } else {
-                for (i, s) in samples.iter().enumerate() {
-                    // Spread a reduced quota over the whole node instead of
-                    // cropping a prefix, which would introduce a spatial bias.
-                    if (i + 1) * quota / sample_count != i * quota / sample_count {
-                        result.push(to_world(s));
+            total += c;
+            taken.push(pick(si, ni, None));
+            // Children only matter while this node is large on screen.
+            if f64::from_bits(weight) > 0.015 {
+                for &child in &scans[si].nodes[ni as usize].children {
+                    if shown(si, child) {
+                        queue.push((size(si, child).to_bits(), si, child));
                     }
                 }
             }
-            segments.last_mut().unwrap().range.end = result.len();
         }
-        Ok(LoadedView {
-            samples: result,
-            segments,
+        Ok(taken)
+    }
+    /// The points of a chosen node in visible layers, in scan coordinates.
+    pub fn view_node(
+        &self,
+        pick: &ViewPick,
+        job: &JobControl,
+        cache: &mut ViewCache,
+    ) -> Result<LoadedNode> {
+        cache.prepare(self);
+        let scan = self
+            .scans()
+            .find(|s| s.id == pick.scan)
+            .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
+        let mut samples = cache.samples(self, scan, pick.node, job)?;
+        if let Some(q) = pick.quota.filter(|q| *q < samples.len()) {
+            // Spread over the whole node rather than a prefix.
+            samples = (0..q)
+                .map(|i| samples[i * samples.len() / q.max(1)].clone())
+                .collect();
+        }
+        Ok(LoadedNode {
+            scan: pick.scan,
+            node: pick.node,
+            samples,
         })
+    }
+    /// [`Project::select_view`] and the chosen nodes' points, grouped by scan.
+    pub fn load_view_cached(
+        &self,
+        camera: &Camera,
+        budget: usize,
+        scan_ids: &[Uuid],
+        job: &JobControl,
+        cache: &mut ViewCache,
+    ) -> Result<LoadedView> {
+        cache.prepare(self);
+        let mut picks = self.select_view(camera, budget, scan_ids, job)?;
+        let order: Vec<_> = self.scans().map(|s| s.id).collect();
+        picks.sort_by_key(|p| order.iter().position(|id| *id == p.scan));
+        let mut nodes = Vec::with_capacity(picks.len());
+        for pick in &picks {
+            job.check()?;
+            nodes.push(self.view_node(pick, job, cache)?);
+        }
+        Ok(LoadedView { nodes })
     }
 }
 

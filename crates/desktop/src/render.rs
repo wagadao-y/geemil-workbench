@@ -1,7 +1,7 @@
 use eframe::{egui, egui_wgpu::wgpu};
 use geemil_core::{Camera, Sample};
 use glam::{DMat4, DVec3};
-use std::ops::Range;
+use std::{collections::HashMap, sync::Arc};
 use wgpu::util::DeviceExt;
 
 // The point pass writes linear RGB to an sRGB target, so the hardware encodes
@@ -10,16 +10,20 @@ const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 // egui-wgpu (0.36) samples native textures as plain Rgba8Unorm holding sRGB
 // code values, so edl.wgsl encodes its linear result before writing here.
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-/// sRGB colour of points a move would take.
-const HIGHLIGHT: [u8; 4] = [255, 48, 48, 255];
+/// Points uploaded per frame at most; the rest follow in later frames so a
+/// large view does not stall one.
+const UPLOAD_PER_FRAME: usize = 2_000_000;
 /// Per-pixel view depth for EDL; 0 marks background.
 const VIEW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Vertex {
+    /// Relative to the node's origin.
     position: [f32; 3],
-    color: [f32; 4],
+    /// sRGB code values; points.wgsl decodes RGB before writing to
+    /// SCENE_FORMAT. Alpha remains a linear coverage value.
+    color: [u8; 4],
 }
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -69,20 +73,36 @@ pub struct DrawOptions<'a> {
     /// Splat diameter in physical pixels.
     pub point_size: f32,
     pub edl: Edl,
-    /// Ranges of points to move or tint; `None` draws everything as uploaded.
-    pub segments: Option<&'a [Segment]>,
     /// Maps the project frame into a box outside of which nothing is drawn.
     pub clip: Option<DMat4>,
     /// Colour by height from the first to the second value (project Z).
     pub height_ramp: Option<[f64; 2]>,
+    /// Changes whenever the nodes' marks do.
+    pub marks_revision: u64,
+    pub nodes: &'a [DrawNode<'a>],
 }
-/// Instances drawn with one transform: a range of uploaded points and the
-/// world-space motion to apply to them, e.g. a transform being previewed.
-pub struct Segment {
-    pub range: Range<u32>,
-    pub motion: DMat4,
+/// A display octree node to draw: its points in scan coordinates, placed in
+/// the project frame by `world`.
+pub struct DrawNode<'a> {
+    pub samples: &'a Arc<[Sample]>,
+    pub world: DMat4,
     /// sRGB colour (0..1) mixed into the points, by the fourth component.
     pub tint: [f32; 4],
+    /// Points to highlight, e.g. those a move would take.
+    pub marks: Option<&'a [bool]>,
+}
+/// A node's points on the GPU. It keeps their samples, so a new node never
+/// reuses the address that identifies this one.
+struct GpuNode {
+    _samples: Arc<[Sample]>,
+    origin: DVec3,
+    vertices: wgpu::Buffer,
+    /// One u32 per point; bit 0 highlights it.
+    flags: wgpu::Buffer,
+    count: u32,
+    marked: bool,
+    marks_revision: u64,
+    used: u64,
 }
 pub struct PointRenderer {
     device: wgpu::Device,
@@ -95,16 +115,19 @@ pub struct PointRenderer {
     uniform_slots: usize,
     layout: wgpu::BindGroupLayout,
     bind: wgpu::BindGroup,
-    vertices: wgpu::Buffer,
-    count: u32,
-    capacity: usize,
+    /// Resident nodes by the address of their samples.
+    nodes: HashMap<usize, GpuNode>,
+    frame: u64,
+    resident: usize,
+    /// Points kept resident at most, besides those drawn this frame.
+    limit: usize,
+    /// Whether nodes were left for later frames to upload.
+    pending: bool,
     edl_pipeline: wgpu::RenderPipeline,
     edl_layout: wgpu::BindGroupLayout,
     edl_uniform: wgpu::Buffer,
     targets: Option<Targets>,
     id: Option<egui::TextureId>,
-    origin: DVec3,
-    uploaded: (u64, u64),
 }
 impl PointRenderer {
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
@@ -140,11 +163,18 @@ impl PointRenderer {
                 module: &shader,
                 entry_point: Some("vertex"),
                 compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Float32x4],
-                })],
+                buffers: &[
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 4,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![2=>Uint32],
+                    }),
+                ],
             },
             primitive: Default::default(),
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -171,12 +201,6 @@ impl PointRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: 28,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
         Self {
             device,
             queue,
@@ -186,68 +210,103 @@ impl PointRenderer {
             uniform_slots: 1,
             layout,
             bind,
-            vertices,
-            count: 0,
-            capacity: 28,
+            nodes: HashMap::new(),
+            frame: 0,
+            resident: 0,
+            limit: 0,
+            pending: false,
             edl_pipeline,
             edl_layout,
             edl_uniform,
             targets: None,
             id: None,
-            origin: DVec3::ZERO,
-            uploaded: (0, 0),
         }
     }
-    /// Uploads `points` unless the same generation and highlight revision are
-    /// resident. `highlight` marks points to draw in `HIGHLIGHT`, with a revision
-    /// that changes whenever the marks do; revision 0 means no highlight.
-    pub fn upload(
-        &mut self,
-        points: &[Sample],
-        origin: DVec3,
-        generation: u64,
-        highlight: Option<(&[bool], u64)>,
-    ) {
-        let key = (generation, highlight.map_or(0, |(_, revision)| revision));
-        if key == self.uploaded && origin == self.origin {
-            return;
-        }
-        self.origin = origin;
-        self.uploaded = key;
-        let marks = highlight.map(|(marks, _)| marks);
-        let vertices: Vec<_> = points
-            .iter()
-            .enumerate()
-            .map(|(i, p)| Vertex {
-                position: (DVec3::from(p.position) - origin).as_vec3().to_array(),
-                // These are sRGB code values; points.wgsl decodes RGB before
-                // writing to SCENE_FORMAT. Alpha remains a linear coverage value.
-                color: if marks.is_some_and(|m| m.get(i) == Some(&true)) {
-                    HIGHLIGHT
-                } else {
-                    p.color
-                }
-                .map(|c| c as f32 / 255.),
-            })
-            .collect();
-        self.count = vertices.len() as u32;
-        if !vertices.is_empty() {
-            let bytes = bytemuck::cast_slice(&vertices);
-            if bytes.len() > self.capacity {
-                self.capacity = bytes.len();
-                self.vertices = self
-                    .device
+    /// Keeps about `points` resident, like Potree's point load limit.
+    pub fn set_point_limit(&mut self, points: usize) {
+        self.limit = points;
+    }
+    /// Whether some nodes still wait for upload in a later frame.
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+    /// Uploads a node unless resident, and brings its marks up to date.
+    /// Returns false when it has to wait for a later frame.
+    fn resident(&mut self, node: &DrawNode, revision: u64, uploaded: &mut usize) -> bool {
+        let key = Arc::as_ptr(node.samples) as *const () as usize;
+        if !self.nodes.contains_key(&key) {
+            if *uploaded > 0 && *uploaded + node.samples.len() > UPLOAD_PER_FRAME {
+                self.pending = true;
+                return false;
+            }
+            *uploaded += node.samples.len();
+            let origin = DVec3::from(node.samples[0].position);
+            let vertices: Vec<_> = node
+                .samples
+                .iter()
+                .map(|p| Vertex {
+                    position: (DVec3::from(p.position) - origin).as_vec3().to_array(),
+                    color: p.color,
+                })
+                .collect();
+            let create = |label, contents: &[u8]| {
+                self.device
                     .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("resident point samples"),
-                        contents: bytes,
+                        label: Some(label),
+                        contents,
                         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    });
-            } else {
-                self.queue.write_buffer(&self.vertices, 0, bytes);
+                    })
+            };
+            let gpu = GpuNode {
+                _samples: node.samples.clone(),
+                origin,
+                vertices: create("node points", bytemuck::cast_slice(&vertices)),
+                flags: create("node flags", &vec![0u8; node.samples.len() * 4]),
+                count: node.samples.len() as u32,
+                marked: false,
+                marks_revision: 0,
+                used: 0,
+            };
+            self.resident += node.samples.len();
+            self.nodes.insert(key, gpu);
+        }
+        let gpu = self.nodes.get_mut(&key).unwrap();
+        gpu.used = self.frame;
+        if gpu.marks_revision != revision {
+            gpu.marks_revision = revision;
+            let marks = node.marks.filter(|m| m.iter().any(|m| *m));
+            if marks.is_some() || gpu.marked {
+                let flags: Vec<u32> = (0..gpu.count as usize)
+                    .map(|i| marks.and_then(|m| m.get(i)).is_some_and(|m| *m) as u32)
+                    .collect();
+                self.queue
+                    .write_buffer(&gpu.flags, 0, bytemuck::cast_slice(&flags));
+                gpu.marked = marks.is_some();
             }
         }
+        true
     }
-    /// Draws the uploaded points.
+    /// Drops the least recently drawn nodes beyond the limit.
+    fn evict(&mut self) {
+        if self.resident <= self.limit {
+            return;
+        }
+        let mut old: Vec<_> = self
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.used < self.frame)
+            .map(|(k, n)| (n.used, *k))
+            .collect();
+        old.sort_unstable();
+        for (_, key) in old {
+            if self.resident <= self.limit {
+                break;
+            }
+            let node = self.nodes.remove(&key).unwrap();
+            self.resident -= node.count as usize;
+        }
+    }
+    /// Draws the nodes, uploading those not resident yet.
     pub fn draw(
         &mut self,
         rs: &eframe::egui_wgpu::RenderState,
@@ -258,9 +317,10 @@ impl PointRenderer {
         let DrawOptions {
             point_size,
             edl,
-            segments,
             clip,
             height_ramp,
+            marks_revision,
+            nodes,
         } = *options;
         let limit = self.device.limits().max_texture_dimension_2d;
         let size = size.map(|v| v.clamp(1, limit));
@@ -282,23 +342,17 @@ impl PointRenderer {
             }
             self.targets = Some(targets);
         }
-        let targets = self.targets.as_ref().unwrap();
-        let all = [Segment {
-            range: 0..self.count,
-            motion: DMat4::IDENTITY,
-            tint: [0.; 4],
-        }];
-        let segments: Vec<_> = segments
-            .unwrap_or(&all)
+        self.frame += 1;
+        self.pending = false;
+        let mut uploaded = 0;
+        let segments: Vec<_> = nodes
             .iter()
-            .map(|s| {
-                (
-                    s.range.start.min(self.count)..s.range.end.min(self.count),
-                    s,
-                )
-            })
-            .filter(|(range, _)| !range.is_empty())
+            .filter(|n| !n.samples.is_empty())
+            .filter(|n| self.resident(n, marks_revision, &mut uploaded))
+            .map(|n| (Arc::as_ptr(n.samples) as *const () as usize, n))
             .collect();
+        self.evict();
+        let targets = self.targets.as_ref().unwrap();
         if segments.len() > self.uniform_slots {
             self.uniform_slots = segments.len().next_power_of_two();
             (self.uniform, self.bind) = uniform_slots(
@@ -308,8 +362,8 @@ impl PointRenderer {
                 self.uniform_slots,
             );
         }
-        // Vertices are relative to `origin`; compose in f64 so large
-        // coordinates keep their precision before narrowing to f32.
+        // Vertices are relative to their node's origin; compose in f64 so
+        // large coordinates keep their precision before narrowing to f32.
         let view = camera.relative_matrix() * DMat4::from_translation(-DVec3::from(camera.target));
         // Parallel projection sees behind the eye; measure EDL depth from a
         // plane as far behind the eye as the target is in front, so it stays
@@ -319,11 +373,11 @@ impl PointRenderer {
             depth_row.w += camera.distance;
         }
         let mut uniforms = vec![0u8; segments.len() * self.uniform_stride as usize];
-        for ((_, segment), slot) in segments
+        for ((key, segment), slot) in segments
             .iter()
             .zip(uniforms.chunks_mut(self.uniform_stride as usize))
         {
-            let to_world = segment.motion * DMat4::from_translation(self.origin);
+            let to_world = segment.world * DMat4::from_translation(self.nodes[key].origin);
             let matrix = view * to_world;
             let depth = to_world.transpose() * depth_row;
             let uniform = Uniform {
@@ -402,15 +456,12 @@ impl PointRenderer {
                 multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
-            let vertex = std::mem::size_of::<Vertex>() as u64;
-            for (i, (range, _)) in segments.iter().enumerate() {
+            for (i, (key, _)) in segments.iter().enumerate() {
+                let node = &self.nodes[key];
                 pass.set_bind_group(0, &self.bind, &[(i as u64 * self.uniform_stride) as u32]);
-                pass.set_vertex_buffer(
-                    0,
-                    self.vertices
-                        .slice(range.start as u64 * vertex..range.end as u64 * vertex),
-                );
-                pass.draw(0..6, 0..range.len() as u32);
+                pass.set_vertex_buffer(0, node.vertices.slice(..));
+                pass.set_vertex_buffer(1, node.flags.slice(..));
+                pass.draw(0..6, 0..node.count);
             }
         }
         {

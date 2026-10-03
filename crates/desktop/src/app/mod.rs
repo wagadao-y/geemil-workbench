@@ -4,6 +4,7 @@ mod actions;
 mod align;
 mod crop;
 mod dialogs;
+mod gizmo;
 mod jobs;
 mod layers;
 mod measure;
@@ -24,7 +25,7 @@ pub use smoke::SmokeOptions;
 use crate::i18n::{self, Strings};
 use crate::render::PointRenderer;
 use eframe::egui;
-use geemil_core::{Bounds, Camera, CleanupReport, Project, Sample, ViewSegment};
+use geemil_core::{Bounds, Camera, CleanupReport, LoadedNode, Project};
 use jobs::{ActiveJob, Notice};
 use serde::{Deserialize, Serialize};
 use smoke::SmokeTest;
@@ -99,7 +100,8 @@ const SETTINGS_KEY: &str = "settings";
 pub struct Workbench {
     t: &'static Strings,
     project: Option<Arc<Project>>,
-    renderer: PointRenderer,
+    /// Taken out while drawing, which reads the rest of the state.
+    renderer: Option<PointRenderer>,
     camera: Camera,
     visible: BTreeSet<Uuid>,
     /// The scan or folder selected in the tree.
@@ -116,11 +118,10 @@ pub struct Workbench {
 
     // Displayed samples and view refinement.
     view: ViewLoader,
-    points: Vec<Sample>,
-    /// The scan and load-time transform of each range of `points`.
-    points_segments: Vec<ViewSegment>,
+    /// The display octree nodes shown, in scan coordinates.
+    nodes: Vec<LoadedNode>,
+    /// Increases whenever `nodes` changes.
     points_generation: u64,
-    points_origin: [f64; 3],
     /// Height range for colouring by height, and what it was taken from.
     height_range: Option<[f64; 2]>,
     height_for: Option<(Uuid, Vec<Uuid>)>,
@@ -136,6 +137,7 @@ pub struct Workbench {
     measure: measure::Measure,
     align: align::Align,
     crop: crop::Crop,
+    gizmo: gizmo::Gizmo,
     transform_edit: tree::TransformEdit,
     undo: undo::UndoStack,
     dialog: Option<dialogs::Dialog>,
@@ -166,7 +168,7 @@ impl Workbench {
         let mut app = Self {
             t,
             project: None,
-            renderer: PointRenderer::new(rs.device.clone(), rs.queue.clone()),
+            renderer: Some(PointRenderer::new(rs.device.clone(), rs.queue.clone())),
             camera: Camera::default(),
             visible: BTreeSet::new(),
             selected: None,
@@ -178,10 +180,8 @@ impl Workbench {
             progress: 0.,
             cleanup_report: None,
             view: ViewLoader::spawn(cc.egui_ctx.clone()),
-            points: vec![],
-            points_segments: vec![],
+            nodes: vec![],
             points_generation: 0,
-            points_origin: [0.; 3],
             height_range: None,
             height_for: None,
             view_ms: 0.,
@@ -195,6 +195,7 @@ impl Workbench {
             measure: Default::default(),
             align: Default::default(),
             crop: Default::default(),
+            gizmo: Default::default(),
             transform_edit: Default::default(),
             undo: Default::default(),
             dialog: None,
@@ -240,9 +241,7 @@ impl Workbench {
             self.selection.clear();
             self.measure.clear();
         }
-        self.points_generation = self.view.next_generation();
         self.view.invalidate();
-        self.points_origin = self.camera.target;
         self.project = Some(Arc::new(project));
         self.dirty = true;
     }

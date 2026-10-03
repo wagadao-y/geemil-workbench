@@ -504,7 +504,7 @@ impl Workbench {
     /// The edited, not yet applied transform of the selected item, which the
     /// viewport shows in place of the applied one.
     pub(super) fn transform_preview(&self) -> Option<(Uuid, Pose)> {
-        if let Some(preview) = self.align_preview() {
+        if let Some(preview) = self.align_preview().or_else(|| self.gizmo_preview()) {
             return Some(preview);
         }
         let (project, id) = (self.project.as_ref()?, self.selected?);

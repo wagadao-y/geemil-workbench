@@ -9,7 +9,6 @@ use super::{
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::CropBox;
-use glam::DVec3;
 
 const EDGE: egui::Color32 = egui::Color32::from_rgb(255, 220, 80);
 
@@ -173,53 +172,14 @@ impl Workbench {
         if self.selection.tool != Tool::Box && !self.crop.clip {
             return;
         }
-        let corners = region.corners();
-        let projector = self.camera.projector();
-        let screen = |p: DVec3| {
-            projector.project(p).map(|(uv, _)| {
-                rect.left_top()
-                    + egui::vec2(uv[0] as f32 * rect.width(), uv[1] as f32 * rect.height())
-            })
-        };
-        // In perspective, cut edges at a plane just in front of the eye so
-        // parts behind the camera do not hide the rest of the edge.
-        let depth = self.camera.depth_row();
-        let near = if self.camera.ortho {
-            f64::NEG_INFINITY
-        } else {
-            self.camera.distance * 1e-3
-        };
-        let clip_edge = |a: DVec3, b: DVec3| -> Option<(DVec3, DVec3)> {
-            let (da, db) = (depth.dot(a.extend(1.)), depth.dot(b.extend(1.)));
-            match (da >= near, db >= near) {
-                (true, true) => Some((a, b)),
-                (false, false) => None,
-                (true, false) => Some((a, a + (b - a) * ((da - near) / (da - db)))),
-                (false, true) => Some((b + (a - b) * ((db - near) / (db - da)), b)),
-            }
-        };
         let painter = ui.painter_at(rect);
-        for a in 0..8usize {
-            for bit in [1, 2, 4] {
-                let b = a | bit;
-                if b == a {
-                    continue;
-                }
-                let Some((ea, eb)) = clip_edge(corners[a], corners[b]) else {
-                    continue;
-                };
-                if let (Some(pa), Some(pb)) = (screen(ea), screen(eb)) {
-                    painter.line_segment([pa, pb], egui::Stroke::new(3., egui::Color32::BLACK));
-                    painter.line_segment([pa, pb], egui::Stroke::new(1.5, EDGE));
-                }
-            }
-        }
+        super::gizmo::draw_box_edges(&painter, &self.camera, rect, &region.corners(), EDGE);
     }
     /// For smoke tests: a 2 m slice at the median height of the displayed points.
     pub(super) fn smoke_box(&mut self) {
         self.selection.tool = Tool::Box;
         self.place_box();
-        let mut heights: Vec<f64> = self.points.iter().map(|p| p.position[2]).collect();
+        let mut heights: Vec<f64> = self.shown_points(false).map(|(.., p)| p.z).collect();
         heights.sort_by(f64::total_cmp);
         let median = heights.get(heights.len() / 2).copied();
         if let Some(region) = &mut self.crop.region {

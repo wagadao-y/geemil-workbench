@@ -57,7 +57,8 @@ fn project(dir: &Path, name: &str, chunk_points: u32) -> Project {
         &source,
         ImportOptions {
             chunk_points,
-            lod_points: 16,
+            view_grid: 4,
+            view_leaf_points: 32,
             ..Default::default()
         },
         &JobControl::default(),
@@ -383,7 +384,8 @@ fn merged_subsampling_keeps_one_point_per_voxel_over_overlapping_scans() {
             &dir.path().join("cloud.las"),
             ImportOptions {
                 chunk_points,
-                lod_points: 16,
+                view_grid: 4,
+                view_leaf_points: 32,
                 ..Default::default()
             },
             &JobControl::default(),

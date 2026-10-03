@@ -1,6 +1,6 @@
 use crate::BlockCodec;
 use anyhow::{Result, ensure};
-use std::io::{Read, Write};
+use std::io::Read;
 
 pub(crate) const MAX_BLOCK_BYTES: usize = 32 * 1024 * 1024;
 
@@ -27,16 +27,6 @@ pub(crate) fn pack(data: &[u8], stride: usize) -> Result<(BlockCodec, Vec<u8>)> 
     } else {
         Ok((BlockCodec::ZstdShuffle, compressed))
     }
-}
-
-pub(crate) fn write_block(
-    writer: &mut impl Write,
-    data: &[u8],
-    stride: usize,
-) -> Result<(BlockCodec, u32)> {
-    let (codec, bytes) = pack(data, stride)?;
-    writer.write_all(&bytes)?;
-    Ok((codec, bytes.len() as u32))
 }
 
 pub(crate) fn read_block(

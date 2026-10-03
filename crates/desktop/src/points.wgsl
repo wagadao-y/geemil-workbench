@@ -18,7 +18,9 @@ struct Out {
     @location(1) corner: vec2<f32>,
     @location(2) depth: f32,
 };
-@vertex fn vertex(@builtin(vertex_index) id: u32, @location(0) position: vec3<f32>, @location(1) color: vec4<f32>) -> Out {
+// sRGB colour of points a move would take (flag bit 0).
+const HIGHLIGHT = vec3<f32>(1.0, 0.188, 0.188);
+@vertex fn vertex(@builtin(vertex_index) id: u32, @location(0) position: vec3<f32>, @location(1) color: vec4<f32>, @location(2) flags: u32) -> Out {
     let corners = array<vec2<f32>, 6>(vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,1.0));
     var out: Out;
     out.position = camera.matrix * vec4(position,1.0);
@@ -30,6 +32,9 @@ struct Out {
     }
     // Mix the tint in sRGB, like the colours it replaces.
     out.color = vec4(mix(base, camera.tint.rgb, camera.tint.a), color.a);
+    if (flags & 1u) != 0u {
+        out.color = vec4(HIGHLIGHT, 1.0);
+    }
     // View-space distance along the camera axis; screen-aligned splats keep it
     // constant. 0 marks background, so keep drawn points above it.
     out.depth = max(dot(camera.depth, vec4(position, 1.0)), 1e-6);

@@ -111,16 +111,21 @@ pub enum BlockCodec {
     Raw,
     ZstdShuffle,
 }
+/// A node of a scan's display octree. Like Potree 2's, the tree is additive:
+/// every valid point is in exactly one node, so drawing a node and its
+/// children adds detail without drawing any point twice. Node 0 is the root.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Node {
+    /// Tight bounds of the points in this node and below, in scan coordinates.
     pub bounds: Bounds,
     pub children: Vec<u32>,
-    pub chunk: Option<u32>,
-    pub lod_offset: u64,
-    pub lod_count: u32,
-    pub point_count: u64,
-    pub lod_codec: BlockCodec,
-    pub lod_bytes: u32,
+    /// This node's own points in the view file.
+    pub count: u32,
+    pub offset: u64,
+    pub codec: BlockCodec,
+    pub stored_bytes: u32,
+    /// How many of this node's points come from each chunk, by chunk.
+    pub chunks: Vec<(u32, u32)>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Scan {
@@ -136,8 +141,12 @@ pub struct Scan {
     pub valid_points: u64,
     pub omitted_attributes: Vec<String>,
     pub points_file: String,
-    pub lod_file: String,
+    /// The display octree's points.
+    pub view_file: String,
+    /// Original points, the unit of processing: leaves of the octree that
+    /// split the scan at import, never changed.
     pub chunks: Vec<Chunk>,
+    /// The display octree.
     pub nodes: Vec<Node>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -426,7 +435,7 @@ impl Project {
             ensure!((32..=1_048_576).contains(&s.stride), "Invalid point stride");
             p.path(&s.template)?;
             p.path(&s.points_file)?;
-            p.path(&s.lod_file)?;
+            p.path(&s.view_file)?;
         }
         for patch in &p.manifest.patches {
             p.path(&patch.file)?;

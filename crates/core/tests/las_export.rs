@@ -49,7 +49,8 @@ fn las_and_laz_keep_attributes_transforms_exclusions_and_crs() {
         &source,
         ImportOptions {
             chunk_points: 32,
-            lod_points: 8,
+            view_grid: 4,
+            view_leaf_points: 32,
             ..Default::default()
         },
         &JobControl::default(),

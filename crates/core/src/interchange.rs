@@ -471,7 +471,7 @@ fn import_e57(
             valid_points: 0,
             omitted_attributes: vec![],
             points_file: format!("{id}.points"),
-            lod_file: format!("{id}.lod"),
+            view_file: format!("{id}.view"),
             chunks: vec![],
             nodes: vec![],
         };
@@ -651,7 +651,7 @@ fn import_las(
         valid_points: 0,
         omitted_attributes: omitted,
         points_file: format!("{id}.points"),
-        lod_file: format!("{id}.lod"),
+        view_file: format!("{id}.view"),
         chunks: vec![],
         nodes: vec![],
     };
@@ -728,7 +728,7 @@ impl Project {
     ) -> Result<()> {
         options.workers()?;
         ensure!(
-            options.chunk_points > 0 && (1..=65_536).contains(&options.lod_points),
+            options.chunk_points > 0 && options.view_grid > 0 && options.view_leaf_points > 0,
             "Invalid import limits"
         );
         job.check()?;
@@ -752,7 +752,7 @@ impl Project {
         for s in &mut scans {
             s.template = format!("{prefix}/{}", s.template);
             s.points_file = format!("{prefix}/{}", s.points_file);
-            s.lod_file = format!("{prefix}/{}", s.lod_file);
+            s.view_file = format!("{prefix}/{}", s.view_file);
         }
         let file = source
             .file_name()
