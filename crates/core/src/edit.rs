@@ -657,6 +657,47 @@ impl Project {
         )
     }
 
+    /// The fraction of each node's points (by index) that no active exclusion
+    /// layer removes, from the layers' per-chunk counts.
+    fn surviving_fractions(&self, scan: &Scan) -> Vec<f64> {
+        let mut excluded = vec![0u64; scan.chunks.len()];
+        for layer in self
+            .manifest
+            .layers
+            .iter()
+            .filter(|l| self.current().layers.contains(&l.id))
+        {
+            for m in layer.masks.iter().filter(|m| m.scan == scan.id) {
+                if let Some(e) = excluded.get_mut(m.chunk as usize) {
+                    *e += m.excluded;
+                }
+            }
+        }
+        // (surviving, total) points below each node.
+        fn count(scan: &Scan, excluded: &[u64], node: usize, out: &mut [(f64, f64)]) -> (f64, f64) {
+            let n = &scan.nodes[node];
+            let mut sums = (0., 0.);
+            if let Some(chunk) = n.chunk {
+                let total = scan.chunks[chunk as usize].count as f64;
+                let gone = (excluded[chunk as usize] as f64).min(total);
+                sums = (total - gone, total);
+            }
+            for &child in &n.children {
+                let (a, b) = count(scan, excluded, child as usize, out);
+                sums.0 += a;
+                sums.1 += b;
+            }
+            out[node] = sums;
+            sums
+        }
+        let mut sums = vec![(0., 0.); scan.nodes.len()];
+        if !scan.nodes.is_empty() {
+            count(scan, &excluded, 0, &mut sums);
+        }
+        sums.iter()
+            .map(|(s, t)| if *t > 0. { s / t } else { 1. })
+            .collect()
+    }
     pub fn load_view(
         &self,
         camera: &Camera,
@@ -678,6 +719,14 @@ impl Project {
         cache.prepare(self);
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
+        // Budget only the samples that survive the active exclusions, so a
+        // heavily cropped or thinned scan is shown from deeper, denser levels.
+        let surviving: Vec<_> = scans.iter().map(|s| self.surviving_fractions(s)).collect();
+        let lod = |si: usize, ni: u32| {
+            let node = &scans[si].nodes[ni as usize];
+            (node.lod_count as f64 * surviving[si][ni as usize]).ceil() as usize
+        };
+        let shown = |si: usize, ni: u32| surviving[si][ni as usize] > 0.;
         let eye = camera.eye();
         let score = |si: usize, ni: u32| {
             let node = &scans[si].nodes[ni as usize];
@@ -696,9 +745,9 @@ impl Project {
         let mut queue = BinaryHeap::new();
         let mut cost = 0usize;
         for (si, scan) in scans.iter().enumerate() {
-            if !scan.nodes.is_empty() && camera.sees(scan, 0, worlds[si]) {
+            if !scan.nodes.is_empty() && shown(si, 0) && camera.sees(scan, 0, worlds[si]) {
                 cut.insert((si, 0u32));
-                cost += scan.nodes[0].lod_count as usize;
+                cost += lod(si, 0);
                 if let Some(candidate) = score(si, 0) {
                     queue.push(candidate);
                 }
@@ -712,14 +761,11 @@ impl Project {
                 .children
                 .iter()
                 .copied()
-                .filter(|id| camera.sees(scan, *id, worlds[si]))
+                .filter(|id| shown(si, *id) && camera.sees(scan, *id, worlds[si]))
                 .map(|id| (si, id))
                 .collect();
-            let next_cost = cost - scan.nodes[ni as usize].lod_count as usize
-                + children
-                    .iter()
-                    .map(|(_, ni)| scan.nodes[*ni as usize].lod_count as usize)
-                    .sum::<usize>();
+            let next_cost =
+                cost - lod(si, ni) + children.iter().map(|(si, ni)| lod(*si, *ni)).sum::<usize>();
             if next_cost > budget {
                 continue;
             }
@@ -734,26 +780,24 @@ impl Project {
         }
         let mut result = Vec::with_capacity(budget.min(2_000_000));
         let mut segments: Vec<ViewSegment> = vec![];
-        let mut remaining_lod: usize = cut
-            .iter()
-            .map(|(si, ni)| scans[*si].nodes[*ni as usize].lod_count as usize)
-            .sum();
+        let mut remaining_lod: usize = cut.iter().map(|(si, ni)| lod(*si, *ni)).sum();
         for (si, ni) in cut {
             job.report(Stage::ViewPoints, result.len() as u64, budget as u64);
             job.check()?;
             let scan = scans[si];
             let node = &scan.nodes[ni as usize];
-            remaining_lod = remaining_lod.saturating_sub(node.lod_count as usize);
+            let node_lod = lod(si, ni);
+            remaining_lod = remaining_lod.saturating_sub(node_lod);
             // Reserve representative points for the rest of the view. Expanding one
             // nearby leaf must not consume the budget of other nodes/scans.
             let available = budget.saturating_sub(result.len());
-            let quota = if remaining_lod + node.lod_count as usize > available {
-                available.saturating_mul(node.lod_count as usize)
-                    / (remaining_lod + node.lod_count as usize).max(1)
+            let quota = if remaining_lod + node_lod > available {
+                available.saturating_mul(node_lod) / (remaining_lod + node_lod).max(1)
             } else {
                 available.saturating_sub(remaining_lod)
             };
-            let full = node.chunk.is_some() && node.point_count as usize <= quota;
+            let survivors = node.point_count as f64 * surviving[si][ni as usize];
+            let full = node.chunk.is_some() && survivors <= quota as f64;
             let samples = cache.samples(self, scan, ni, full, job)?;
             let sample_count = samples.len();
             // `cut` is ordered by scan, so each scan's samples are contiguous.

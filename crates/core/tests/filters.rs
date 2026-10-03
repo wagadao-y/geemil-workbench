@@ -321,3 +321,31 @@ fn statistical_outliers_match_brute_force_regardless_of_chunking() {
     }
     assert_eq!(results[0], results[1]);
 }
+
+#[test]
+fn heavy_exclusions_still_fill_the_view_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = project(dir.path(), "p", 64);
+    let scans = ids(&p);
+    let camera = geemil_core::Camera {
+        target: p.bounds().center().to_array(),
+        distance: p.bounds().radius() * 3.,
+        ..Default::default()
+    };
+    let budget = 400;
+    let before = p
+        .load_view(&camera, budget, &scans, &JobControl::default())
+        .unwrap()
+        .len();
+    assert!(before > budget * 3 / 4, "{before} of {budget}");
+    // Keep about a tenth of the points.
+    p.subsample(0.12, &scans, &JobControl::default()).unwrap();
+    let survivors = surviving(&p).len();
+    assert!(survivors > budget && survivors < 2000, "{survivors}");
+    let after = p
+        .load_view(&camera, budget, &scans, &JobControl::default())
+        .unwrap()
+        .len();
+    // Excluded samples no longer use up the budget (before: about a quarter).
+    assert!(after > budget * 9 / 10, "{after} of {budget}");
+}
