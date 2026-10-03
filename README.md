@@ -111,6 +111,12 @@ CPU側の読み込みは、`view_bench`で同じ周辺を少しずつ回転し�
 cargo run -p geemil-core --release --example view_bench -- work-data/trimble
 ```
 
+選択範囲の除外は`selection_bench`で計測できる。初期の全体表示で画面中央の正方形（第2引数は半幅、0.5で画面全体）を奥行き（第3引数、m）付きで除外する。プロジェクトに除外レイヤーを確定するため、コピーに対して実行する。原解像度チャンクのうち選択範囲・奥行きに入り得ないものは読み込まない。Trimbleの848万点のRelease版で、変更前は範囲によらず約2.4秒、変更後は中央の小範囲で約0.5秒、画面全体・奥行き0.5mで約0.75秒、全点除外で約1.2秒。除外マスクは変更前とbit単位で一致した。
+
+```powershell
+cargo run -p geemil-core --release --example selection_bench -- work-data/trimble-copy 0.05 0.5
+```
+
 開発用のGPU起動テストでは、2秒間カメラを回転・平行移動し、移動中にもノードの更新が完了することを確認して画面を保存する。
 
 ```powershell

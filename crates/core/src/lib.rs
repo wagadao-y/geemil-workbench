@@ -9,7 +9,7 @@ mod parallel;
 mod storage;
 mod view_cache;
 
-pub use edit::{Camera, Projector, Selection};
+pub use edit::{Camera, PreparedSelection, Projector, Selection};
 pub use error::{CoreError, Stage};
 pub use model::*;
 pub use storage::{ImportOptions, JobControl, Sample};

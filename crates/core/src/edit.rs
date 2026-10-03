@@ -1,7 +1,7 @@
 use crate::storage::{position, valid};
-use crate::{ChunkMask, JobControl, Layer, Pose, Project, Sample, Scan, Stage, ViewCache};
+use crate::{Bounds, ChunkMask, JobControl, Layer, Pose, Project, Sample, Scan, Stage, ViewCache};
 use anyhow::{Result, ensure};
-use glam::{DMat4, DVec3};
+use glam::{DMat4, DVec3, DVec4};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeSet, BinaryHeap},
@@ -114,8 +114,41 @@ pub struct Selection {
     pub depth_meters: f64,
 }
 impl Selection {
+    /// View depth of `p` if it projects inside the polygon.
     pub fn contains(&self, p: DVec3) -> Option<f64> {
-        let (uv, depth) = self.camera.project(p)?;
+        self.prepare().contains(p)
+    }
+    /// Computes the camera matrices once, for testing many points.
+    pub fn prepare(&self) -> PreparedSelection<'_> {
+        let mut min = [f64::INFINITY; 2];
+        let mut max = [f64::NEG_INFINITY; 2];
+        for v in &self.polygon {
+            for axis in 0..2 {
+                min[axis] = min[axis].min(v[axis]);
+                max[axis] = max[axis].max(v[axis]);
+            }
+        }
+        PreparedSelection {
+            polygon: &self.polygon,
+            matrix: self.camera.matrix(),
+            projector: self.camera.projector(),
+            min,
+            max,
+        }
+    }
+}
+pub struct PreparedSelection<'a> {
+    polygon: &'a [[f64; 2]],
+    matrix: DMat4,
+    projector: Projector,
+    /// Polygon bounding box in normalized viewport coordinates.
+    min: [f64; 2],
+    max: [f64; 2],
+}
+impl PreparedSelection<'_> {
+    /// Same result as `Selection::contains`.
+    pub fn contains(&self, p: DVec3) -> Option<f64> {
+        let (uv, depth) = self.projector.project(p)?;
         let mut inside = false;
         for i in 0..self.polygon.len() {
             let a = self.polygon[i];
@@ -127,6 +160,32 @@ impl Selection {
             }
         }
         inside.then_some(depth)
+    }
+    /// False only when no point in `bounds` (local coordinates, placed by `world`)
+    /// can be selected at a view depth of at most `max_depth`. Conservative: the
+    /// box is culled only if all corners lie outside one clip-space half-space.
+    pub fn may_contain(&self, bounds: &Bounds, world: DMat4, max_depth: f64) -> bool {
+        // Keep rounding in the corner transforms from culling points on the faces.
+        let margin = DVec3::splat(bounds.radius() * 1e-6 + 1e-9);
+        let padded = Bounds {
+            min: (DVec3::from(bounds.min) - margin).to_array(),
+            max: (DVec3::from(bounds.max) + margin).to_array(),
+        };
+        let m = self.matrix * world;
+        let corners: Vec<_> = padded.corners().map(|p| m * p.extend(1.)).collect();
+        // Viewport u = (x/w + 1) / 2 and v = (1 - y/w) / 2, so for w > 0 the
+        // polygon box is k_min*w <= x <= k_max*w and l_min*w <= y <= l_max*w.
+        let x = [2. * self.min[0] - 1., 2. * self.max[0] - 1.];
+        let y = [1. - 2. * self.max[1], 1. - 2. * self.min[1]];
+        let outside = |test: &dyn Fn(DVec4) -> bool| corners.iter().all(|c| test(*c));
+        !(outside(&|c| c.w <= 0.)
+            || outside(&|c| c.z < 0.)
+            || outside(&|c| c.z > c.w)
+            || outside(&|c| c.w > max_depth)
+            || outside(&|c| c.x < x[0] * c.w)
+            || outside(&|c| c.x > x[1] * c.w)
+            || outside(&|c| c.y < y[0] * c.w)
+            || outside(&|c| c.y > y[1] * c.w))
     }
 }
 pub(crate) fn is_excluded(mask: &[u8], i: usize) -> bool {
@@ -188,17 +247,23 @@ impl Project {
             .filter(|s| scan_ids.contains(&s.id))
             .cloned()
             .collect();
-        let mut nearest = f64::INFINITY;
+        let test = selection.prepare();
         // First pass finds the nearest surviving ORIGINAL point, independent of LOD.
+        // Each chunk keeps its own nearest depth so the second pass can skip it.
+        let mut chunk_nearest = vec![];
         for scan in &scans {
             let world = self.world_matrix(scan);
-            for id in 0..scan.chunks.len() {
+            let mut depths = vec![f64::INFINITY; scan.chunks.len()];
+            for (id, c) in scan.chunks.iter().enumerate() {
                 job.check()?;
                 job.report(
                     Stage::SelectionNearestDepth,
                     id as u64,
                     scan.chunks.len() as u64,
                 );
+                if !test.may_contain(&c.bounds, world, f64::INFINITY) {
+                    continue;
+                }
                 let data = self.read_chunk(scan, id as u32)?;
                 let mask = self.exclusion_mask(scan, id as u32)?;
                 for (i, p) in data.chunks_exact(scan.stride).enumerate() {
@@ -208,16 +273,23 @@ impl Project {
                     if valid(p)
                         && !is_excluded(&mask, i)
                         && let Some(depth) =
-                            selection.contains(world.transform_point3(DVec3::from(position(p))))
+                            test.contains(world.transform_point3(DVec3::from(position(p))))
                     {
-                        nearest = nearest.min(depth);
+                        depths[id] = depths[id].min(depth);
                     }
                 }
             }
+            chunk_nearest.push(depths);
         }
+        let nearest = chunk_nearest
+            .iter()
+            .flatten()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
         if !nearest.is_finite() {
             return Ok(0);
         }
+        let limit = nearest + selection.depth_meters;
         let id = Uuid::new_v4();
         let relative = format!("layers/{id}.mask");
         let tmp = self.root.join("staging").join(format!("{id}.mask"));
@@ -225,7 +297,7 @@ impl Project {
         let mut masks = vec![];
         let mut offset = 0;
         let mut total = 0;
-        for scan in &scans {
+        for (scan, depths) in scans.iter().zip(&chunk_nearest) {
             let world = self.world_matrix(scan);
             for (chunk, c) in scan.chunks.iter().enumerate() {
                 job.check()?;
@@ -234,6 +306,9 @@ impl Project {
                     chunk as u64,
                     scan.chunks.len() as u64,
                 );
+                if depths[chunk] > limit {
+                    continue;
+                }
                 let data = self.read_chunk(scan, chunk as u32)?;
                 let old = self.exclusion_mask(scan, chunk as u32)?;
                 let mut mask = vec![0; (c.count as usize).div_ceil(8)];
@@ -245,8 +320,8 @@ impl Project {
                     if valid(p)
                         && !is_excluded(&old, i)
                         && let Some(depth) =
-                            selection.contains(world.transform_point3(DVec3::from(position(p))))
-                        && depth <= nearest + selection.depth_meters
+                            test.contains(world.transform_point3(DVec3::from(position(p))))
+                        && depth <= limit
                     {
                         mask[i / 8] |= 1 << (i % 8);
                         count += 1;
@@ -456,8 +531,9 @@ impl Project {
 
 #[cfg(test)]
 mod tests {
-    use super::Camera;
-    use glam::DVec3;
+    use super::{Camera, Selection};
+    use crate::Bounds;
+    use glam::{DMat4, DQuat, DVec3};
 
     #[test]
     fn looking_at_keeps_the_eye_and_centres_the_target() {
@@ -477,5 +553,66 @@ mod tests {
         assert!((depth - moved.distance).abs() < 1e-6);
         // Looking at the eye itself has no direction; keep the camera unchanged.
         assert_eq!(camera.looking_at(camera.eye()), camera);
+    }
+
+    #[test]
+    fn chunk_culling_never_skips_a_selectable_point() {
+        // Deterministic pseudo-random values in [0, 1).
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let selection = Selection {
+            camera: Camera {
+                target: [1., 2., 0.5],
+                yaw: 0.4,
+                pitch: 0.5,
+                distance: 12.,
+                aspect: 1.5,
+                ..Camera::default()
+            },
+            polygon: vec![[0.42, 0.40], [0.61, 0.44], [0.55, 0.63], [0.40, 0.58]],
+            depth_meters: 1.,
+        };
+        let test = selection.prepare();
+        let world = DMat4::from_rotation_translation(
+            DQuat::from_rotation_z(0.3),
+            DVec3::new(-2., 1., 0.25),
+        );
+        let (mut kept, mut culled, mut selectable) = (0, 0, 0);
+        for _ in 0..4000 {
+            let center = DVec3::new(next(), next(), next()) * 16. - 8.;
+            let half = DVec3::new(next(), next(), next()) * 1.5 + DVec3::splat(0.01);
+            let bounds = Bounds {
+                min: (center - half).to_array(),
+                max: (center + half).to_array(),
+            };
+            let max_depth = 6. + next() * 10.;
+            let may_contain = test.may_contain(&bounds, world, max_depth);
+            if may_contain {
+                kept += 1;
+            } else {
+                culled += 1;
+            }
+            // Corners, face points and interior samples of every box.
+            for _ in 0..64 {
+                let t = DVec3::new(next(), next(), next()).map(|v| (v * 3.).floor() / 2.);
+                let r = DVec3::new(next(), next(), next());
+                for f in [t, r] {
+                    let local = center - half + 2. * half * f;
+                    let selected = test
+                        .contains(world.transform_point3(local))
+                        .is_some_and(|depth| depth <= max_depth);
+                    assert!(!selected || may_contain, "culled a selectable point");
+                    selectable += selected as u32;
+                }
+            }
+        }
+        assert!(selectable > 100, "only {selectable} selectable samples");
+        // The cull must actually skip most boxes away from the small polygon.
+        assert!(culled > kept, "kept {kept}, culled {culled}");
     }
 }
