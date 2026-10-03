@@ -157,7 +157,9 @@ impl Workbench {
             self.align.item = None;
             return;
         };
-        let item = self.selected.filter(|id| !p.scans_within(*id).is_empty());
+        let item = self
+            .single_tree_item()
+            .filter(|id| !p.scans_within(*id).is_empty());
         if item != self.align.item {
             self.align.clear();
             self.align.item = item;
@@ -557,7 +559,7 @@ impl Workbench {
             .as_ref()
             .and_then(|p| p.scans().next().map(|s| s.id));
         self.selection.tool = Tool::Align;
-        self.selected = first;
+        self.select_tree_item(first);
         self.align_update();
         self.run_icp(ctx);
     }
@@ -573,7 +575,7 @@ impl Workbench {
             return;
         };
         self.selection.tool = Tool::Align;
-        self.selected = Some(first);
+        self.select_tree_item(Some(first));
         self.align_update();
         let world = |id| p.world_matrix(p.scans().find(|s| s.id == id).unwrap());
         let (to_other, from_first) = (world(other).inverse(), world(first));

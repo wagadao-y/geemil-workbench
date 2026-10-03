@@ -15,12 +15,17 @@ pub(super) enum Dialog {
         imports: Vec<PathBuf>,
     },
     Revisions(RevisionsState),
+    Properties {
+        id: Uuid,
+    },
     SaveAs {
         name: String,
     },
     /// Confirms throwing away unsaved changes, then does `then`.
     Discard {
         then: AfterDiscard,
+        /// Restore the revision picker, including its selection, on cancellation.
+        return_to_revisions: Option<RevisionsState>,
     },
     Cleanup,
     RenameGroup {
@@ -34,12 +39,28 @@ pub(super) enum Dialog {
     },
     /// A filter, and the layer it moves points to; none for its default layer.
     Filter(Filter, Option<u8>),
-    ExportLas {
+    Export {
+        format: ExportFormat,
         per_scan: bool,
-        laz: bool,
     },
     Shortcuts,
     About,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExportFormat {
+    E57,
+    Las,
+    Laz,
+}
+impl ExportFormat {
+    pub(super) fn extension(self) -> &'static str {
+        match self {
+            Self::E57 => "e57",
+            Self::Las => "las",
+            Self::Laz => "laz",
+        }
+    }
 }
 /// A point filter and its parameters, as edited in its dialog.
 #[derive(Clone, Copy)]
@@ -107,7 +128,10 @@ enum Outcome {
     RenameGroup(Uuid, String),
     RenameLayer(Option<u8>, String),
     Filter(Filter, Option<u8>),
-    ExportLas { per_scan: bool, laz: bool },
+    Export {
+        format: ExportFormat,
+        per_scan: bool,
+    },
 }
 
 /// Dialog buttons at the bottom right in Windows order: the actions `add`
@@ -129,6 +153,11 @@ impl Workbench {
         let Some(dialog) = &mut self.dialog else {
             return;
         };
+        if let Dialog::Properties { id } = dialog {
+            let id = *id;
+            self.properties_dialog(ctx, id);
+            return;
+        }
         if let Dialog::Revisions(state) = dialog {
             let mut state = std::mem::take(state);
             let keep = self.revisions_dialog(ctx, &mut state);
@@ -201,7 +230,7 @@ impl Workbench {
                         outcome = Outcome::Close;
                     }
                 }
-                Dialog::Discard { then } => {
+                Dialog::Discard { then, .. } => {
                     ui.heading(format!("{} {}", icon::WARNING, t.discard_title));
                     ui.label(t.discard_message);
                     if buttons(ui, t.cancel, |ui| {
@@ -334,22 +363,33 @@ impl Workbench {
                         outcome = Outcome::Close;
                     }
                 }
-                Dialog::ExportLas { per_scan, laz } => {
+                Dialog::Export { format, per_scan } => {
                     ui.heading(format!(
                         "{} {}",
-                        icon::FILE_ARROW_UP,
-                        t.export_las.trim_end_matches('…')
+                        icon::EXPORT,
+                        t.export.trim_end_matches('…')
                     ));
-                    ui.label(t.export_las_message);
+                    ui.label(t.export_message);
                     ui.add_space(6.);
-                    ui.radio_value(per_scan, false, t.export_merged);
-                    ui.radio_value(per_scan, true, t.export_per_scan);
-                    ui.checkbox(laz, t.export_compress);
+                    ui.horizontal(|ui| {
+                        ui.label(t.export_format);
+                        ui.radio_value(format, ExportFormat::E57, "E57");
+                        ui.radio_value(format, ExportFormat::Las, "LAS");
+                        ui.radio_value(format, ExportFormat::Laz, "LAZ");
+                    });
+                    ui.add_space(6.);
+                    if *format == ExportFormat::E57 {
+                        ui.label(t.export_e57_message);
+                    } else {
+                        ui.label(t.export_las_message);
+                        ui.radio_value(per_scan, false, t.export_merged);
+                        ui.radio_value(per_scan, true, t.export_per_scan);
+                    }
                     if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.export_button).clicked() {
-                            outcome = Outcome::ExportLas {
+                            outcome = Outcome::Export {
+                                format: *format,
                                 per_scan: *per_scan,
-                                laz: *laz,
                             };
                         }
                     }) {
@@ -383,7 +423,7 @@ impl Workbench {
                         outcome = Outcome::Close;
                     }
                 }
-                Dialog::Revisions(_) => unreachable!(),
+                Dialog::Revisions(_) | Dialog::Properties { .. } => unreachable!(),
             }
         });
         if matches!(outcome, Outcome::Keep) && response.should_close() {
@@ -391,7 +431,15 @@ impl Workbench {
         }
         match outcome {
             Outcome::Keep => {}
-            Outcome::Close => self.dialog = None,
+            Outcome::Close => {
+                self.dialog = match self.dialog.take() {
+                    Some(Dialog::Discard {
+                        return_to_revisions: Some(state),
+                        ..
+                    }) => Some(Dialog::Revisions(state)),
+                    _ => None,
+                };
+            }
             Outcome::CreateProject(path, imports) => {
                 self.dialog = None;
                 self.create_project(ctx, path, imports);
@@ -431,9 +479,9 @@ impl Workbench {
                 self.dialog = None;
                 self.run_filter(ctx, filter, destination);
             }
-            Outcome::ExportLas { per_scan, laz } => {
+            Outcome::Export { format, per_scan } => {
                 self.dialog = None;
-                self.export_las(ctx, per_scan, laz);
+                self.export(ctx, format, per_scan);
             }
         }
     }

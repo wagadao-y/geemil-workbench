@@ -404,6 +404,7 @@ impl Workbench {
             } else if project.has_unsaved_changes() {
                 self.dialog = Some(Dialog::Discard {
                     then: AfterDiscard::Switch(id),
+                    return_to_revisions: Some(std::mem::take(state)),
                 });
                 return false;
             } else {

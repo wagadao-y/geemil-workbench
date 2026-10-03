@@ -289,7 +289,9 @@ impl Workbench {
     /// The tree selection, if it holds any scans.
     fn boxed_item(&self) -> Option<(std::sync::Arc<Project>, Uuid)> {
         let p = self.project.clone()?;
-        let item = self.selected.filter(|id| !p.scans_within(*id).is_empty())?;
+        let item = self
+            .single_tree_item()
+            .filter(|id| !p.scans_within(*id).is_empty())?;
         Some((p, item))
     }
     fn transforming(&self) -> bool {

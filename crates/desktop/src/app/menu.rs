@@ -53,8 +53,7 @@ impl Workbench {
                     self.menu_item(ui, Action::Discard, &mut chosen);
                     ui.separator();
                     self.menu_item(ui, Action::Import, &mut chosen);
-                    self.menu_item(ui, Action::ExportE57, &mut chosen);
-                    self.menu_item(ui, Action::ExportLas, &mut chosen);
+                    self.menu_item(ui, Action::Export, &mut chosen);
                     ui.separator();
                     self.menu_item(ui, Action::Cleanup, &mut chosen);
                     ui.separator();
@@ -147,13 +146,7 @@ impl Workbench {
         let mut chosen = None;
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
-                for action in [
-                    Action::NewProject,
-                    Action::Open,
-                    Action::Import,
-                    Action::Save,
-                    Action::ExportE57,
-                ] {
+                for action in [Action::Import, Action::Save, Action::Export] {
                     self.tool_button(ui, action, false, &mut chosen);
                 }
                 ui.separator();

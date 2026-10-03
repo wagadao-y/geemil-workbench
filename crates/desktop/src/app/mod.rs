@@ -106,6 +106,7 @@ pub struct Workbench {
     visible: BTreeSet<Uuid>,
     /// The scan or folder selected in the tree.
     selected: Option<Uuid>,
+    tree_selection: tree::TreeSelection,
     layer_counts: layers::LayerCounts,
     settings: Settings,
 
@@ -172,6 +173,7 @@ impl Workbench {
             camera: Camera::default(),
             visible: BTreeSet::new(),
             selected: None,
+            tree_selection: tree::TreeSelection::default(),
             layer_counts: None,
             settings,
             job: None,
@@ -233,8 +235,13 @@ impl Workbench {
             .chain(project.groups().iter().map(|g| g.id))
             .collect();
         carry_scan_state(&mut self.visible, previous.as_deref(), &scans);
-        if !self.selected.is_some_and(|id| items.contains(&id)) {
+        if previous.is_none() {
+            self.tree_selection = tree::TreeSelection::default();
             self.selected = None;
+        }
+        self.tree_selection.retain(&items);
+        if !self.selected.is_some_and(|id| items.contains(&id)) {
+            self.selected = self.tree_selection.first();
         }
         if fit || previous.is_none() {
             frame_bounds(&mut self.camera, &project.bounds());
