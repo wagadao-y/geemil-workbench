@@ -93,9 +93,17 @@ enum Outcome {
     ExportLas { per_scan: bool, laz: bool },
 }
 
-fn buttons(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+/// Dialog buttons at the bottom right in Windows order: the actions `add`
+/// puts, then `cancel` at the far right. Returns whether `cancel` was clicked.
+fn buttons(ui: &mut egui::Ui, cancel: &str, add: impl FnOnce(&mut egui::Ui)) -> bool {
     ui.add_space(8.);
-    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), add);
+    // Right to left: the first button is the rightmost.
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        let cancelled = ui.button(cancel).clicked();
+        add(ui);
+        cancelled
+    })
+    .inner
 }
 
 impl Workbench {
@@ -149,14 +157,13 @@ impl Workbench {
                         ui.small((t.import_after)(imports.len()));
                     }
                     let valid = !name.trim().is_empty() && !path.exists();
-                    buttons(ui, |ui| {
+                    if buttons(ui, t.cancel, |ui| {
                         if ui.add_enabled(valid, egui::Button::new(t.create)).clicked() {
                             outcome = Outcome::CreateProject(path, std::mem::take(imports));
                         }
-                        if ui.button(t.cancel).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    }) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::SaveAs { name } => {
                     ui.heading(format!("{} {}", icon::FLOPPY_DISK, t.save_title));
@@ -168,52 +175,48 @@ impl Workbench {
                             outcome = Outcome::Save(name.clone());
                         }
                     });
-                    buttons(ui, |ui| {
+                    if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.save_button).clicked() {
                             outcome = Outcome::Save(name.clone());
                         }
-                        if ui.button(t.cancel).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    }) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::Discard { then } => {
                     ui.heading(format!("{} {}", icon::WARNING, t.discard_title));
                     ui.label(t.discard_message);
-                    buttons(ui, |ui| {
+                    if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.discard_and_continue).clicked() {
                             outcome = Outcome::Discard(*then);
                         }
-                        if ui.button(t.cancel).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    }) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::Cleanup => {
                     ui.heading(format!("{} {}", icon::BROOM, t.cleanup_title));
                     ui.label(t.cleanup_message);
-                    buttons(ui, |ui| {
+                    if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.cleanup_run).clicked() {
                             outcome = Outcome::Cleanup;
                         }
-                        if ui.button(t.cancel).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    }) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::RenameGroup { id, name } => {
                     ui.heading(format!("{} {}", icon::PENCIL_SIMPLE, t.rename));
                     let edit = ui.add(egui::TextEdit::singleline(name).desired_width(320.));
                     edit.request_focus();
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    buttons(ui, |ui| {
+                    if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.apply).clicked() || enter {
                             outcome = Outcome::RenameGroup(*id, name.clone());
                         }
-                        if ui.button(t.cancel).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    }) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::Filter(filter) => {
                     let (heading, message) = match filter {
@@ -278,14 +281,13 @@ impl Workbench {
                             }
                         });
                     ui.small((t.filter_targets)(visible));
-                    buttons(ui, |ui| {
+                    if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.run).clicked() {
                             outcome = Outcome::Filter(*filter);
                         }
-                        if ui.button(t.cancel).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    }) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::ExportLas { per_scan, laz } => {
                     ui.heading(format!(
@@ -298,17 +300,16 @@ impl Workbench {
                     ui.radio_value(per_scan, false, t.export_merged);
                     ui.radio_value(per_scan, true, t.export_per_scan);
                     ui.checkbox(laz, t.export_compress);
-                    buttons(ui, |ui| {
+                    if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.export_button).clicked() {
                             outcome = Outcome::ExportLas {
                                 per_scan: *per_scan,
                                 laz: *laz,
                             };
                         }
-                        if ui.button(t.cancel).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    }) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::Shortcuts => {
                     ui.heading(format!("{} {}", icon::KEYBOARD, t.shortcuts));
@@ -322,11 +323,9 @@ impl Workbench {
                                 ui.end_row();
                             }
                         });
-                    buttons(ui, |ui| {
-                        if ui.button(t.close).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    if buttons(ui, t.close, |_| {}) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::About => {
                     ui.heading(format!(
@@ -335,11 +334,9 @@ impl Workbench {
                         env!("CARGO_PKG_VERSION")
                     ));
                     ui.label(t.about_text);
-                    buttons(ui, |ui| {
-                        if ui.button(t.close).clicked() {
-                            outcome = Outcome::Close;
-                        }
-                    });
+                    if buttons(ui, t.close, |_| {}) {
+                        outcome = Outcome::Close;
+                    }
                 }
                 Dialog::Revisions(_) => unreachable!(),
             }
