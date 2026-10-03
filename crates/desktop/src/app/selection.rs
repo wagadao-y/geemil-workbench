@@ -221,7 +221,7 @@ impl Workbench {
         if self.job.is_some() {
             return;
         }
-        if !ctx.wants_keyboard_input() {
+        if !ctx.egui_wants_keyboard_input() {
             let (enter, escape, delete) = ctx.input(|i| {
                 (
                     i.key_pressed(egui::Key::Enter),

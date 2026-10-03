@@ -4,8 +4,9 @@ use eframe::egui;
 use glam::DVec3;
 
 impl Workbench {
-    pub(super) fn viewport(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    pub(super) fn viewport(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let ctx = &ui.ctx().clone();
+        egui::CentralPanel::default().show(ui, |ui| {
             self.advance_flight(ctx);
             self.selection_tools(ui, ctx);
             self.display_settings(ui);

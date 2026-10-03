@@ -5,11 +5,12 @@ use glam::DQuat;
 use std::sync::Arc;
 
 impl Workbench {
-    pub(super) fn sidebar(&mut self, ctx: &egui::Context) {
+    pub(super) fn sidebar(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         let t = self.t;
-        egui::SidePanel::left("scans")
-            .default_width(270.)
-            .show(ctx, |ui| {
+        egui::Panel::left("scans")
+            .default_size(270.)
+            .show(ui, |ui| {
                 ui.heading(t.scans);
                 let Some(p) = self.project.clone() else {
                     ui.label(t.no_project_hint);

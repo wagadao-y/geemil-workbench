@@ -30,14 +30,17 @@ Potreeの`src/materials/shaders/pointcloud.vs`の`getRGB()`はRGBにgamma・brig
 
 Workbenchで白っぽく見えた直接の原因は、egui-wgpuへのテクスチャ受け渡しの不整合だった。egui-wgpu 0.31.1の`register_native_texture`は`Rgba8UnormSrgb`を前提とし、`egui.wgsl`はサンプル値をリニアRGBとしてsRGBに変換する。旧実装は`Rgba8Unorm`に入力のsRGB値をそのまま保存していたため、eguiで余分な明るさ変換が入っていた。
 
-修正後の経路:
+egui-wgpu 0.36では前提が逆になり、`register_native_texture`は`Rgba8Unorm`にsRGB符号値を保持したテクスチャを前提とする（`egui.wgsl`は「sRGB非対応の通常のテクスチャ」としてサンプルする）。0.31向けの経路のまま更新すると、暗部が二重にリニア化されて沈んだ（入力8が1として表示）。`--smoke-colors`で検出した。
+
+現在の経路:
 
 ```text
 入力の8bit sRGB
   → 点シェーダーでsRGBからリニアRGBへ変換
-  → Rgba8UnormSrgbへ描画（GPUがsRGBにエンコード）
-  → eguiがテクスチャをサンプル（GPUがリニアRGBへデコード）
-  → eguiの画面出力処理
+  → Rgba8UnormSrgbの描画テクスチャへ描画（GPUがsRGBにエンコード）
+  → EDLパスがtextureLoadで読む（GPUがリニアRGBへデコード）、陰影を掛ける
+  → EDLシェーダーでリニアRGBからsRGB符号値へ変換し、Rgba8Unormの出力テクスチャへ書く
+  → eguiが出力テクスチャをsRGB符号値としてサンプルし、画面出力処理を行う
 ```
 
 alphaはRGBと別に扱い、sRGB変換しない。背景のclear値はリニアRGB。これは表示処理の修正で、既存プロジェクトのRGBにも適用される。

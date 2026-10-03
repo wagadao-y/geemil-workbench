@@ -169,14 +169,15 @@ impl Workbench {
 }
 
 impl eframe::App for Workbench {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        self.smoke_frame(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.smoke_frame(&ctx);
         self.poll_job();
         self.poll_view();
-        self.toolbar(ctx);
-        self.sidebar(ctx);
-        self.status_bar(ctx);
-        self.viewport(ctx, frame);
+        self.toolbar(ui);
+        self.sidebar(ui);
+        self.status_bar(ui);
+        self.viewport(ui, frame);
         self.request_view();
         if self.dirty || self.refine_pending || self.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(33));

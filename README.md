@@ -6,7 +6,7 @@ Windows向けのOSS点群編集アプリ。Rust / egui / wgpuで、原解像度�
 
 ## 起動
 
-WindowsのRust MSVC環境とC++ Build Toolsが必要。開発時の確認環境はRust 1.94.0。初回ビルドは依存ライブラリをダウンロードする。
+WindowsのRust MSVC環境とC++ Build Toolsが必要。Rustの版はリポジトリの`rust-toolchain.toml`で固定している（現在1.99.0、egui 0.36の要件は1.95以上）。rustupが自動で取得する。初回ビルドは依存ライブラリをダウンロードする。
 
 ```powershell
 cargo run -p geemil-desktop --release

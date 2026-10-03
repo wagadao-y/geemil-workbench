@@ -2,9 +2,9 @@ use super::Workbench;
 use eframe::egui;
 
 impl Workbench {
-    pub(super) fn status_bar(&mut self, ctx: &egui::Context) {
+    pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
         let t = self.t;
-        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+        egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 if let Some(job) = &self.job {

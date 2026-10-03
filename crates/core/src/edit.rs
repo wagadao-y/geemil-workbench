@@ -44,12 +44,17 @@ impl Camera {
         self.relative_matrix() * DMat4::from_translation(-DVec3::from(self.target))
     }
     pub fn relative_matrix(&self) -> DMat4 {
-        DMat4::perspective_rh(
+        // Right-handed with a 0..1 depth range, as wgpu expects.
+        glam::dcamera::rh::proj::directx::perspective(
             self.fov,
             self.aspect,
             (self.distance * 1e-5).max(0.0001),
             (self.distance * 1000.).max(100.),
-        ) * DMat4::look_at_rh(self.eye() - DVec3::from(self.target), DVec3::ZERO, DVec3::Z)
+        ) * glam::dcamera::rh::view::look_at_mat4(
+            self.eye() - DVec3::from(self.target),
+            DVec3::ZERO,
+            DVec3::Z,
+        )
     }
     /// Projects to normalized viewport coordinates (origin top left) and view depth.
     pub fn project(&self, p: DVec3) -> Option<([f64; 2], f64)> {

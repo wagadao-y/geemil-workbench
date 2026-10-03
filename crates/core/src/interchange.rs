@@ -589,44 +589,50 @@ fn import_las(
     let mut out = BufWriter::new(File::create(&spool)?);
     let mut bounds: Option<Bounds> = None;
     let mut count = 0;
-    for point in reader.points() {
-        if count % 8192 == 0 {
-            job.check()?;
-            job.report(Stage::ReadingLas, count, scan.records);
+    let mut batch = las::PointDataBuilder::new()
+        .for_header(reader.header())
+        .build();
+    loop {
+        job.check()?;
+        job.report(Stage::ReadingLas, count, scan.records);
+        if reader.fill_points(8192, &mut batch)? == 0 {
+            break;
         }
-        let point = point?;
-        let p = [point.x, point.y, point.z];
-        ensure!(
-            p.iter().all(|v| v.is_finite()),
-            "LAS has non-finite coordinates"
-        );
-        let mut raw = vec![
-            RecordValue::Double(p[0]),
-            RecordValue::Double(p[1]),
-            RecordValue::Double(p[2]),
-            RecordValue::Integer(point.intensity as i64),
-        ];
-        let mut color = [180, 195, 210, 255];
-        if header.point_format().has_color {
-            let c = point.color.unwrap_or_default();
-            raw.extend([
-                RecordValue::Integer(c.red as i64),
-                RecordValue::Integer(c.green as i64),
-                RecordValue::Integer(c.blue as i64),
-            ]);
-            color = [
-                (c.red >> 8) as u8,
-                (c.green >> 8) as u8,
-                (c.blue >> 8) as u8,
-                255,
+        for point in batch.points() {
+            let point = point?;
+            let p = [point.x, point.y, point.z];
+            ensure!(
+                p.iter().all(|v: &f64| v.is_finite()),
+                "LAS has non-finite coordinates"
+            );
+            let mut raw = vec![
+                RecordValue::Double(p[0]),
+                RecordValue::Double(p[1]),
+                RecordValue::Double(p[2]),
+                RecordValue::Integer(point.intensity as i64),
             ];
+            let mut color = [180, 195, 210, 255];
+            if header.point_format().has_color {
+                let c = point.color.unwrap_or_default();
+                raw.extend([
+                    RecordValue::Integer(c.red as i64),
+                    RecordValue::Integer(c.green as i64),
+                    RecordValue::Integer(c.blue as i64),
+                ]);
+                color = [
+                    (c.red >> 8) as u8,
+                    (c.green >> 8) as u8,
+                    (c.blue >> 8) as u8,
+                    255,
+                ];
+            }
+            out.write_all(&make_record(p, color, true, &encode(&raw)))?;
+            match &mut bounds {
+                Some(b) => b.include(p),
+                None => bounds = Some(Bounds::at(p)),
+            };
+            count += 1;
         }
-        out.write_all(&make_record(p, color, true, &encode(&raw)))?;
-        match &mut bounds {
-            Some(b) => b.include(p),
-            None => bounds = Some(Bounds::at(p)),
-        };
-        count += 1;
     }
     ensure!(count == scan.records, "LAS point count mismatch");
     scan.valid_points = count;

@@ -3,9 +3,10 @@ use eframe::egui;
 use geemil_core::{ImportOptions, Project};
 
 impl Workbench {
-    pub(super) fn toolbar(&mut self, ctx: &egui::Context) {
+    pub(super) fn toolbar(&mut self, ui: &mut egui::Ui) {
+        let ctx = &ui.ctx().clone();
         let t = self.t;
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("Geemil Workbench");
                 ui.separator();

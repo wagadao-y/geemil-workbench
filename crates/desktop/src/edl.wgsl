@@ -12,12 +12,20 @@ struct Edl { radius: f32, strength: f32, padding: vec2<f32> };
     return vec4(uv * 2.0 - 1.0, 0.0, 1.0);
 }
 
+// The output is a plain Rgba8Unorm texture that egui samples as sRGB code values.
+fn srgb_from_linear(rgb: vec3<f32>) -> vec3<f32> {
+    let low = rgb * 12.92;
+    let high = 1.055 * pow(rgb, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(high, low, rgb <= vec3<f32>(0.0031308));
+}
+
 @fragment fn fragment(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let pixel = vec2<i32>(position.xy);
+    // Linear RGB: the scene target is sRGB-encoded and decoded on load.
     let base = textureLoad(color, pixel, 0);
     let w = textureLoad(depth, pixel, 0).r;
     if w <= 0.0 || edl.strength <= 0.0 {
-        return base;
+        return vec4(srgb_from_linear(base.rgb), base.a);
     }
     let center = log2(w);
     let size = vec2<i32>(textureDimensions(depth));
@@ -33,5 +41,5 @@ struct Edl { radius: f32, strength: f32, padding: vec2<f32> };
         }
     }
     let shade = exp(-sum / 8.0 * 300.0 * edl.strength);
-    return vec4(base.rgb * shade, base.a);
+    return vec4(srgb_from_linear(base.rgb * shade), base.a);
 }
