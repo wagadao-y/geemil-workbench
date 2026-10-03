@@ -1,9 +1,38 @@
+// A GUI program: Windows opens no console window for it.
+#![windows_subsystem = "windows"]
+
 mod app;
 mod i18n;
 mod render;
 
+/// Smoke tests report on stderr. Started from a terminal without redirection,
+/// a GUI program has no stderr, so borrow the terminal's console.
+#[cfg(windows)]
+fn attach_parent_console() {
+    const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    unsafe extern "system" {
+        fn GetStdHandle(handle: u32) -> *mut std::ffi::c_void;
+        fn AttachConsole(process: u32) -> i32;
+    }
+    // SAFETY: plain Win32 calls without pointers passed in. Redirected
+    // output (a pipe or file) already has a handle and is left alone.
+    unsafe {
+        if GetStdHandle(STD_ERROR_HANDLE).is_null() {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
+    #[cfg(windows)]
+    if args
+        .iter()
+        .any(|a| a.to_string_lossy().starts_with("--smoke"))
+    {
+        attach_parent_console();
+    }
     let project = args
         .first()
         .filter(|a| !a.to_string_lossy().starts_with("--"))

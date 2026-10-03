@@ -20,7 +20,7 @@ cargo run -p geemil-desktop --release -- work-data/trimble
 
 WindowsではDirectX 12を既定とする。`WGPU_BACKEND`環境変数でバックエンドを指定できる。画面の日本語フォントはWindowsのメイリオ／游ゴシックを使用し、配布物には同梱しない。
 
-配布物は`cargo build -p geemil-desktop --release`で作る`target/release/geemil-desktop.exe`の1ファイルだけでよい。`.cargo/config.toml`でCランタイムを静的リンクしているため、Visual C++再頒布可能パッケージは不要で、Windows標準以外のDLLに依存しない。CLIが必要な場合は`geemil.exe`も添える。`target`のそれ以外の中身はビルド用の中間生成物で、配布しない。
+配布物は`cargo build -p geemil-desktop --release`で作る`target/release/geemil-desktop.exe`の1ファイルだけでよい。`.cargo/config.toml`でCランタイムを静的リンクしているため、Visual C++再頒布可能パッケージは不要で、Windows標準以外のDLLに依存しない。CLIが必要な場合は`geemil.exe`も添える。`target`のそれ以外の中身はビルド用の中間生成物で、配布しない。GUIアプリとしてビルドするため、起動してもコンソールウィンドウは開かない。スモークテストの出力は、リダイレクトしていればそこへ、ターミナルから直接実行した場合はそのターミナルへ出る。
 
 ## 操作
 
