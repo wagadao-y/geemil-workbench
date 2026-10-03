@@ -198,7 +198,7 @@ impl Workbench {
         Some(
             self.points_segments
                 .iter()
-                .filter(|s| self.visible.contains(&s.scan))
+                .filter(|s| self.visible.contains(&s.scan) && !self.align_hides(s.scan))
                 .filter_map(|s| {
                     let scan = project.scans().find(|scan| scan.id == s.scan)?;
                     let world = match preview {

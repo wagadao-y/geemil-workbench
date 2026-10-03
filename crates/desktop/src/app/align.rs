@@ -19,6 +19,8 @@ const REFERENCE: egui::Color32 = egui::Color32::from_rgb(70, 170, 255);
 struct Pick {
     scan: Uuid,
     local: DVec3,
+    /// Increases with every pick, so the latest can be taken back.
+    order: u64,
 }
 #[derive(Default)]
 struct Pair {
@@ -40,6 +42,15 @@ pub(super) struct Align {
     icp: Option<mpsc::Receiver<IcpResult>>,
     /// Colour the moved and the reference points apart.
     tint: bool,
+    /// Which side to show, so a point hidden behind the other side can be picked.
+    show: Show,
+    picks: u64,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Show {
+    Both,
+    Moving,
+    Reference,
 }
 impl Default for Align {
     fn default() -> Self {
@@ -50,6 +61,8 @@ impl Default for Align {
             report: None,
             icp: None,
             tint: true,
+            show: Show::Both,
+            picks: 0,
         }
     }
 }
@@ -95,6 +108,34 @@ impl Workbench {
             return None;
         }
         Some((self.align.item?, self.align.preview?))
+    }
+    /// Whether the registration tool hides this scan for picking.
+    pub(super) fn align_hides(&self, scan: Uuid) -> bool {
+        let Some(p) = self.project.as_ref().filter(|_| self.aligning()) else {
+            return false;
+        };
+        let Some(item) = self.align.item else {
+            return false;
+        };
+        let moving = p.scans_within(item).contains(&scan);
+        match self.align.show {
+            Show::Both => false,
+            Show::Moving => !moving,
+            Show::Reference => moving,
+        }
+    }
+    /// Takes back the most recent pick (Backspace).
+    pub(super) fn align_undo_pick(&mut self) {
+        let pairs = &mut self.align.pairs;
+        let latest = pairs
+            .iter_mut()
+            .flat_map(|pair| [&mut pair.moving, &mut pair.reference])
+            .filter(|slot| slot.is_some())
+            .max_by_key(|slot| slot.map_or(0, |p| p.order));
+        if let Some(slot) = latest {
+            *slot = None;
+        }
+        pairs.retain(|pair| pair.moving.is_some() || pair.reference.is_some());
     }
     pub(super) fn align_tint(&self, scan: Uuid) -> [f32; 4] {
         let Some(p) = self
@@ -169,6 +210,7 @@ impl Workbench {
                 let pick = || Pick {
                     scan: segment.scan,
                     local: segment.loaded_to_local.transform_point3(loaded),
+                    order: 0,
                 };
                 if d2 <= radius * radius {
                     if covering.as_ref().is_none_or(|(best, _)| depth < *best) {
@@ -179,9 +221,11 @@ impl Workbench {
                 }
             }
         }
-        let Some((_, pick)) = covering.or(closest) else {
+        let Some((_, mut pick)) = covering.or(closest) else {
             return;
         };
+        self.align.picks += 1;
+        pick.order = self.align.picks;
         let Some(p) = self.project.clone() else {
             return;
         };
@@ -322,6 +366,12 @@ impl Workbench {
                         ui.end_row();
                     });
                 ui.checkbox(&mut self.align.tint, t.align_tint);
+                ui.horizontal(|ui| {
+                    ui.label(t.align_show);
+                    ui.selectable_value(&mut self.align.show, Show::Both, t.align_show_both);
+                    ui.selectable_value(&mut self.align.show, Show::Moving, t.align_moving);
+                    ui.selectable_value(&mut self.align.show, Show::Reference, t.align_reference);
+                });
                 ui.separator();
 
                 ui.strong(t.align_pairs);
@@ -546,10 +596,15 @@ impl Workbench {
                 .transform_point3(DVec3::from(sample.position));
             let reference = to_other.transform_point3(from_first.transform_point3(local));
             self.align.pairs.push(Pair {
-                moving: Some(Pick { scan: first, local }),
+                moving: Some(Pick {
+                    scan: first,
+                    local,
+                    order: 0,
+                }),
                 reference: Some(Pick {
                     scan: other,
                     local: reference,
+                    order: 0,
                 }),
             });
         }

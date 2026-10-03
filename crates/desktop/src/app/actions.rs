@@ -244,6 +244,12 @@ impl Workbench {
         if !typing && ctx.input(|i| i.key_pressed(Key::Enter)) {
             self.selection.close_polygon();
         }
+        if !typing
+            && self.selection.tool == Tool::Align
+            && ctx.input(|i| i.key_pressed(Key::Backspace))
+        {
+            self.align_undo_pick();
+        }
     }
     pub(super) fn perform(&mut self, ctx: &egui::Context, action: Action) {
         let t = self.t;
