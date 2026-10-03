@@ -219,3 +219,62 @@ fn cleanup_removes_only_data_no_state_refers_to() {
     }
     assert_eq!(p.scans().count(), 2);
 }
+
+#[test]
+fn edits_rewrite_only_the_history_and_format_3_still_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    let root = p.root.clone();
+    let manifest = std::fs::read_to_string(root.join("project.json")).unwrap();
+    assert!(!manifest.contains("\"chunks\""), "chunk metadata in project.json");
+    let scan_files: Vec<_> = p
+        .scans()
+        .map(|s| root.join(s.points_file.replace(".points", ".scan.json")))
+        .collect();
+    let stamps: Vec<_> = scan_files
+        .iter()
+        .map(|f| std::fs::metadata(f).unwrap().modified().unwrap())
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let id = p.scans().next().unwrap().id;
+    p.set_transform(id, shift(0.5)).unwrap();
+    exclude_everything(&mut p);
+    let layer = p.manifest.layers[0].clone();
+    assert!(root.join(format!("layers/{}.json", layer.id)).is_file());
+    for (file, stamp) in scan_files.iter().zip(&stamps) {
+        assert_eq!(std::fs::metadata(file).unwrap().modified().unwrap(), *stamp);
+    }
+    let reopened = Project::load(&root).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reopened.manifest).unwrap(),
+        serde_json::to_value(&p.manifest).unwrap()
+    );
+
+    // A format 3 project keeps everything inline; it opens and saves as 4.
+    let mut legacy = serde_json::to_value(&p.manifest).unwrap();
+    legacy["format_version"] = 3.into();
+    std::fs::write(root.join("project.json"), legacy.to_string()).unwrap();
+    for file in &scan_files {
+        std::fs::remove_file(file).unwrap();
+    }
+    let mut old = Project::load(&root).unwrap();
+    assert_eq!(old.manifest.scans.len(), p.manifest.scans.len());
+    old.save().unwrap();
+    assert!(scan_files.iter().all(|f| f.is_file()));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &std::fs::read_to_string(root.join("project.json")).unwrap()
+        )
+        .unwrap()["format_version"],
+        4
+    );
+
+    // Cleanup removes the metadata of data nothing uses any more.
+    old.set_layer_enabled(layer.id, false).unwrap();
+    old.discard_changes().unwrap();
+    let layer_file = root.join(format!("layers/{}.json", layer.id));
+    assert!(layer_file.is_file());
+    old.cleanup().unwrap();
+    assert!(!layer_file.is_file());
+    assert!(Project::load(&root).is_ok());
+}

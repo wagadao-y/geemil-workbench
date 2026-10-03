@@ -11,7 +11,10 @@ use std::{
 use uuid::Uuid;
 
 /// 3 adds the unsaved working state (`Manifest::draft`) and the scan tree.
-pub const FORMAT_VERSION: u32 = 3;
+/// 4 moves scan and layer metadata, which never change once written, out of
+/// `project.json` into files of their own; saving an edit then writes only
+/// the small history. Versions up to 3 still load and are saved as 4.
+pub const FORMAT_VERSION: u32 = 4;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct Bounds {
@@ -266,6 +269,37 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<Revision>,
 }
+/// `project.json` from format 4: scans and layers are referenced by the
+/// project-relative paths of their metadata files.
+#[derive(Serialize, Deserialize)]
+struct ManifestFile {
+    format_version: u32,
+    name: String,
+    scans: Vec<String>,
+    images: Vec<ImageInfo>,
+    layers: Vec<String>,
+    revisions: Vec<Revision>,
+    current: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft: Option<Revision>,
+}
+/// Where a scan's metadata lives: next to its points.
+pub(crate) fn scan_metadata_path(scan: &Scan) -> String {
+    let stem = scan
+        .points_file
+        .strip_suffix(".points")
+        .unwrap_or(&scan.points_file);
+    format!("{stem}.scan.json")
+}
+/// Where a layer's metadata lives: next to its mask.
+pub(crate) fn layer_metadata_path(layer: &Layer) -> String {
+    let stem = layer
+        .mask_file
+        .strip_suffix(".mask")
+        .unwrap_or(&layer.mask_file);
+    format!("{stem}.json")
+}
+
 #[derive(Clone, Debug)]
 pub struct Project {
     pub root: PathBuf,
@@ -312,13 +346,62 @@ impl Project {
             CoreError::NotAProject(root.to_owned())
         );
         let root = fs::canonicalize(root)?;
-        let manifest: Manifest =
-            serde_json::from_reader(fs::File::open(root.join("project.json"))?)
+        let value: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("project.json"))?)
                 .context("Invalid project metadata")?;
+        let version = value
+            .get("format_version")
+            .and_then(|v| v.as_u64())
+            .context("Invalid project metadata")? as u32;
         ensure!(
-            (1..=FORMAT_VERSION).contains(&manifest.format_version),
-            CoreError::UnsupportedProjectFormat(manifest.format_version)
+            (1..=FORMAT_VERSION).contains(&version),
+            CoreError::UnsupportedProjectFormat(version)
         );
+        let manifest = if version < 4 {
+            serde_json::from_value(value).context("Invalid project metadata")?
+        } else {
+            let file: ManifestFile =
+                serde_json::from_value(value).context("Invalid project metadata")?;
+            let read = |relative: &str| -> Result<Vec<u8>> {
+                let p = Path::new(relative);
+                ensure!(
+                    !p.as_os_str().is_empty()
+                        && p.components().all(|c| matches!(c, Component::Normal(_))),
+                    "Invalid project asset path"
+                );
+                fs::read(root.join(p)).with_context(|| format!("Reading {relative}"))
+            };
+            let mut scans = vec![];
+            for path in &file.scans {
+                let scan: Scan = serde_json::from_slice(&read(path)?)
+                    .with_context(|| format!("Invalid scan metadata {path}"))?;
+                ensure!(
+                    scan_metadata_path(&scan) == *path,
+                    "Misplaced scan metadata"
+                );
+                scans.push(scan);
+            }
+            let mut layers = vec![];
+            for path in &file.layers {
+                let layer: Layer = serde_json::from_slice(&read(path)?)
+                    .with_context(|| format!("Invalid layer metadata {path}"))?;
+                ensure!(
+                    layer_metadata_path(&layer) == *path,
+                    "Misplaced layer metadata"
+                );
+                layers.push(layer);
+            }
+            Manifest {
+                format_version: version,
+                name: file.name,
+                scans,
+                images: file.images,
+                layers,
+                revisions: file.revisions,
+                current: file.current,
+                draft: file.draft,
+            }
+        };
         ensure!(
             manifest.revisions.iter().any(|r| r.id == manifest.current),
             "Current revision is missing"
@@ -347,17 +430,62 @@ impl Project {
         }
         Ok(result)
     }
+    /// Writes `project.json`, after the metadata of any scan or layer that has
+    /// no file yet. Those never change once written, so an edit writes only
+    /// the history.
     pub fn save(&self) -> Result<()> {
+        let m = &self.manifest;
+        let scans: Vec<_> = m.scans.iter().map(scan_metadata_path).collect();
+        let layers: Vec<_> = m.layers.iter().map(layer_metadata_path).collect();
+        for (scan, path) in m.scans.iter().zip(&scans) {
+            self.write_once(path, scan)?;
+        }
+        for (layer, path) in m.layers.iter().zip(&layers) {
+            self.write_once(path, layer)?;
+        }
+        let file = ManifestFile {
+            format_version: FORMAT_VERSION,
+            name: m.name.clone(),
+            scans,
+            images: m.images.clone(),
+            layers,
+            revisions: m.revisions.clone(),
+            current: m.current,
+            draft: m.draft.clone(),
+        };
+        self.write_atomic(Path::new("project.json"), |f| {
+            serde_json::to_writer_pretty(&mut *f, &file)?;
+            f.write_all(b"\n")?;
+            Ok(())
+        })
+    }
+    /// Writes `value` to `relative` unless the file exists.
+    fn write_once(&self, relative: &str, value: &impl Serialize) -> Result<()> {
+        let path = self.path(relative)?;
+        if path.is_file() {
+            return Ok(());
+        }
+        self.write_atomic(&path, |f| Ok(serde_json::to_writer(f, value)?))
+    }
+    /// Writes a file through a temporary file in the project root and renames
+    /// it into place, so a crash never leaves it half written.
+    fn write_atomic(
+        &self,
+        path: &Path,
+        write: impl FnOnce(&mut fs::File) -> Result<()>,
+    ) -> Result<()> {
         let tmp = self.root.join(format!("project-{}.tmp", Uuid::new_v4()));
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)?;
-        serde_json::to_writer_pretty(&mut f, &self.manifest)?;
-        f.write_all(b"\n")?;
-        f.sync_all()?;
+        let written = write(&mut f).and_then(|_| Ok(f.sync_all()?));
         drop(f);
-        fs::rename(tmp, self.root.join("project.json"))?;
+        if let Err(e) = written {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        fs::rename(tmp, self.root.join(path))?;
         Ok(())
     }
     /// The state everything reads: the working state, else the current revision.

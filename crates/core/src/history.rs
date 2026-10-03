@@ -221,9 +221,11 @@ impl Project {
         let mut referenced = BTreeSet::new();
         for s in &self.manifest.scans {
             referenced.extend([&s.template, &s.points_file, &s.lod_file].map(|p| p.clone()));
+            referenced.insert(crate::model::scan_metadata_path(s));
         }
         for l in &self.manifest.layers {
             referenced.insert(l.mask_file.clone());
+            referenced.insert(crate::model::layer_metadata_path(l));
         }
         let remove = |path: &std::path::Path, report: &mut CleanupReport| -> Result<()> {
             let (files, bytes) = measure(path)?;
@@ -253,7 +255,9 @@ impl Project {
                 let file = file?;
                 let file_name = file.file_name().to_string_lossy().into_owned();
                 let unused = !referenced.contains(&format!("{prefix}{file_name}"));
-                let scan_asset = file_name.ends_with(".points") || file_name.ends_with(".lod");
+                let scan_asset = [".points", ".lod", ".scan.json"]
+                    .iter()
+                    .any(|ext| file_name.ends_with(ext));
                 if unused && scan_asset {
                     remove(&file.path(), &mut report)?;
                 }
