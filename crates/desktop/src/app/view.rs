@@ -196,42 +196,37 @@ fn load(
         Ok(picks) => picks,
         Err(e) => return Outcome::Failed(e),
     };
-    let (cached, missing): (Vec<_>, Vec<_>) = picks
-        .into_iter()
-        .partition(|p| p.quota.is_some() || cache.contains(project, p.scan, p.node));
-    let mut nodes = Vec::with_capacity(cached.len() + missing.len());
-    for pick in &cached {
-        match project.view_node(pick, &job, cache) {
-            Ok(node) => nodes.push(node),
-            Err(e) => return Outcome::Failed(e),
-        }
-    }
+    let mut nodes = Vec::with_capacity(picks.len());
+    let mut newer_request = None;
     let mut last = Instant::now();
-    if !missing.is_empty() {
-        partial(nodes.clone());
-    }
-    for pick in &missing {
+    let result = project.load_view_nodes(&picks, cache, &job, 0, |node| {
         if epoch.load(Ordering::Relaxed) != request.epoch {
-            return Outcome::Stale;
+            job.cancel.store(true, Ordering::Relaxed);
+            job.check()?;
         }
         if let Ok(mut newer) = requests.try_recv() {
             while let Ok(new) = requests.try_recv() {
                 newer = new;
             }
-            return Outcome::Superseded(newer);
+            newer_request = Some(newer);
+            job.cancel.store(true, Ordering::Relaxed);
+            job.check()?;
         }
-        job.report(geemil_core::Stage::ViewPoints, 0, 0);
-        match project.view_node(pick, &job, cache) {
-            Ok(node) => nodes.push(node),
-            Err(e) if is_cancelled(&e) => return Outcome::Stale,
-            Err(e) => return Outcome::Failed(e),
-        }
+        nodes.push(node);
         if last.elapsed() >= PARTIAL_EVERY {
             partial(nodes.clone());
             last = Instant::now();
         }
+        Ok(())
+    });
+    if let Some(newer) = newer_request {
+        return Outcome::Superseded(newer);
     }
-    Outcome::Done(nodes)
+    match result {
+        Ok(()) => Outcome::Done(nodes),
+        Err(e) if is_cancelled(&e) => Outcome::Stale,
+        Err(e) => Outcome::Failed(e),
+    }
 }
 
 impl Workbench {
@@ -262,6 +257,7 @@ impl Workbench {
         {
             self.dirty = false;
             self.last_request = Instant::now();
+            self.smoke.view_requested();
         }
     }
     pub(super) fn poll_view(&mut self) {
@@ -276,7 +272,7 @@ impl Workbench {
                     self.view.shown = result.serial;
                     let moving = self.last_motion.elapsed() < Duration::from_millis(150);
                     let points = nodes.iter().map(|n| n.samples.len()).sum();
-                    self.smoke.view_loaded(moving, points);
+                    self.smoke.view_loaded(moving, points, result.partial);
                     self.nodes = nodes;
                     self.points_generation += 1;
                     self.update_height_range();

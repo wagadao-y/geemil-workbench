@@ -27,6 +27,103 @@ fn fixture(root: &std::path::Path) -> Project {
     p
 }
 
+#[test]
+fn parallel_view_matches_serial_with_hidden_layers_quotas_and_cache_reuse() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = fixture(dir.path());
+    let camera = Camera {
+        target: p.bounds().center().to_array(),
+        distance: p.bounds().radius() * 3.,
+        ..Camera::default()
+    };
+    let ids: Vec<_> = p.scans().map(|s| s.id).collect();
+    let job = JobControl::default();
+    for hidden in [false, true] {
+        if hidden {
+            p.move_selection(
+                &Selection {
+                    camera,
+                    polygon: vec![[0., 0.], [0.5, 0.], [0.5, 1.], [0., 1.]],
+                    depth_meters: None,
+                    mode: SelectionMode::ExcludeInside,
+                },
+                &ids,
+                &p.layer_named("Deleted"),
+                &job,
+            )
+            .unwrap();
+        }
+        let project = Arc::new(p.clone());
+        for budget in [20, 100_000] {
+            let picks = project.select_view(&camera, budget, &ids, &job).unwrap();
+            let mut serial_cache = ViewCache::new(16 * 1024 * 1024);
+            let expected: Vec<_> = picks
+                .iter()
+                .map(|pick| {
+                    let node = project.view_node(pick, &job, &mut serial_cache).unwrap();
+                    (node.scan, node.node, node.samples)
+                })
+                .collect();
+            let mut cache = ViewCache::new(16 * 1024 * 1024);
+            for _ in 0..2 {
+                let mut actual = vec![];
+                project
+                    .load_view_nodes(&picks, &mut cache, &job, 4, |node| {
+                        actual.push((node.scan, node.node, node.samples));
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(expected, actual);
+            }
+            assert_eq!(cache.stats().misses, picks.len() as u64);
+            assert_eq!(cache.stats().hits, picks.len() as u64);
+        }
+    }
+}
+
+#[test]
+fn parallel_view_stops_after_cancellation_and_reports_missing_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = Arc::new(fixture(dir.path()));
+    let picks: Vec<_> = project
+        .scans()
+        .flat_map(|s| {
+            (0..s.nodes.len() as u32).map(|node| geemil_core::ViewPick {
+                scan: s.id,
+                node,
+                quota: None,
+            })
+        })
+        .collect();
+    let job = JobControl::default();
+    let mut received = 0;
+    let error = project
+        .load_view_nodes(&picks, &mut ViewCache::new(0), &job, 4, |_| {
+            received += 1;
+            job.cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<geemil_core::CoreError>(),
+        Some(geemil_core::CoreError::Cancelled)
+    ));
+    assert_eq!(received, 1);
+    let scan = project.scans().next().unwrap();
+    std::fs::remove_file(project.root.join(&scan.view_file)).unwrap();
+    assert!(
+        project
+            .load_view_nodes(
+                &picks,
+                &mut ViewCache::new(0),
+                &JobControl::default(),
+                4,
+                |_| Ok(())
+            )
+            .is_err()
+    );
+}
+
 fn assert_same_storage(left: &Project, right: &Project) {
     assert_eq!(left.manifest.scans.len(), right.manifest.scans.len());
     assert_eq!(left.manifest.images.len(), right.manifest.images.len());

@@ -171,6 +171,8 @@ cargo run -p geemil-core --release --example import_bench -- Trimble_StSulpice-C
 
 CPU側の読み込みは、`view_bench`で同じ周辺を少しずつ回転して計測できる。GPU転送・描画は含まない。Trimbleの約20万点では、導入前のDebug版が毎回約122〜131ms、キャッシュ導入後のDebug版は再利用時約7〜9ms。圧縮後のRelease版は初回約21ms、再利用時約1.5〜1.8msだった。ディスク読み込み・展開・座標変換の初回コストは残る。DebugとReleaseの数字を同じ条件の高速化率として比較しない。
 
+表示用ノードの読み込み・解凍・点への復元は、CPU数−1（最大8）のワーカーで並列化する。処理中・完了待ちのノードと展開用の一時メモリには256 MiBの上限を設け、キャッシュ済みノードを先に表示する。全レイヤー表示時は点ごとの非表示判定を省く。`view_bench PROJECT BUDGET WORKERS`のWORKERSは0で自動、1で直列。ノード選択と読み込み時間を別々に出力する。Manitouの326ノード・約110万点では、Release版の初回CPU読み込みが変更前の約143msから自動ワーカーで約24〜34msになった（ディスクキャッシュの影響を含む）。GUI自動テストはCPU結果受信までと全GPU転送の投入までを記録し、GPU処理完了・画面への提示時間とは区別する。
+
 ```powershell
 cargo run -p geemil-core --release --example view_bench -- work-data/trimble
 ```

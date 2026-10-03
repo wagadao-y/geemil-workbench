@@ -45,7 +45,9 @@ impl Workbench {
                         .flatten(),
                 },
             );
+            let points = nodes.iter().map(|n| n.samples.len()).sum();
             drop(nodes);
+            self.smoke.view_rendered(renderer.pending(), points);
             self.renderer = Some(renderer);
             let response =
                 ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));

@@ -1,10 +1,11 @@
 use crate::layers::{LabelWriter, is_set};
+use crate::parallel::OrderedPool;
 use crate::storage::{position, valid};
 use crate::{Bounds, JobControl, LayerTarget, Pose, Project, Sample, Scan, Stage, ViewCache};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3, DVec4};
 use serde::{Deserialize, Serialize};
-use std::collections::BinaryHeap;
+use std::{collections::BinaryHeap, sync::Arc};
 use uuid::Uuid;
 
 /// A display octree node chosen for a view, in priority order.
@@ -642,18 +643,116 @@ impl Project {
             .scans()
             .find(|s| s.id == pick.scan)
             .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
-        let mut samples = cache.samples(self, scan, pick.node, job)?;
+        let samples = cache.samples(self, scan, pick.node, job)?;
+        Ok(Self::loaded_node(pick, samples))
+    }
+
+    fn loaded_node(pick: &ViewPick, mut samples: Arc<[Sample]>) -> LoadedNode {
         if let Some(q) = pick.quota.filter(|q| *q < samples.len()) {
             // Spread over the whole node rather than a prefix.
             samples = (0..q)
                 .map(|i| samples[i * samples.len() / q.max(1)].clone())
                 .collect();
         }
-        Ok(LoadedNode {
+        LoadedNode {
             scan: pick.scan,
             node: pick.node,
             samples,
-        })
+        }
+    }
+
+    /// Streams cached nodes first, then misses in priority order with parallel decoding.
+    /// Zero workers chooses available CPUs minus one, capped at eight. In-flight
+    /// decoded blocks and scratch space share a 256 MiB reservation budget.
+    pub fn load_view_nodes(
+        self: &Arc<Self>,
+        picks: &[ViewPick],
+        cache: &mut ViewCache,
+        job: &JobControl,
+        workers: usize,
+        mut loaded: impl FnMut(LoadedNode) -> Result<()>,
+    ) -> Result<()> {
+        ensure!(workers <= 64, "Too many view workers");
+        job.check()?;
+        let workers = if workers == 0 {
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get().saturating_sub(1).clamp(1, 8))
+        } else {
+            workers
+        };
+        // Cached nodes require no worker or file access.
+        let (cached, missing): (Vec<_>, Vec<_>) = picks
+            .iter()
+            .partition(|p| cache.contains(self, p.scan, p.node));
+        for pick in cached {
+            job.report(Stage::ViewPoints, 0, 0);
+            job.check()?;
+            loaded(self.view_node(pick, job, cache)?)?;
+        }
+        if workers == 1 || missing.is_empty() {
+            for pick in missing {
+                job.report(Stage::ViewPoints, 0, 0);
+                job.check()?;
+                loaded(self.view_node(pick, job, cache)?)?;
+            }
+            return Ok(());
+        }
+        let project = self.clone();
+        let worker_job = job.clone();
+        let mut pool = OrderedPool::new(
+            workers.min(missing.len()),
+            256 * 1024 * 1024,
+            job,
+            move |pick: ViewPick| {
+                worker_job.report(Stage::ViewPoints, 0, 0);
+                worker_job.check()?;
+                let scan = project
+                    .scans()
+                    .find(|s| s.id == pick.scan)
+                    .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
+                let samples = project.read_view(scan, pick.node)?;
+                worker_job.check()?;
+                Ok((pick, samples))
+            },
+        )?;
+        let mut consume = |(pick, samples): (ViewPick, Vec<Sample>)| -> Result<()> {
+            job.report(Stage::ViewPoints, 0, 0);
+            job.check()?;
+            let scan = self
+                .scans()
+                .find(|s| s.id == pick.scan)
+                .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
+            let samples = cache.store_decoded(self, scan, pick.node, samples, job)?;
+            loaded(Self::loaded_node(&pick, samples))
+        };
+        for pick in missing {
+            let scan = self
+                .scans()
+                .find(|s| s.id == pick.scan)
+                .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
+            let node = scan
+                .nodes
+                .get(pick.node as usize)
+                .ok_or_else(|| anyhow::anyhow!("Invalid node"))?;
+            // Compressed input, shuffle/decode scratch and the completed samples.
+            let bytes = node.count as usize
+                * (crate::storage::SAMPLE_BYTES * 4 + std::mem::size_of::<Sample>())
+                + 128;
+            ensure!(
+                bytes <= 256 * 1024 * 1024,
+                "View node exceeds worker budget"
+            );
+            while !pool.has_capacity(bytes) {
+                if let Some(node) = pool.pop()? {
+                    consume(node)?;
+                }
+            }
+            pool.submit(*pick, bytes)?;
+        }
+        while let Some(node) = pool.pop()? {
+            consume(node)?;
+        }
+        Ok(())
     }
     /// [`Project::select_view`] and the chosen nodes' points, grouped by scan.
     pub fn load_view_cached(

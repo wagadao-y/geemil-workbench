@@ -55,6 +55,8 @@ pub(super) struct SmokeTest {
     camera: Camera,
     moving_updates: u64,
     started: Instant,
+    view_started: Option<Instant>,
+    cpu_finished: Option<Duration>,
 }
 impl SmokeTest {
     pub(super) fn new(options: SmokeOptions) -> Self {
@@ -71,15 +73,38 @@ impl SmokeTest {
             camera: Camera::default(),
             moving_updates: 0,
             started: Instant::now(),
+            view_started: None,
+            cpu_finished: None,
         }
     }
     /// Whether this run is a smoke test rather than an interactive session.
     pub(super) fn active(&self) -> bool {
         self.screenshot.is_some() || self.colors
     }
-    pub(super) fn view_loaded(&mut self, interactive: bool, points: usize) {
+    pub(super) fn view_requested(&mut self) {
+        if self.active() {
+            self.view_started = Some(Instant::now());
+            self.cpu_finished = None;
+        }
+    }
+    pub(super) fn view_loaded(&mut self, interactive: bool, points: usize, partial: bool) {
+        if !partial {
+            self.cpu_finished = self.view_started.map(|start| start.elapsed());
+        }
         if interactive && points > 0 && self.started.elapsed() < Duration::from_secs(2) {
             self.moving_updates += 1;
+        }
+    }
+    /// Submission timing, not GPU fence or display presentation timing.
+    pub(super) fn view_rendered(&mut self, pending: bool, points: usize) {
+        if !pending && let (Some(start), Some(cpu)) = (self.view_started, self.cpu_finished) {
+            eprintln!(
+                "Smoke view ready: points {points}, CPU {:.1} ms, all uploads submitted {:.1} ms",
+                cpu.as_secs_f64() * 1000.,
+                start.elapsed().as_secs_f64() * 1000.
+            );
+            self.view_started = None;
+            self.cpu_finished = None;
         }
     }
 }

@@ -111,30 +111,53 @@ impl ViewCache {
             entry.used = self.clock;
             return Ok(entry.samples.clone());
         }
-        self.stats.misses += 1;
         let samples = project.read_view(scan, node)?;
-        let mut result = Vec::with_capacity(samples.len());
-        for (i, sample) in samples.into_iter().enumerate() {
-            if i % 8192 == 0 {
-                job.check()?;
+        self.store_decoded(project, scan, node, samples, job)
+    }
+
+    /// Filters decoded samples and installs them on the cache's owning thread.
+    pub(crate) fn store_decoded(
+        &mut self,
+        project: &Project,
+        scan: &Scan,
+        node: u32,
+        samples: Vec<Sample>,
+        job: &JobControl,
+    ) -> Result<Arc<[Sample]>> {
+        self.prepare(project);
+        self.stats.misses += 1;
+        let key = Key {
+            scan: scan.id,
+            node,
+        };
+        self.clock += 1;
+        let samples: Arc<[Sample]> = if project.current().layers.iter().all(|l| l.visible) {
+            job.check()?;
+            samples.into()
+        } else {
+            let mut result = Vec::with_capacity(samples.len());
+            for (i, sample) in samples.into_iter().enumerate() {
+                if i % 8192 == 0 {
+                    job.check()?;
+                }
+                let hidden = match self.hidden.entry((scan.id, sample.chunk)) {
+                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
+                    std::collections::hash_map::Entry::Vacant(e) => e
+                        .insert(
+                            (project.hidden_count(scan, sample.chunk) > 0)
+                                .then(|| project.hidden_mask(scan, sample.chunk).map(Arc::new))
+                                .transpose()?,
+                        )
+                        .clone(),
+                };
+                if hidden.is_some_and(|hidden| is_set(&hidden, sample.index as usize)) {
+                    continue;
+                }
+                result.push(sample);
             }
-            let hidden = match self.hidden.entry((scan.id, sample.chunk)) {
-                std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-                std::collections::hash_map::Entry::Vacant(e) => e
-                    .insert(
-                        (project.hidden_count(scan, sample.chunk) > 0)
-                            .then(|| project.hidden_mask(scan, sample.chunk).map(Arc::new))
-                            .transpose()?,
-                    )
-                    .clone(),
-            };
-            if hidden.is_some_and(|hidden| is_set(&hidden, sample.index as usize)) {
-                continue;
-            }
-            result.push(sample);
-        }
-        job.check()?;
-        let samples: Arc<[Sample]> = result.into();
+            job.check()?;
+            result.into()
+        };
         // Charge entry/Arc/hash-table overhead too, including nodes left empty.
         let bytes = std::mem::size_of_val(samples.as_ref()) + 128;
         if bytes <= self.limit {
