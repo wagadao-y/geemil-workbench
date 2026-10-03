@@ -226,7 +226,10 @@ fn edits_rewrite_only_the_history_and_format_3_still_opens() {
     let mut p = imported(dir.path());
     let root = p.root.clone();
     let manifest = std::fs::read_to_string(root.join("project.json")).unwrap();
-    assert!(!manifest.contains("\"chunks\""), "chunk metadata in project.json");
+    assert!(
+        !manifest.contains("\"chunks\""),
+        "chunk metadata in project.json"
+    );
     let scan_files: Vec<_> = p
         .scans()
         .map(|s| root.join(s.points_file.replace(".points", ".scan.json")))

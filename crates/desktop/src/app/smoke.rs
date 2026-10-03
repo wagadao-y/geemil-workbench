@@ -212,6 +212,9 @@ impl Workbench {
                     self.points.len(),
                     self.view_ms
                 );
+                if let Some(error) = &self.error {
+                    eprintln!("Smoke test error: {} {:?}", error.message, error.detail);
+                }
                 if let Some(preview) = self.selection.preview_summary() {
                     eprintln!("Smoke test preview: {preview}");
                 }
