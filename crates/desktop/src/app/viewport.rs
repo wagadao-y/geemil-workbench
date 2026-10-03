@@ -68,6 +68,7 @@ impl Workbench {
             self.draw_box(ui, response.rect);
             self.draw_gizmo(ui, response.rect);
             self.draw_pivot(ui, &response);
+            self.draw_orientation(ui, response.rect);
             self.empty_hint(ui, response.rect);
         });
     }

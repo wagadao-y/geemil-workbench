@@ -37,7 +37,8 @@ pub struct SmokeOptions {
     /// top view), box (a 2 m slice at the median height, inside highlighted),
     /// box-crop (move everything outside that box to the "deleted" layer),
     /// transform and transform-folder (the move and rotate tool on the first
-    /// scan or folder), show-layers (show every layer), restore (move every point of the newest
+    /// scan or folder), focus and focus-folder (frame the first scan or folder),
+    /// show-layers (show every layer), restore (move every point of the newest
     /// layer back to the default one), color-height and color-scan (colour modes).
     pub script: Vec<String>,
 }
@@ -422,6 +423,19 @@ impl Workbench {
             "ortho" => {
                 self.perform(ctx, Action::ToggleOrtho);
                 self.perform(ctx, Action::View(super::actions::ViewPreset::Top));
+            }
+            "focus" | "focus-folder" => {
+                let selected = self.project.as_ref().and_then(|p| {
+                    if step == "focus" {
+                        p.scans().next().map(|s| s.id)
+                    } else {
+                        p.groups().first().map(|g| g.id)
+                    }
+                });
+                self.select_tree_item(selected);
+                if let Some(id) = selected {
+                    self.focus_tree_item(id);
+                }
             }
             "color-height" => self.settings.color_mode = super::ColorMode::Height,
             "color-scan" => self.settings.color_mode = super::ColorMode::Scan,

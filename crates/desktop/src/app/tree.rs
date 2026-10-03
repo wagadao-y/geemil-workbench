@@ -10,6 +10,7 @@ use uuid::Uuid;
 
 enum TreeAction {
     Select(Uuid, egui::Modifiers),
+    Focus(Uuid),
     Properties(Uuid),
     SetVisible(Vec<Uuid>, bool),
     ShowOnly(Vec<Uuid>),
@@ -459,7 +460,10 @@ impl Workbench {
         let selected = self.tree_selection.items.contains(&id) || self.selected == Some(id);
         let row =
             ui.add(egui::Button::selectable(selected, label).sense(egui::Sense::click_and_drag()));
-        if row.clicked() {
+        if row.double_clicked() {
+            actions.push(TreeAction::Select(id, egui::Modifiers::NONE));
+            actions.push(TreeAction::Focus(id));
+        } else if row.clicked() {
             actions.push(TreeAction::Select(id, ui.input(|i| i.modifiers)));
         }
         if (row.secondary_clicked() || row.drag_started()) && !selected {
@@ -513,6 +517,7 @@ impl Workbench {
     }
     fn tree_action(&mut self, action: TreeAction) {
         match action {
+            TreeAction::Focus(id) => self.focus_tree_item(id),
             TreeAction::Select(id, modifiers) => {
                 self.tree_selection.select(id, modifiers);
                 self.selected = self

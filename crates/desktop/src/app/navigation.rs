@@ -7,14 +7,40 @@ use std::time::{Duration, Instant};
 
 const FLIGHT: Duration = Duration::from_millis(250);
 
-/// Turns the camera toward a new orbit centre while the eye stays in place.
+/// Retargets the orbit centre, optionally moving closer to frame a tree item.
 pub(super) struct Flight {
     from: Camera,
     to: DVec3,
+    fit_distance: Option<f64>,
     start: Instant,
 }
 
 impl Workbench {
+    pub(super) fn focus_tree_item(&mut self, id: uuid::Uuid) {
+        let Some((frame, bounds)) = self
+            .project
+            .as_deref()
+            .and_then(|p| super::gizmo::item_box(p, id, None))
+        else {
+            return;
+        };
+        let to = framed_camera(
+            self.camera,
+            &bounds
+                .corners()
+                .map(|p| frame.transform_point3(p))
+                .collect::<Vec<_>>(),
+        );
+        self.flight = Some(Flight {
+            from: self.camera,
+            to: DVec3::from(to.target),
+            fit_distance: Some(to.distance),
+            start: Instant::now(),
+        });
+        self.selection.clear();
+        self.dirty = true;
+    }
+
     /// Orbit (left, in tools that pick by clicking), pan (right), zoom (wheel)
     /// and double-click picking. Any camera change drops the selection, which is
     /// tied to the camera it was drawn with.
@@ -74,6 +100,7 @@ impl Workbench {
                 self.flight = Some(Flight {
                     from: self.camera,
                     to: target,
+                    fit_distance: None,
                     start: Instant::now(),
                 });
                 self.selection.clear();
@@ -88,7 +115,16 @@ impl Workbench {
         let s = (flight.start.elapsed().as_secs_f64() / FLIGHT.as_secs_f64()).min(1.);
         let eased = s * s * (3. - 2. * s);
         let from = DVec3::from(flight.from.target);
-        self.camera = flight.from.looking_at(from.lerp(flight.to, eased));
+        let target = from.lerp(flight.to, eased);
+        self.camera = if let Some(distance) = flight.fit_distance {
+            Camera {
+                target: target.to_array(),
+                distance: flight.from.distance + (distance - flight.from.distance) * eased,
+                ..flight.from
+            }
+        } else {
+            flight.from.looking_at(target)
+        };
         self.dirty = true;
         if s >= 1. {
             self.flight = None;
@@ -109,6 +145,80 @@ impl Workbench {
         let painter = ui.painter();
         painter.circle_stroke(center, 6., egui::Stroke::new(3., egui::Color32::BLACK));
         painter.circle_stroke(center, 6., egui::Stroke::new(1.5, egui::Color32::WHITE));
+    }
+
+    /// A passive world-axis triad, rotated with the view, in logical pixels.
+    pub(super) fn draw_orientation(&self, ui: &egui::Ui, rect: egui::Rect) {
+        if rect.width() < 120. || rect.height() < 120. {
+            return;
+        }
+        let painter = ui.painter().with_clip_rect(rect);
+        let origin = rect.right_bottom() - egui::vec2(58., 58.);
+        painter.circle_filled(origin, 48., egui::Color32::from_black_alpha(100));
+        let (right, up, forward) = view_basis(self.camera);
+        let mut axes = super::gizmo::AXES.map(|(axis, color)| (axis, color, axis.dot(forward)));
+        // Draw the far axes first so the near ones remain readable.
+        axes.sort_by(|a, b| b.2.total_cmp(&a.2));
+        for (axis, color, depth) in axes {
+            let offset = egui::vec2(axis.dot(right) as f32, -axis.dot(up) as f32) * 32.;
+            let end = origin + offset;
+            painter.line_segment([origin, end], egui::Stroke::new(4., egui::Color32::BLACK));
+            painter.line_segment([origin, end], egui::Stroke::new(2., color));
+            painter.circle_filled(end, 9., egui::Color32::BLACK);
+            painter.circle_stroke(end, 9., egui::Stroke::new(1., color));
+            let name = if axis == DVec3::X {
+                "X"
+            } else if axis == DVec3::Y {
+                "Y"
+            } else {
+                "Z"
+            };
+            painter.text(
+                end,
+                egui::Align2::CENTER_CENTER,
+                name,
+                egui::FontId::proportional(12.),
+                if depth > 0. {
+                    color.gamma_multiply(0.7)
+                } else {
+                    color
+                },
+            );
+        }
+    }
+}
+
+fn view_basis(camera: Camera) -> (DVec3, DVec3, DVec3) {
+    let forward = -DVec3::new(
+        camera.yaw.cos() * camera.pitch.cos(),
+        camera.yaw.sin() * camera.pitch.cos(),
+        camera.pitch.sin(),
+    );
+    let right = DVec3::new(-camera.yaw.sin(), camera.yaw.cos(), 0.);
+    let up = right.cross(forward);
+    (right, up, forward)
+}
+
+/// Fit transformed bounds with a small margin while preserving the view direction.
+fn framed_camera(camera: Camera, corners: &[DVec3]) -> Camera {
+    let target = corners.iter().copied().sum::<DVec3>() / corners.len() as f64;
+    let (right, up, forward) = view_basis(camera);
+    let vertical = (camera.fov * 0.5).tan();
+    let horizontal = vertical * camera.aspect;
+    let mut distance: f64 = 0.001;
+    for corner in corners {
+        let q = corner - target;
+        let needed = (q.dot(right).abs() / horizontal).max(q.dot(up).abs() / vertical) * 1.08;
+        distance = distance.max(if camera.ortho {
+            needed
+        } else {
+            (needed - q.dot(forward)).max(0.001 - q.dot(forward))
+        });
+    }
+    Camera {
+        target: target.to_array(),
+        distance,
+        ..camera
     }
 }
 
@@ -147,9 +257,73 @@ pub(super) fn pick(
 
 #[cfg(test)]
 mod tests {
-    use super::pick;
-    use geemil_core::{Camera, Sample};
-    use glam::DVec3;
+    use super::{framed_camera, pick, view_basis};
+    use geemil_core::{Bounds, Camera, Sample};
+    use glam::{DMat4, DVec3};
+
+    #[test]
+    fn frames_transformed_bounds_in_portrait_and_landscape_in_both_projections() {
+        let bounds = Bounds {
+            min: [-12., -3., -1.],
+            max: [12., 3., 1.],
+        };
+        let world = DMat4::from_translation(DVec3::new(100_000., -200_000., 150.))
+            * DMat4::from_rotation_z(0.7);
+        let corners: Vec<_> = bounds
+            .corners()
+            .map(|p| world.transform_point3(p))
+            .collect();
+        for aspect in [0.4, 1., 2.5] {
+            for ortho in [false, true] {
+                let from = Camera {
+                    aspect,
+                    ortho,
+                    ..Camera::default()
+                };
+                let camera = framed_camera(from, &corners);
+                assert_eq!((camera.yaw, camera.pitch), (from.yaw, from.pitch));
+                let mut edge: f64 = 0.;
+                for corner in &corners {
+                    let (uv, depth) = camera.project(*corner).unwrap();
+                    assert!(depth > 0. || ortho);
+                    for coordinate in uv {
+                        assert!((0.03..=0.97).contains(&coordinate), "{camera:?}: {uv:?}");
+                        edge = edge.max((coordinate - 0.5).abs());
+                    }
+                }
+                // The item fills the limiting dimension without clipping.
+                assert!(edge > 0.45);
+            }
+        }
+    }
+
+    #[test]
+    fn orientation_axes_match_projection_and_ignore_camera_translation() {
+        for yaw in [-1.2, 0., 1.8] {
+            for pitch in [-1.5, 0., 1.5] {
+                let camera = Camera {
+                    yaw,
+                    pitch,
+                    ortho: true,
+                    aspect: 1.,
+                    target: [1000., 2000., -3000.],
+                    ..Camera::default()
+                };
+                let (right, up, forward) = view_basis(camera);
+                assert!((right.cross(up) + forward).length() < 1e-12);
+                let target = DVec3::from(camera.target);
+                for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
+                    let (uv, _) = camera.project(target + axis).unwrap();
+                    assert!(
+                        ((uv[0] - 0.5) * 2. * camera.half_height() - axis.dot(right)).abs() < 1e-9
+                    );
+                    assert!(
+                        ((0.5 - uv[1]) * 2. * camera.half_height() - axis.dot(up)).abs() < 1e-9
+                    );
+                }
+            }
+        }
+    }
 
     fn sample(position: [f64; 3]) -> Sample {
         Sample {
