@@ -2,6 +2,7 @@
 //! smoke tests live in submodules as further `impl Workbench` blocks.
 mod history;
 mod jobs;
+mod navigation;
 mod sidebar;
 mod smoke;
 mod status;
@@ -54,6 +55,9 @@ pub struct Workbench {
     refine_pending: bool,
     point_budget: usize,
     point_size: f32,
+    edl: bool,
+    edl_strength: f32,
+    flight: Option<navigation::Flight>,
 
     // Screen-space selection.
     select_mode: bool,
@@ -106,6 +110,9 @@ impl Workbench {
             refine_pending: false,
             point_budget: 200_000,
             point_size: 3.,
+            edl: true,
+            edl_strength: 1.,
+            flight: None,
             select_mode: false,
             lasso: false,
             polygon: vec![],

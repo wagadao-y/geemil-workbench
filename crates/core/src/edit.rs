@@ -51,13 +51,30 @@ impl Camera {
             (self.distance * 1000.).max(100.),
         ) * DMat4::look_at_rh(self.eye() - DVec3::from(self.target), DVec3::ZERO, DVec3::Z)
     }
+    /// Projects to normalized viewport coordinates (origin top left) and view depth.
     pub fn project(&self, p: DVec3) -> Option<([f64; 2], f64)> {
-        let clip = self.matrix() * p.extend(1.);
-        if clip.w <= 0. || clip.z < 0. || clip.z > clip.w {
-            return None;
+        self.projector().project(p)
+    }
+    /// `project` with the matrices computed once, for many points.
+    pub fn projector(&self) -> Projector {
+        Projector {
+            matrix: self.matrix(),
         }
-        let ndc = clip.truncate() / clip.w;
-        Some(([(ndc.x + 1.) * 0.5, (1. - ndc.y) * 0.5], clip.w))
+    }
+    /// The same eye position, looking at and orbiting around `target`.
+    pub fn looking_at(&self, target: DVec3) -> Self {
+        let offset = self.eye() - target;
+        let distance = offset.length();
+        if distance <= f64::EPSILON {
+            return *self;
+        }
+        Self {
+            target: target.to_array(),
+            yaw: offset.y.atan2(offset.x),
+            pitch: (offset.z / distance).asin().clamp(-1.5, 1.5),
+            distance,
+            ..*self
+        }
     }
     pub fn sees(&self, scan: &Scan, node: u32, world: DMat4) -> bool {
         let points: Vec<_> = scan.nodes[node as usize]
@@ -75,6 +92,19 @@ impl Camera {
                 _ => p.z > p.w,
             })
         })
+    }
+}
+pub struct Projector {
+    matrix: DMat4,
+}
+impl Projector {
+    pub fn project(&self, p: DVec3) -> Option<([f64; 2], f64)> {
+        let clip = self.matrix * p.extend(1.);
+        if clip.w <= 0. || clip.z < 0. || clip.z > clip.w {
+            return None;
+        }
+        let ndc = clip.truncate() / clip.w;
+        Some(([(ndc.x + 1.) * 0.5, (1. - ndc.y) * 0.5], clip.w))
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -421,5 +451,31 @@ impl Project {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Camera;
+    use glam::DVec3;
+
+    #[test]
+    fn looking_at_keeps_the_eye_and_centres_the_target() {
+        let camera = Camera {
+            target: [10., -4., 2.],
+            yaw: 0.7,
+            pitch: 0.3,
+            distance: 25.,
+            ..Camera::default()
+        };
+        let target = DVec3::new(3., 5., -1.);
+        let moved = camera.looking_at(target);
+        assert!(moved.eye().distance(camera.eye()) < 1e-9);
+        assert!((moved.distance - camera.eye().distance(target)).abs() < 1e-9);
+        let (uv, depth) = moved.project(target).unwrap();
+        assert!((uv[0] - 0.5).abs() < 1e-9 && (uv[1] - 0.5).abs() < 1e-9);
+        assert!((depth - moved.distance).abs() < 1e-6);
+        // Looking at the eye itself has no direction; keep the camera unchanged.
+        assert_eq!(camera.looking_at(camera.eye()), camera);
     }
 }

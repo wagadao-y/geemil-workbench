@@ -1,4 +1,5 @@
 use super::Workbench;
+use crate::render::Edl;
 use eframe::egui;
 use geemil_core::Selection;
 use glam::DVec3;
@@ -6,6 +7,7 @@ use glam::DVec3;
 impl Workbench {
     pub(super) fn viewport(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            self.advance_flight(ctx);
             self.edit_tools(ui, ctx);
             self.display_settings(ui);
             ui.small(self.t.controls_hint);
@@ -27,6 +29,10 @@ impl Workbench {
                 &self.camera,
                 [(size.x * pixels) as u32, (size.y * pixels) as u32],
                 self.point_size * pixels,
+                Edl {
+                    radius: 1.4 * pixels,
+                    strength: if self.edl { self.edl_strength } else { 0. },
+                },
             );
             let response =
                 ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
@@ -34,6 +40,7 @@ impl Workbench {
             self.camera_input(ctx, &response);
             self.selection_input(&response);
             self.draw_selection(ui, response.rect);
+            self.draw_pivot(ui, &response);
         });
     }
     fn edit_tools(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -84,41 +91,12 @@ impl Workbench {
             }
             ui.label(t.point_size);
             ui.add(egui::Slider::new(&mut self.point_size, 1.0..=8.0));
+            ui.checkbox(&mut self.edl, t.edl);
+            ui.add_enabled(
+                self.edl,
+                egui::Slider::new(&mut self.edl_strength, 0.1..=5.0).text(t.edl_strength),
+            );
         });
-    }
-    /// Orbit (left, outside selection mode), pan (right/middle) and zoom (wheel).
-    /// Any camera change drops the selection, which is tied to the camera.
-    fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
-        if !self.select_mode && response.dragged_by(egui::PointerButton::Primary) {
-            let delta = ctx.input(|i| i.pointer.delta());
-            self.camera.yaw -= delta.x as f64 * 0.007;
-            self.camera.pitch = (self.camera.pitch + delta.y as f64 * 0.007).clamp(-1.5, 1.5);
-            self.dirty = true;
-            self.polygon.clear();
-        }
-        if response.dragged_by(egui::PointerButton::Secondary)
-            || response.dragged_by(egui::PointerButton::Middle)
-        {
-            let delta = ctx.input(|i| i.pointer.delta());
-            let forward = (DVec3::from(self.camera.target) - self.camera.eye()).normalize();
-            let right = forward.cross(DVec3::Z).normalize();
-            let up = right.cross(forward);
-            self.camera.target = (DVec3::from(self.camera.target)
-                + (right * (-delta.x as f64) + up * delta.y as f64) * self.camera.distance
-                    / response.rect.height() as f64)
-                .to_array();
-            self.dirty = true;
-            self.polygon.clear();
-        }
-        if response.hovered() {
-            let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0. {
-                self.camera.distance =
-                    (self.camera.distance * (-scroll as f64 * 0.003).exp()).clamp(0.001, 1e10);
-                self.dirty = true;
-                self.polygon.clear();
-            }
-        }
     }
     /// Rectangle drag or polygon clicks, stored in normalized viewport coordinates.
     fn selection_input(&mut self, response: &egui::Response) {

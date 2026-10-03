@@ -5,7 +5,10 @@ use wgpu::util::DeviceExt;
 
 // egui-wgpu expects sampled images to yield linear RGB. The target encodes
 // linear shader output to sRGB bytes, and texture sampling decodes them again.
+// The point pass uses the same format, so the EDL pass also reads linear RGB.
 const VIEW_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// Per-pixel view depth for EDL; 0 marks background.
+const VIEW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -21,6 +24,29 @@ struct Uniform {
     size: f32,
     padding: f32,
 }
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct EdlUniform {
+    radius: f32,
+    strength: f32,
+    padding: [f32; 2],
+}
+/// Eye-Dome Lighting. A strength of 0 shows the plain colours.
+#[derive(Clone, Copy)]
+pub struct Edl {
+    /// Neighbour distance in physical pixels.
+    pub radius: f32,
+    pub strength: f32,
+}
+/// Size-dependent render targets, recreated when the viewport resizes.
+struct Targets {
+    size: [u32; 2],
+    scene: wgpu::TextureView,
+    view_depth: wgpu::TextureView,
+    depth: wgpu::TextureView,
+    output: wgpu::TextureView,
+    edl_bind: wgpu::BindGroup,
+}
 pub struct PointRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -30,9 +56,10 @@ pub struct PointRenderer {
     vertices: wgpu::Buffer,
     count: u32,
     capacity: usize,
-    texture: Option<wgpu::Texture>,
-    depth: Option<wgpu::Texture>,
-    size: [u32; 2],
+    edl_pipeline: wgpu::RenderPipeline,
+    edl_layout: wgpu::BindGroupLayout,
+    edl_uniform: wgpu::Buffer,
+    targets: Option<Targets>,
     id: Option<egui::TextureId>,
     origin: DVec3,
     uploaded_generation: u64,
@@ -101,14 +128,17 @@ impl PointRenderer {
                 module: &shader,
                 entry_point: Some("fragment"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: VIEW_FORMAT,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[Some(VIEW_FORMAT.into()), Some(VIEW_DEPTH_FORMAT.into())],
             }),
             multiview: None,
             cache: None,
+        });
+        let (edl_pipeline, edl_layout) = edl_pipeline(&device);
+        let edl_uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("edl"),
+            size: std::mem::size_of::<EdlUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let vertices = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -125,9 +155,10 @@ impl PointRenderer {
             vertices,
             count: 0,
             capacity: 28,
-            texture: None,
-            depth: None,
-            size: [0, 0],
+            edl_pipeline,
+            edl_layout,
+            edl_uniform,
+            targets: None,
             id: None,
             origin: DVec3::ZERO,
             uploaded_generation: 0,
@@ -171,58 +202,29 @@ impl PointRenderer {
         camera: &Camera,
         size: [u32; 2],
         point_size: f32,
+        edl: Edl,
     ) -> egui::TextureId {
         let limit = self.device.limits().max_texture_dimension_2d;
         let size = size.map(|v| v.clamp(1, limit));
-        if size != self.size {
-            self.size = size;
-            let texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("point viewport"),
-                size: wgpu::Extent3d {
-                    width: size[0],
-                    height: size[1],
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: VIEW_FORMAT,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
-                    | wgpu::TextureUsages::TEXTURE_BINDING
-                    | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let view = texture.create_view(&Default::default());
+        if self.targets.as_ref().is_none_or(|t| t.size != size) {
+            let targets = self.create_targets(size);
             if let Some(id) = self.id {
                 rs.renderer.write().update_egui_texture_from_wgpu_texture(
                     &self.device,
-                    &view,
+                    &targets.output,
                     wgpu::FilterMode::Nearest,
                     id,
                 );
             } else {
                 self.id = Some(rs.renderer.write().register_native_texture(
                     &self.device,
-                    &view,
+                    &targets.output,
                     wgpu::FilterMode::Nearest,
                 ));
             }
-            self.texture = Some(texture);
-            self.depth = Some(self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("point depth"),
-                size: wgpu::Extent3d {
-                    width: size[0],
-                    height: size[1],
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Depth32Float,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            }));
+            self.targets = Some(targets);
         }
+        let targets = self.targets.as_ref().unwrap();
         let matrix = camera.relative_matrix()
             * glam::DMat4::from_translation(self.origin - DVec3::from(camera.target));
         let uniform = Uniform {
@@ -233,38 +235,45 @@ impl PointRenderer {
         };
         self.queue
             .write_buffer(&self.uniform, 0, bytemuck::bytes_of(&uniform));
-        let view = self
-            .texture
-            .as_ref()
-            .unwrap()
-            .create_view(&Default::default());
-        let depth = self
-            .depth
-            .as_ref()
-            .unwrap()
-            .create_view(&Default::default());
+        let edl = EdlUniform {
+            radius: edl.radius,
+            strength: edl.strength,
+            padding: [0.; 2],
+        };
+        self.queue
+            .write_buffer(&self.edl_uniform, 0, bytemuck::bytes_of(&edl));
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("point viewport"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.025,
-                            g: 0.035,
-                            b: 0.05,
-                            a: 1.,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
+                label: Some("point splats"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.scene,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color {
+                                r: 0.025,
+                                g: 0.035,
+                                b: 0.05,
+                                a: 1.,
+                            }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.view_depth,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &depth,
+                    view: &targets.depth,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,
                     }),
                     stencil_ops: None,
                 }),
@@ -276,7 +285,147 @@ impl PointRenderer {
             pass.set_vertex_buffer(0, self.vertices.slice(..));
             pass.draw(0..6, 0..self.count);
         }
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("eye-dome lighting"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &targets.output,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.edl_pipeline);
+            pass.set_bind_group(0, &targets.edl_bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
         self.queue.submit([encoder.finish()]);
         self.id.unwrap()
     }
+    fn create_targets(&self, size: [u32; 2]) -> Targets {
+        let texture = |label, format, usage| {
+            self.device
+                .create_texture(&wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: size[0],
+                        height: size[1],
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format,
+                    usage,
+                    view_formats: &[],
+                })
+                .create_view(&Default::default())
+        };
+        let sampled = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
+        let scene = texture("point colors", VIEW_FORMAT, sampled);
+        let view_depth = texture("point view depth", VIEW_DEPTH_FORMAT, sampled);
+        let depth = texture(
+            "point depth",
+            wgpu::TextureFormat::Depth32Float,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let output = texture(
+            "point viewport",
+            VIEW_FORMAT,
+            sampled | wgpu::TextureUsages::COPY_SRC,
+        );
+        let edl_bind = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("edl"),
+            layout: &self.edl_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scene),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view_depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.edl_uniform.as_entire_binding(),
+                },
+            ],
+        });
+        Targets {
+            size,
+            scene,
+            view_depth,
+            depth,
+            output,
+            edl_bind,
+        }
+    }
+}
+
+fn edl_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("eye-dome lighting"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("edl.wgsl").into()),
+    });
+    // Both inputs are read with textureLoad, so no sampler or filtering is needed.
+    let texture = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    };
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("edl"),
+        entries: &[
+            texture(0),
+            texture(1),
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("edl"),
+        bind_group_layouts: &[&layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("eye-dome lighting"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[],
+        },
+        primitive: Default::default(),
+        depth_stencil: None,
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fragment"),
+            compilation_options: Default::default(),
+            targets: &[Some(VIEW_FORMAT.into())],
+        }),
+        multiview: None,
+        cache: None,
+    });
+    (pipeline, layout)
 }

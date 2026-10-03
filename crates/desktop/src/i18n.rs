@@ -46,6 +46,8 @@ pub struct Strings {
     pub clear_selection: &'static str,
     pub point_budget: &'static str,
     pub point_size: &'static str,
+    pub edl: &'static str,
+    pub edl_strength: &'static str,
     pub controls_hint: &'static str,
 
     pub status_start: &'static str,
@@ -134,7 +136,9 @@ pub static JA: Strings = Strings {
     clear_selection: "選択解除",
     point_budget: "描画点数上限",
     point_size: "点サイズ",
-    controls_hint: "左ドラッグ: 回転 / 矩形選択    右・中ドラッグ: 平行移動    ホイール: 拡大縮小    多角形: 左クリックで頂点を追加",
+    edl: "陰影強調（EDL）",
+    edl_strength: "強度",
+    controls_hint: "左ドラッグ: 回転 / 矩形選択    右・中ドラッグ: 平行移動    ホイール: 拡大縮小    多角形: 左クリックで頂点を追加    ダブルクリック: 回転中心を設定",
 
     status_start: "プロジェクトを作成するか、既存のプロジェクトを開いてください。",
     status_saved: "プロジェクトは保存済みです。",
