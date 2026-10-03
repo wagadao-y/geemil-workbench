@@ -1,6 +1,10 @@
+use crate::i18n::{self, Strings};
 use crate::render::PointRenderer;
 use eframe::egui;
-use geemil_core::{Camera, ImportOptions, JobControl, Pose, Project, Sample, Selection, ViewCache};
+use geemil_core::{
+    Camera, CoreError, ImportOptions, JobControl, Layer, Pose, Project, Revision, Sample,
+    Selection, Stage, ViewCache,
+};
 use glam::{DQuat, DVec3};
 use std::{
     collections::BTreeSet,
@@ -15,8 +19,31 @@ use std::{
 use uuid::Uuid;
 
 enum JobEvent {
-    Progress(String, u64, u64),
-    Complete(Result<Project, String>),
+    Progress(Stage, u64, u64),
+    Complete(Result<Project, JobFailure>),
+}
+enum JobFailure {
+    Panicked,
+    Failed(anyhow::Error),
+}
+/// An error shown under the status bar until dismissed.
+#[derive(Debug)]
+struct Notice {
+    message: String,
+    /// English error chain from the core, for reports and diagnosis.
+    detail: Option<String>,
+}
+impl Notice {
+    fn new(t: &Strings, error: &anyhow::Error) -> Self {
+        Self {
+            message: CoreError::find(error)
+                .map_or_else(|| t.unexpected_error.into(), |e| (t.core_error)(e)),
+            detail: Some(format!("{error:#}")),
+        }
+    }
+}
+fn is_cancelled(error: &anyhow::Error) -> bool {
+    CoreError::find(error) == Some(&CoreError::Cancelled)
 }
 struct ActiveJob {
     rx: mpsc::Receiver<JobEvent>,
@@ -33,7 +60,7 @@ struct ViewRequest {
 }
 struct ViewResult {
     generation: u64,
-    result: Result<Vec<Sample>, String>,
+    result: anyhow::Result<Vec<Sample>>,
     origin: [f64; 3],
     elapsed_ms: f64,
     epoch: u64,
@@ -41,6 +68,7 @@ struct ViewResult {
 }
 
 pub struct Workbench {
+    t: &'static Strings,
     project: Option<Arc<Project>>,
     renderer: PointRenderer,
     camera: Camera,
@@ -48,7 +76,7 @@ pub struct Workbench {
     selected: Option<Uuid>,
     job: Option<ActiveJob>,
     status: String,
-    error: Option<String>,
+    error: Option<Notice>,
     progress: f32,
     view_tx: mpsc::SyncSender<ViewRequest>,
     view_rx: mpsc::Receiver<ViewResult>,
@@ -149,16 +177,13 @@ impl Workbench {
                     }),
                 };
                 let started = Instant::now();
-                let result = request
-                    .project
-                    .load_view_cached(
-                        &request.camera,
-                        request.budget,
-                        &request.visible,
-                        &job,
-                        &mut cache,
-                    )
-                    .map_err(|e| format!("{e:#}"));
+                let result = request.project.load_view_cached(
+                    &request.camera,
+                    request.budget,
+                    &request.visible,
+                    &job,
+                    &mut cache,
+                );
                 if live_epoch.load(Ordering::Relaxed) == request.epoch
                     && (interactive || current.load(Ordering::Relaxed) == request.generation)
                 {
@@ -174,14 +199,16 @@ impl Workbench {
                 }
             }
         });
+        let t = &i18n::JA;
         let mut app = Self {
+            t,
             project: None,
             renderer,
             camera: Camera::default(),
             visible: BTreeSet::new(),
             selected: None,
             job: None,
-            status: "プロジェクトを作成するか、既存のプロジェクトを開いてください。".into(),
+            status: t.status_start.into(),
             error: None,
             progress: 0.,
             view_tx,
@@ -207,7 +234,7 @@ impl Workbench {
             depth: 0.5,
             translation: [0.; 3],
             rotation: [0.; 3],
-            branch_name: "新しい分岐".into(),
+            branch_name: t.default_branch_name.into(),
             screenshot,
             screenshot_requested: false,
             smoke_orbit,
@@ -220,7 +247,7 @@ impl Workbench {
         if let Some(path) = path {
             match Project::load(&path) {
                 Ok(p) => app.install(p, true),
-                Err(e) => app.error = Some(format!("{e:#}")),
+                Err(e) => app.error = Some(Notice::new(t, &e)),
             }
         }
         if smoke_colors {
@@ -265,12 +292,18 @@ impl Workbench {
         app
     }
     fn install(&mut self, project: Project, fit: bool) {
-        let ids: BTreeSet<_> = project.scans().map(|s| s.id).collect();
-        self.visible.retain(|id| ids.contains(id));
-        if self.project.is_none() || fit {
-            self.visible = ids;
-        }
-        self.selected = project.scans().next().map(|s| s.id);
+        let previous: Option<Vec<_>> = self
+            .project
+            .as_ref()
+            .filter(|p| p.root == project.root)
+            .map(|p| p.scans().map(|s| s.id).collect());
+        let scans: Vec<_> = project.scans().map(|s| s.id).collect();
+        carry_scan_state(
+            &mut self.visible,
+            &mut self.selected,
+            previous.as_deref(),
+            &scans,
+        );
         if fit {
             let bounds = project.bounds();
             self.camera.target = bounds.center().to_array();
@@ -281,7 +314,7 @@ impl Workbench {
         self.points.clear();
         self.points_origin = self.camera.target;
         self.project = Some(Arc::new(project));
-        self.status = "プロジェクトは保存済みです。".into();
+        self.status = self.t.status_saved.into();
         self.polygon.clear();
         self.selection_camera = None;
         self.dirty = true;
@@ -311,7 +344,7 @@ impl Workbench {
         let job = JobControl {
             cancel: cancel.clone(),
             progress: Arc::new(move |stage, done, total| {
-                let _ = progress_tx.try_send(JobEvent::Progress(stage.into(), done, total));
+                let _ = progress_tx.try_send(JobEvent::Progress(stage, done, total));
                 progress_ctx.request_repaint();
             }),
         };
@@ -320,9 +353,11 @@ impl Workbench {
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.progress = 0.;
         self.error = None;
-        self.status = "処理中…".into();
+        self.status = self.t.status_working.into();
         std::thread::spawn(move || {
-            let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||task(job))).map_err(|_|"処理スレッドで予期しないエラーが発生しました。直前の確定状態は保持されています。".to_owned()).and_then(|r|r.map_err(|e|format!("{e:#}")));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| task(job)))
+                .map_err(|_| JobFailure::Panicked)
+                .and_then(|r| r.map_err(JobFailure::Failed));
             let _ = tx.send(JobEvent::Complete(result));
             repaint.request_repaint();
         });
@@ -333,7 +368,13 @@ impl Workbench {
             while let Ok(event) = job.rx.try_recv() {
                 match event {
                     JobEvent::Progress(stage, done, total) => {
-                        self.status = format!("{stage}: {done} / {total}");
+                        let t = self.t;
+                        self.status = format!(
+                            "{}: {} / {}",
+                            (t.stage)(stage),
+                            t.count(done),
+                            t.count(total)
+                        );
                         self.progress = if total > 0 {
                             done as f32 / total as f32
                         } else {
@@ -354,7 +395,7 @@ impl Workbench {
                         .as_ref()
                         .is_none_or(|p| p.current().scans != project.current().scans);
                     self.install(project, fit);
-                    self.status = "完了しました。プロジェクトは保存済みです。".into();
+                    self.status = self.t.status_done.into();
                 }
                 Err(e) => {
                     // A batch may have committed earlier files before cancellation/error.
@@ -364,8 +405,22 @@ impl Workbench {
                         let fit = project.current().scans != latest.current().scans;
                         self.install(latest, fit);
                     }
-                    self.status = "処理を終了しました。".into();
-                    self.error = Some(e);
+                    match e {
+                        JobFailure::Failed(e) if is_cancelled(&e) => {
+                            self.status = self.t.status_cancelled.into();
+                        }
+                        JobFailure::Failed(e) => {
+                            self.status = self.t.status_failed.into();
+                            self.error = Some(Notice::new(self.t, &e));
+                        }
+                        JobFailure::Panicked => {
+                            self.status = self.t.status_failed.into();
+                            self.error = Some(Notice {
+                                message: self.t.job_panicked.into(),
+                                detail: None,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -386,7 +441,9 @@ impl Workbench {
                         self.points_origin = result.origin;
                         self.view_ms = result.elapsed_ms;
                     }
-                    Err(e) => self.error = Some(e),
+                    // A superseded view request is not a failure.
+                    Err(e) if is_cancelled(&e) => {}
+                    Err(e) => self.error = Some(Notice::new(self.t, &e)),
                 }
             }
         }
@@ -455,16 +512,17 @@ impl Workbench {
         }
     }
     fn toolbar(&mut self, ctx: &egui::Context) {
+        let t = self.t;
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("Geemil Workbench");
                 ui.separator();
                 let busy = self.job.is_some();
                 if ui
-                    .add_enabled(!busy, egui::Button::new("新規プロジェクト"))
+                    .add_enabled(!busy, egui::Button::new(t.new_project))
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .set_title("新しいプロジェクトの保存先（新規フォルダー名）")
+                        .set_title(t.new_project_dialog)
                         .set_file_name("point-project")
                         .save_file()
                 {
@@ -476,27 +534,24 @@ impl Workbench {
                             .as_ref(),
                     ) {
                         Ok(p) => self.install(p, true),
-                        Err(e) => self.error = Some(format!("{e:#}")),
+                        Err(e) => self.error = Some(Notice::new(t, &e)),
                     }
                 }
-                if ui.add_enabled(!busy, egui::Button::new("開く")).clicked()
+                if ui.add_enabled(!busy, egui::Button::new(t.open)).clicked()
                     && let Some(path) = rfd::FileDialog::new()
-                        .set_title("プロジェクトフォルダーを開く")
+                        .set_title(t.open_dialog)
                         .pick_folder()
                 {
                     match Project::load(&path) {
                         Ok(p) => self.install(p, true),
-                        Err(e) => self.error = Some(format!("{e:#}")),
+                        Err(e) => self.error = Some(Notice::new(t, &e)),
                     }
                 }
                 if ui
-                    .add_enabled(
-                        !busy && self.project.is_some(),
-                        egui::Button::new("点群を取り込む"),
-                    )
+                    .add_enabled(!busy && self.project.is_some(), egui::Button::new(t.import))
                     .clicked()
                     && let Some(files) = rfd::FileDialog::new()
-                        .add_filter("点群", &["e57", "las", "laz"])
+                        .add_filter(t.point_cloud_filter, &["e57", "las", "laz"])
                         .pick_files()
                 {
                     let mut project = (**self.project.as_ref().unwrap()).clone();
@@ -514,7 +569,7 @@ impl Workbench {
                                 .project
                                 .as_ref()
                                 .is_some_and(|p| p.scans().next().is_some()),
-                        egui::Button::new("E57書き出し"),
+                        egui::Button::new(t.export_e57),
                     )
                     .clicked()
                     && let Some(path) = rfd::FileDialog::new()
@@ -531,7 +586,7 @@ impl Workbench {
                 if ui
                     .add_enabled(
                         !busy && self.project.is_some(),
-                        egui::Button::new("内部データを圧縮"),
+                        egui::Button::new(t.compress_storage),
                     )
                     .clicked()
                 {
@@ -541,7 +596,7 @@ impl Workbench {
                         Ok(project)
                     });
                 }
-                if ui.button("全体表示").clicked()
+                if ui.button(t.fit_view).clicked()
                     && let Some(p) = &self.project
                 {
                     let b = p.bounds();
@@ -554,10 +609,11 @@ impl Workbench {
         });
     }
     fn sidebar(&mut self, ctx: &egui::Context) {
+        let t = self.t;
         egui::SidePanel::left("scans")
             .default_width(270.)
             .show(ctx, |ui| {
-                ui.heading("スキャン");
+                ui.heading(t.scans);
                 if let Some(p) = self.project.clone() {
                     ui.label(&p.manifest.name);
                     for scan in p.scans() {
@@ -580,40 +636,39 @@ impl Workbench {
                                 self.sync_pose();
                             }
                         });
-                        ui.small(format!(
-                            "{} 点 / {} チャンク",
-                            scan.records,
-                            scan.chunks.len()
+                        ui.small((t.scan_summary)(
+                            &t.count(scan.records),
+                            &t.count(scan.chunks.len() as u64),
                         ));
                     }
                     if let Some(id) = self.selected
                         && let Some(scan) = p.scans().find(|s| s.id == id)
                     {
                         ui.separator();
-                        ui.label("対応画像");
+                        ui.label(t.images);
                         for image in p.manifest.images.iter().filter(|i| i.scan_id == Some(id)) {
                             ui.small(format!(
                                 "{} ({})",
-                                image.name.as_deref().unwrap_or("Image"),
+                                image.name.as_deref().unwrap_or(t.unnamed_image),
                                 image.projection
                             ));
                         }
-                        ui.collapsing("取り込み時に省略した属性", |ui| {
+                        ui.collapsing(t.omitted_attributes, |ui| {
                             for attribute in &scan.omitted_attributes {
                                 ui.small(attribute);
                             }
                         });
                     }
                     ui.separator();
-                    ui.collapsing("位置合わせ（追加変換）", |ui| {
-                        ui.label("平行移動（元データの座標単位）");
+                    ui.collapsing(t.alignment, |ui| {
+                        ui.label(t.translation);
                         for (i, label) in ["X", "Y", "Z"].iter().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.label(*label);
                                 ui.add(egui::DragValue::new(&mut self.translation[i]).speed(0.01));
                             });
                         }
-                        ui.label("回転（度）");
+                        ui.label(t.rotation);
                         for (i, label) in ["X", "Y", "Z"].iter().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.label(*label);
@@ -623,7 +678,7 @@ impl Workbench {
                         if ui
                             .add_enabled(
                                 self.job.is_none() && self.selected.is_some(),
-                                egui::Button::new("変換を確定"),
+                                egui::Button::new(t.apply_transform),
                             )
                             .clicked()
                         {
@@ -646,13 +701,13 @@ impl Workbench {
                         }
                     });
                     ui.separator();
-                    ui.heading("除外レイヤー");
+                    ui.heading(t.layers);
                     for layer in &p.manifest.layers {
                         let mut enabled = p.current().layers.contains(&layer.id);
                         if ui
                             .add_enabled(
                                 self.job.is_none(),
-                                egui::Checkbox::new(&mut enabled, &layer.name),
+                                egui::Checkbox::new(&mut enabled, layer_label(t, layer)),
                             )
                             .changed()
                         {
@@ -665,13 +720,17 @@ impl Workbench {
                         }
                     }
                     ui.separator();
-                    ui.heading("履歴");
+                    ui.heading(t.history);
                     egui::ScrollArea::vertical()
                         .max_height(230.)
                         .show(ui, |ui| {
                             for r in &p.manifest.revisions {
                                 let depth = revision_depth(&p, r.id);
-                                let label = format!("{}{}", "  ".repeat(depth.min(8)), r.name);
+                                let label = format!(
+                                    "{}{}",
+                                    "  ".repeat(depth.min(8)),
+                                    revision_label(t, &p, r)
+                                );
                                 if ui
                                     .add_enabled(
                                         self.job.is_none(),
@@ -686,14 +745,14 @@ impl Workbench {
                                             let fit = p.current().scans != project.current().scans;
                                             self.install(project, fit);
                                         }
-                                        Err(e) => self.error = Some(format!("{e:#}")),
+                                        Err(e) => self.error = Some(Notice::new(t, &e)),
                                     }
                                 }
                             }
                         });
                     ui.text_edit_singleline(&mut self.branch_name);
                     if ui
-                        .add_enabled(self.job.is_none(), egui::Button::new("現在の状態から分岐"))
+                        .add_enabled(self.job.is_none(), egui::Button::new(t.fork))
                         .clicked()
                     {
                         let mut project = (*p).clone();
@@ -703,11 +762,32 @@ impl Workbench {
                             Ok(project)
                         });
                     }
-                    ui.small("切り替え後の編集も、自動的に別の枝になります。");
+                    ui.small(t.fork_hint);
                 } else {
-                    ui.label("元ファイルを移動しても使える作業プロジェクトを作成します。");
+                    ui.label(t.no_project_hint);
                 }
             });
+    }
+}
+
+/// Carries scan visibility and selection into a new project state. `previous`
+/// holds the replaced state's scans when it belongs to the same project.
+fn carry_scan_state(
+    visible: &mut BTreeSet<Uuid>,
+    selected: &mut Option<Uuid>,
+    previous: Option<&[Uuid]>,
+    scans: &[Uuid],
+) {
+    match previous {
+        // Keep what the user hid, and show scans that just appeared.
+        Some(previous) => {
+            visible.retain(|id| scans.contains(id));
+            visible.extend(scans.iter().filter(|id| !previous.contains(id)));
+        }
+        None => *visible = scans.iter().copied().collect(),
+    }
+    if !selected.is_some_and(|id| scans.contains(&id)) {
+        *selected = scans.first().copied();
     }
 }
 
@@ -732,6 +812,39 @@ fn revision_depth(p: &Project, id: Uuid) -> usize {
             .and_then(|r| r.parent);
     }
     depth
+}
+
+/// The core stores English names; label from the recorded operation instead.
+/// User-named revisions (forks, checkpoints) and unknown kinds keep their name.
+fn revision_label(t: &Strings, p: &Project, r: &Revision) -> String {
+    let op = &r.operation;
+    let text = |key| op.get(key).and_then(|v| v.as_str());
+    let id = |key| text(key).and_then(|s| Uuid::parse_str(s).ok());
+    let layer = |id: Uuid| p.manifest.layers.iter().find(|l| l.id == id);
+    let label = match text("kind") {
+        Some("create") => Some(t.revision_created.into()),
+        Some("import") => text("file").map(t.revision_import),
+        // The layer created by a selection is appended to that revision's layers.
+        Some("selection") => r
+            .layers
+            .last()
+            .and_then(|id| layer(*id))
+            .map(|l| (t.revision_exclude)(&t.count(l.excluded))),
+        Some("layer") => id("id").and_then(layer).map(|l| {
+            let enabled = op.get("enabled").and_then(|v| v.as_bool());
+            (t.revision_layer)(&layer_label(t, l), enabled.unwrap_or(true))
+        }),
+        Some("transform") => id("scan")
+            .and_then(|id| p.manifest.scans.iter().find(|s| s.id == id))
+            .map(|s| (t.revision_transform)(&s.name)),
+        _ => None,
+    };
+    label.unwrap_or_else(|| r.name.clone())
+}
+
+// Every layer is a manual exclusion until filters add their own layer kinds.
+fn layer_label(t: &Strings, layer: &Layer) -> String {
+    (t.manual_exclusion_layer)(&t.count(layer.excluded))
 }
 
 impl eframe::App for Workbench {
@@ -810,70 +923,133 @@ impl eframe::App for Workbench {
         self.poll();
         self.toolbar(ctx);
         self.sidebar(ctx);
+        let t = self.t;
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
                 if let Some(job) = &self.job {
                     ui.add(egui::ProgressBar::new(self.progress).desired_width(160.));
-                    if ui.button("キャンセル").clicked() {
+                    if ui.button(t.cancel).clicked() {
                         job.cancel.store(true, Ordering::Relaxed);
                     }
                 } else {
-                    ui.label(format!(
-                        "表示 {} 点 / 更新 {:.1} ms",
-                        self.points.len(),
-                        self.view_ms
+                    ui.label((t.view_stats)(
+                        &t.mega_points(self.points.len()),
+                        self.view_ms,
                     ));
                 }
             });
+            let mut dismissed = false;
             if let Some(error) = &self.error {
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
+                ui.horizontal(|ui| {
+                    ui.colored_label(egui::Color32::LIGHT_RED, &error.message);
+                    dismissed = ui.small_button(t.dismiss).clicked();
+                });
+                if let Some(detail) = &error.detail {
+                    ui.collapsing(t.details, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(detail).small()).selectable(true),
+                        );
+                    });
+                }
+            }
+            if dismissed {
+                self.error = None;
             }
         });
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.select_mode, false, "カメラ操作");
-                ui.selectable_value(&mut self.select_mode, true, "範囲選択");
-                ui.checkbox(&mut self.lasso, "多角形");
-                ui.label("奥行き");
-                ui.add(egui::DragValue::new(&mut self.depth).speed(0.05).range(0.001..=1_000_000.).suffix(" m"));
-                if ui.add_enabled(self.job.is_none() && self.polygon.len() >= 3, egui::Button::new("選択範囲を除外")).clicked() {
+                ui.selectable_value(&mut self.select_mode, false, t.navigate);
+                ui.selectable_value(&mut self.select_mode, true, t.select);
+                ui.checkbox(&mut self.lasso, t.polygon);
+                ui.label(t.depth);
+                ui.add(
+                    egui::DragValue::new(&mut self.depth)
+                        .speed(0.05)
+                        .range(0.001..=1_000_000.)
+                        .suffix(" m"),
+                );
+                if ui
+                    .add_enabled(
+                        self.job.is_none() && self.polygon.len() >= 3,
+                        egui::Button::new(t.exclude_selection),
+                    )
+                    .clicked()
+                {
                     self.delete(ctx);
                 }
-                if ui.button("選択解除").clicked() {
+                if ui.button(t.clear_selection).clicked() {
                     self.polygon.clear();
                 }
             });
             ui.horizontal(|ui| {
-                ui.label("描画点数上限");
-                if ui.add(egui::DragValue::new(&mut self.point_budget).speed(1000).range(2048..=2_000_000)).changed() {
+                ui.label(t.point_budget);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut self.point_budget)
+                            .speed(1000)
+                            .range(2048..=2_000_000)
+                            .custom_formatter(|n, _| t.count(n as u64))
+                            .custom_parser(|s| {
+                                s.replace(t.thousands_separator, "").trim().parse().ok()
+                            }),
+                    )
+                    .changed()
+                {
                     self.view_epoch.fetch_add(1, Ordering::Relaxed);
                     self.dirty = true;
                 }
-                ui.label("点サイズ");
+                ui.label(t.point_size);
                 ui.add(egui::Slider::new(&mut self.point_size, 1.0..=8.0));
             });
-            ui.small("左ドラッグ: 回転 / 矩形選択    右・中ドラッグ: 平行移動    ホイール: 拡大縮小    多角形: 左クリックで頂点を追加");
+            ui.small(t.controls_hint);
             let size = ui.available_size().max(egui::vec2(1., 1.));
             let aspect = (size.x / size.y) as f64;
             if (self.camera.aspect - aspect).abs() > 1e-6 {
                 self.camera.aspect = aspect;
                 self.dirty = true;
             }
-            self.renderer.upload(&self.points, DVec3::from(self.points_origin), self.points_generation);
+            self.renderer.upload(
+                &self.points,
+                DVec3::from(self.points_origin),
+                self.points_generation,
+            );
             let pixels = ctx.pixels_per_point();
             let rs = frame.wgpu_render_state().unwrap();
-            let id = self.renderer.draw(rs, &self.camera, [(size.x * pixels) as u32, (size.y * pixels) as u32], self.point_size * pixels);
-            let response = ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
+            let id = self.renderer.draw(
+                rs,
+                &self.camera,
+                [(size.x * pixels) as u32, (size.y * pixels) as u32],
+                self.point_size * pixels,
+            );
+            let response =
+                ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
             let rect = response.rect;
             if self.smoke_colors {
-                self.color_probes = self.points.iter().filter_map(|sample| {
-                    self.camera.project(DVec3::from(sample.position)).map(|(uv,_)| (
-                        egui::pos2(rect.left() + uv[0] as f32 * rect.width(), rect.top() + uv[1] as f32 * rect.height()), sample.color,
-                    ))
-                }).collect();
+                self.color_probes = self
+                    .points
+                    .iter()
+                    .filter_map(|sample| {
+                        self.camera
+                            .project(DVec3::from(sample.position))
+                            .map(|(uv, _)| {
+                                (
+                                    egui::pos2(
+                                        rect.left() + uv[0] as f32 * rect.width(),
+                                        rect.top() + uv[1] as f32 * rect.height(),
+                                    ),
+                                    sample.color,
+                                )
+                            })
+                    })
+                    .collect();
             }
-            let normalize = |p: egui::Pos2| egui::pos2(((p.x - rect.left()) / rect.width()).clamp(0., 1.), ((p.y - rect.top()) / rect.height()).clamp(0., 1.));
+            let normalize = |p: egui::Pos2| {
+                egui::pos2(
+                    ((p.x - rect.left()) / rect.width()).clamp(0., 1.),
+                    ((p.y - rect.top()) / rect.height()).clamp(0., 1.),
+                )
+            };
             let orbit = !self.select_mode && response.dragged_by(egui::PointerButton::Primary);
             if orbit {
                 let delta = ctx.input(|i| i.pointer.delta());
@@ -882,45 +1058,79 @@ impl eframe::App for Workbench {
                 self.dirty = true;
                 self.polygon.clear();
             }
-            if response.dragged_by(egui::PointerButton::Secondary) || response.dragged_by(egui::PointerButton::Middle) {
+            if response.dragged_by(egui::PointerButton::Secondary)
+                || response.dragged_by(egui::PointerButton::Middle)
+            {
                 let delta = ctx.input(|i| i.pointer.delta());
                 let forward = (DVec3::from(self.camera.target) - self.camera.eye()).normalize();
                 let right = forward.cross(DVec3::Z).normalize();
                 let up = right.cross(forward);
-                self.camera.target = (DVec3::from(self.camera.target) + (right * (-delta.x as f64) + up * delta.y as f64) * self.camera.distance / rect.height() as f64).to_array();
+                self.camera.target = (DVec3::from(self.camera.target)
+                    + (right * (-delta.x as f64) + up * delta.y as f64) * self.camera.distance
+                        / rect.height() as f64)
+                    .to_array();
                 self.dirty = true;
                 self.polygon.clear();
             }
             if response.hovered() {
                 let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
                 if scroll != 0. {
-                    self.camera.distance = (self.camera.distance * (-scroll as f64 * 0.003).exp()).clamp(0.001, 1e10);
+                    self.camera.distance =
+                        (self.camera.distance * (-scroll as f64 * 0.003).exp()).clamp(0.001, 1e10);
                     self.dirty = true;
                     self.polygon.clear();
                 }
             }
             if self.select_mode && self.job.is_none() {
                 if self.lasso {
-                    if response.clicked_by(egui::PointerButton::Primary) && let Some(pos) = response.interact_pointer_pos() {
-                        if self.polygon.is_empty() { self.selection_camera = Some(self.camera); }
+                    if response.clicked_by(egui::PointerButton::Primary)
+                        && let Some(pos) = response.interact_pointer_pos()
+                    {
+                        if self.polygon.is_empty() {
+                            self.selection_camera = Some(self.camera);
+                        }
                         self.polygon.push(normalize(pos));
                     }
                 } else {
-                    if response.drag_started_by(egui::PointerButton::Primary) && let Some(pos) = response.interact_pointer_pos() {
+                    if response.drag_started_by(egui::PointerButton::Primary)
+                        && let Some(pos) = response.interact_pointer_pos()
+                    {
                         self.drag_start = Some(normalize(pos));
                         self.selection_camera = Some(self.camera);
                         self.polygon.clear();
                     }
-                    if response.dragged_by(egui::PointerButton::Primary) && let (Some(start), Some(pos)) = (self.drag_start, response.interact_pointer_pos()) {
+                    if response.dragged_by(egui::PointerButton::Primary)
+                        && let (Some(start), Some(pos)) =
+                            (self.drag_start, response.interact_pointer_pos())
+                    {
                         let end = normalize(pos);
-                        self.polygon = vec![start, egui::pos2(end.x, start.y), end, egui::pos2(start.x, end.y)];
+                        self.polygon = vec![
+                            start,
+                            egui::pos2(end.x, start.y),
+                            end,
+                            egui::pos2(start.x, end.y),
+                        ];
                     }
-                    if response.drag_stopped_by(egui::PointerButton::Primary) { self.drag_start = None; }
+                    if response.drag_stopped_by(egui::PointerButton::Primary) {
+                        self.drag_start = None;
+                    }
                 }
             }
             if self.polygon.len() > 1 {
-                let points: Vec<_> = self.polygon.iter().map(|p| egui::pos2(rect.left() + p.x * rect.width(), rect.top() + p.y * rect.height())).collect();
-                ui.painter().add(egui::Shape::closed_line(points, egui::Stroke::new(2., egui::Color32::from_rgb(80, 220, 190))));
+                let points: Vec<_> = self
+                    .polygon
+                    .iter()
+                    .map(|p| {
+                        egui::pos2(
+                            rect.left() + p.x * rect.width(),
+                            rect.top() + p.y * rect.height(),
+                        )
+                    })
+                    .collect();
+                ui.painter().add(egui::Shape::closed_line(
+                    points,
+                    egui::Stroke::new(2., egui::Color32::from_rgb(80, 220, 190)),
+                ));
             }
         });
         self.request_view();
@@ -936,5 +1146,37 @@ impl Drop for Workbench {
         }
         self.generation.fetch_add(1, Ordering::Relaxed);
         self.view_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::carry_scan_state;
+    use std::collections::BTreeSet;
+    use uuid::Uuid;
+
+    #[test]
+    fn import_keeps_hidden_scans_and_selection() {
+        let [a, b, c] = [(); 3].map(|_| Uuid::new_v4());
+        let mut visible = BTreeSet::from([a]);
+        let mut selected = Some(b);
+        carry_scan_state(&mut visible, &mut selected, Some(&[a, b]), &[a, b, c]);
+        assert_eq!(visible, BTreeSet::from([a, c]));
+        assert_eq!(selected, Some(b));
+    }
+
+    #[test]
+    fn removed_or_foreign_scans_fall_back_to_the_first() {
+        let [a, b, c] = [(); 3].map(|_| Uuid::new_v4());
+        let mut visible = BTreeSet::from([a, b]);
+        let mut selected = Some(b);
+        // Switching to a revision without `b` drops it from both.
+        carry_scan_state(&mut visible, &mut selected, Some(&[a, b]), &[a]);
+        assert_eq!(visible, BTreeSet::from([a]));
+        assert_eq!(selected, Some(a));
+        // Another project shows everything and selects its first scan.
+        carry_scan_state(&mut visible, &mut selected, None, &[c, b]);
+        assert_eq!(visible, BTreeSet::from([b, c]));
+        assert_eq!(selected, Some(c));
     }
 }

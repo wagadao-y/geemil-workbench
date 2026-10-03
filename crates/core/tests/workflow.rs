@@ -1,4 +1,6 @@
-use geemil_core::{Camera, ImportOptions, JobControl, Pose, Project, Selection, interchange};
+use geemil_core::{
+    Camera, CoreError, ImportOptions, JobControl, Pose, Project, Selection, Stage, interchange,
+};
 use glam::DVec3;
 use std::{collections::BTreeMap, fs::File, io::BufReader, sync::atomic::Ordering};
 
@@ -197,14 +199,15 @@ fn cancellation_does_not_publish_an_import_revision() {
     let mut job = JobControl::default();
     let cancel = job.cancel.clone();
     job.progress = std::sync::Arc::new(move |stage, done, _| {
-        if stage == "Reading E57" && done >= 8192 {
+        if stage == Stage::ReadingE57 && done >= 8192 {
             cancel.store(true, Ordering::Relaxed);
         }
     });
-    assert!(
-        p.import_file(&source, ImportOptions::default(), &job)
-            .is_err()
-    );
+    let error = p
+        .import_file(&source, ImportOptions::default(), &job)
+        .unwrap_err();
+    // The import context wraps the cancellation; UIs still recognise it.
+    assert_eq!(CoreError::find(&error), Some(&CoreError::Cancelled));
     let reopened = Project::load(&p.root).unwrap();
     assert_eq!(reopened.manifest.current, initial);
     assert!(reopened.manifest.scans.is_empty());
@@ -385,4 +388,35 @@ fn e57_template_contains_no_duplicate_point_payload() {
     .unwrap();
     assert!(template.pointclouds().iter().all(|pc| pc.records == 0));
     assert_eq!(template.images().len(), 4);
+}
+
+#[test]
+fn user_facing_errors_are_typed() {
+    let dir = tempfile::tempdir().unwrap();
+    let find = |e: anyhow::Error| CoreError::find(&e).cloned();
+    let root = dir.path().join("p");
+    let p = Project::create(&root, "Test").unwrap();
+    assert_eq!(
+        find(Project::create(&root, "Test").unwrap_err()),
+        Some(CoreError::ProjectExists(root.clone()))
+    );
+    assert_eq!(
+        find(Project::load(dir.path()).unwrap_err()),
+        Some(CoreError::NotAProject(dir.path().to_owned()))
+    );
+    let text = dir.path().join("points.txt");
+    std::fs::write(&text, "0 0 0").unwrap();
+    let mut imported = p.clone();
+    assert_eq!(
+        find(
+            imported
+                .import_file(&text, ImportOptions::default(), &JobControl::default())
+                .unwrap_err()
+        ),
+        Some(CoreError::UnsupportedFormat)
+    );
+    assert_eq!(
+        find(p.export_e57(&text, &JobControl::default()).unwrap_err()),
+        Some(CoreError::OutputExists(text.clone()))
+    );
 }

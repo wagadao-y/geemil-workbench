@@ -1,5 +1,6 @@
 use geemil_core::{
-    BlockCodec, Camera, ImportOptions, JobControl, Pose, Project, Selection, ViewCache, interchange,
+    BlockCodec, Camera, ImportOptions, JobControl, Pose, Project, Selection, Stage, ViewCache,
+    interchange,
 };
 use std::{
     fs::File,
@@ -76,7 +77,7 @@ fn parallel_import_matches_one_worker_and_cancel_during_indexing_is_not_publishe
     let mut job = JobControl::default();
     let cancel = job.cancel.clone();
     job.progress = Arc::new(move |stage, done, _| {
-        if stage == "Indexing" && done > 0 {
+        if stage == Stage::Indexing && done > 0 {
             cancel.store(true, Ordering::Relaxed);
         }
     });
@@ -242,7 +243,7 @@ fn cancelled_conversion_keeps_legacy_assets_and_manifest() {
     let mut job = JobControl::default();
     let cancel = job.cancel.clone();
     job.progress = Arc::new(move |stage, _, _| {
-        if stage == "Compressing LOD" {
+        if stage == Stage::CompressingLod {
             cancel.store(true, Ordering::Relaxed);
         }
     });

@@ -35,13 +35,14 @@ fn main() -> Result<()> {
     let job = JobControl {
         progress: Arc::new(move |stage, _, _| {
             let mut state = progress_timing.lock().unwrap();
+            let stage = stage.to_string();
             if state.1 != stage {
                 let now = Instant::now();
                 let elapsed = now.duration_since(state.0).as_secs_f64();
                 let old = state.1.clone();
                 *state.2.entry(old).or_default() += elapsed;
                 state.0 = now;
-                state.1 = stage.to_owned();
+                state.1 = stage;
             }
         }),
         ..Default::default()

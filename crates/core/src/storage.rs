@@ -1,6 +1,6 @@
 use crate::codec::{pack, read_block, write_block};
 use crate::parallel::OrderedPool;
-use crate::{BlockCodec, Bounds, Chunk, Node, Project, Scan};
+use crate::{BlockCodec, Bounds, Chunk, CoreError, Node, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use std::{
     fs::{self, File},
@@ -26,7 +26,7 @@ pub struct JobControl {
     pub cancel: Arc<AtomicBool>,
     pub progress: Arc<ProgressCallback>,
 }
-pub type ProgressCallback = dyn Fn(&str, u64, u64) + Send + Sync;
+pub type ProgressCallback = dyn Fn(Stage, u64, u64) + Send + Sync;
 impl Default for JobControl {
     fn default() -> Self {
         Self {
@@ -37,10 +37,10 @@ impl Default for JobControl {
 }
 impl JobControl {
     pub fn check(&self) -> Result<()> {
-        ensure!(!self.cancel.load(Ordering::Relaxed), "Cancelled");
+        ensure!(!self.cancel.load(Ordering::Relaxed), CoreError::Cancelled);
         Ok(())
     }
-    pub fn report(&self, stage: &str, done: u64, total: u64) {
+    pub fn report(&self, stage: Stage, done: u64, total: u64) {
         (self.progress)(stage, done, total);
     }
 }
@@ -288,7 +288,7 @@ impl Builder<'_> {
         for i in 0..count {
             if i % 8192 == 0 {
                 self.job.check()?;
-                self.job.report("Partitioning", i, count);
+                self.job.report(Stage::Partitioning, i, count);
             }
             reader.read_exact(&mut record)?;
             let p = position(&record);
@@ -343,7 +343,7 @@ impl Builder<'_> {
         self.lod.write_all(&leaf.lod.1)?;
         self.lod_offset += leaf.lod.1.len() as u64;
         self.job
-            .report("Indexing", self.processed_points, self.scan.records);
+            .report(Stage::Indexing, self.processed_points, self.scan.records);
         Ok(true)
     }
     fn finish_parents(&mut self, root: &Path) -> Result<()> {
@@ -357,7 +357,7 @@ impl Builder<'_> {
                 continue;
             }
             self.job.report(
-                "Building parent LOD",
+                Stage::BuildingParentLod,
                 (self.scan.nodes.len() - id) as u64,
                 self.scan.nodes.len() as u64,
             );
@@ -485,7 +485,7 @@ impl Project {
             let mut lod = BufWriter::new(File::create(stage.join(&lod_name))?);
             let mut offset = 0;
             for (i, chunk) in updated.chunks.iter_mut().enumerate() {
-                job.report("Compressing points", i as u64, scan.chunks.len() as u64);
+                job.report(Stage::CompressingPoints, i as u64, scan.chunks.len() as u64);
                 job.check()?;
                 let bytes = self.read_chunk(scan, i as u32)?;
                 let (codec, stored_bytes) = write_block(&mut points, &bytes, scan.stride)?;
@@ -496,7 +496,7 @@ impl Project {
             }
             offset = 0;
             for (i, node) in updated.nodes.iter_mut().enumerate() {
-                job.report("Compressing LOD", i as u64, scan.nodes.len() as u64);
+                job.report(Stage::CompressingLod, i as u64, scan.nodes.len() as u64);
                 job.check()?;
                 let samples = self.read_lod(scan, i as u32)?;
                 let mut bytes = Vec::with_capacity(samples.len() * SAMPLE_BYTES);
@@ -518,7 +518,7 @@ impl Project {
             for i in 0..scan.chunks.len() {
                 job.check()?;
                 job.report(
-                    "Verifying compressed points",
+                    Stage::VerifyingCompressedPoints,
                     i as u64,
                     scan.chunks.len() as u64,
                 );

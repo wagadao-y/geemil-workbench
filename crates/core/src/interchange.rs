@@ -2,7 +2,7 @@
 //! stores scan metadata and image blobs, without a second copy of the point cloud.
 use crate::parallel::OrderedPool;
 use crate::storage::{index, make_record};
-use crate::{Bounds, ImageInfo, ImportOptions, JobControl, Pose, Project, Scan};
+use crate::{Bounds, CoreError, ImageInfo, ImportOptions, JobControl, Pose, Project, Scan, Stage};
 use anyhow::{Context, Result, ensure};
 use e57::{
     E57Reader, E57Writer, PointCloud, PointCloudWriter, Projection, Record, RecordDataType,
@@ -185,7 +185,7 @@ fn copy_images(
     let mut result = vec![];
     for (i, image) in reader.images().into_iter().enumerate() {
         job.check()?;
-        job.report("Images", i as u64, reader.images().len() as u64);
+        job.report(Stage::Images, i as u64, reader.images().len() as u64);
         let association = image
             .pointcloud_guid
             .as_ref()
@@ -361,7 +361,7 @@ fn write_geometry_batch(
     }
     *count += batch.count;
     scan.valid_points += batch.valid;
-    job.report("Reading E57", *count, scan.records);
+    job.report(Stage::ReadingE57, *count, scan.records);
     Ok(())
 }
 
@@ -414,7 +414,7 @@ fn import_e57(
         let mut file = BufWriter::new(File::create(&spool)?);
         let mut bounds: Option<Bounds> = None;
         let mut count = 0;
-        job.report("Reading E57", 0, pc.records);
+        job.report(Stage::ReadingE57, 0, pc.records);
         let workers = options.workers()?;
         // Includes RecordValue vectors, output bytes and temporary encodings.
         // Also cover Vec capacity growth for a one-point batch with unusually
@@ -592,7 +592,7 @@ fn import_las(
     for point in reader.points() {
         if count % 8192 == 0 {
             job.check()?;
-            job.report("Reading LAS/LAZ", count, scan.records);
+            job.report(Stage::ReadingLas, count, scan.records);
         }
         let point = point?;
         let p = [point.x, point.y, point.z];
@@ -667,7 +667,7 @@ impl Project {
         let (mut scans, images) = match extension.as_str() {
             "e57" => import_e57(source, &stage, options, job),
             "las" | "laz" => import_las(source, &stage, options, job),
-            _ => anyhow::bail!("Supported formats: E57, LAS, LAZ"),
+            _ => Err(CoreError::UnsupportedFormat.into()),
         }
         .with_context(|| format!("Importing {}", source.display()))?;
         job.check()?;
@@ -692,7 +692,10 @@ impl Project {
     }
 
     pub fn export_e57(&self, destination: &Path, job: &JobControl) -> Result<()> {
-        ensure!(!destination.exists(), "Output already exists");
+        ensure!(
+            !destination.exists(),
+            CoreError::OutputExists(destination.to_owned())
+        );
         let tmp = destination.with_file_name(format!("{}.tmp", Uuid::new_v4()));
         let result = (|| -> Result<()> {
             let mut writer = E57Writer::from_file(&tmp, &Uuid::new_v4().to_string())?;
@@ -704,7 +707,7 @@ impl Project {
                 let reader = E57Reader::from_file(self.path(&scan.template)?)?;
                 let cm = reader.coordinate_metadata().map(str::to_owned);
                 if let Some(existing) = &coordinate_metadata {
-                    ensure!(&cm == existing, "Scans have different coordinate systems");
+                    ensure!(&cm == existing, CoreError::CoordinateSystemMismatch);
                 } else {
                     coordinate_metadata = Some(cm);
                 }
@@ -740,7 +743,7 @@ impl Project {
                 copy_scan_metadata(&pc, &mut out, pose);
                 for id in 0..scan.chunks.len() {
                     job.check()?;
-                    job.report("Writing E57", id as u64, scan.chunks.len() as u64);
+                    job.report(Stage::WritingE57, id as u64, scan.chunks.len() as u64);
                     let data = self.read_chunk(scan, id as u32)?;
                     let mask = self.exclusion_mask(scan, id as u32)?;
                     for (i, record) in data.chunks_exact(scan.stride).enumerate() {

@@ -1,5 +1,5 @@
 use crate::storage::{position, valid};
-use crate::{ChunkMask, JobControl, Layer, Pose, Project, Sample, Scan, ViewCache};
+use crate::{ChunkMask, JobControl, Layer, Pose, Project, Sample, Scan, Stage, ViewCache};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3};
 use serde::{Deserialize, Serialize};
@@ -165,7 +165,7 @@ impl Project {
             for id in 0..scan.chunks.len() {
                 job.check()?;
                 job.report(
-                    "Selection: nearest depth",
+                    Stage::SelectionNearestDepth,
                     id as u64,
                     scan.chunks.len() as u64,
                 );
@@ -200,7 +200,7 @@ impl Project {
             for (chunk, c) in scan.chunks.iter().enumerate() {
                 job.check()?;
                 job.report(
-                    "Selection: exclusion mask",
+                    Stage::SelectionExclusionMask,
                     chunk as u64,
                     scan.chunks.len() as u64,
                 );
@@ -355,7 +355,7 @@ impl Project {
             }
         }
         while let Some((_, si, ni)) = queue.pop() {
-            job.report("View LOD", 0, budget as u64);
+            job.report(Stage::ViewLod, 0, budget as u64);
             job.check()?;
             let scan = scans[si];
             let children: Vec<_> = scan.nodes[ni as usize]
@@ -388,7 +388,7 @@ impl Project {
             .map(|(si, ni)| scans[*si].nodes[*ni as usize].lod_count as usize)
             .sum();
         for (si, ni) in cut {
-            job.report("View points", result.len() as u64, budget as u64);
+            job.report(Stage::ViewPoints, result.len() as u64, budget as u64);
             job.check()?;
             let scan = scans[si];
             let node = &scan.nodes[ni as usize];

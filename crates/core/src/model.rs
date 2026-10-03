@@ -1,3 +1,4 @@
+use crate::CoreError;
 use anyhow::{Context, Result, ensure};
 use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
@@ -194,11 +195,7 @@ pub struct Project {
 }
 impl Project {
     pub fn create(root: &Path, name: &str) -> Result<Self> {
-        ensure!(
-            !root.exists(),
-            "Project directory already exists: {}",
-            root.display()
-        );
+        ensure!(!root.exists(), CoreError::ProjectExists(root.to_owned()));
         fs::create_dir_all(root)?;
         for dir in ["data", "layers", "staging"] {
             fs::create_dir(root.join(dir))?;
@@ -228,14 +225,17 @@ impl Project {
         Ok(p)
     }
     pub fn load(root: &Path) -> Result<Self> {
+        ensure!(
+            root.join("project.json").is_file(),
+            CoreError::NotAProject(root.to_owned())
+        );
         let root = fs::canonicalize(root)?;
         let manifest: Manifest =
             serde_json::from_reader(fs::File::open(root.join("project.json"))?)
                 .context("Invalid project metadata")?;
         ensure!(
             (1..=FORMAT_VERSION).contains(&manifest.format_version),
-            "Unsupported project format {}",
-            manifest.format_version
+            CoreError::UnsupportedProjectFormat(manifest.format_version)
         );
         ensure!(
             manifest.revisions.iter().any(|r| r.id == manifest.current),
