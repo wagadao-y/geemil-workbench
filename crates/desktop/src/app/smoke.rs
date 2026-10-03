@@ -21,7 +21,7 @@ pub struct SmokeOptions {
     /// (mode, whether an inside exclusion limits its depth).
     pub select: Option<(SelectionMode, bool)>,
     /// Open this dialog for the capture: revisions, shortcuts, new-project,
-    /// cleanup, save-as, subsample or noise. Also selects the first folder of the tree.
+    /// cleanup, save-as, subsample, noise or export-las. Also selects the first folder of the tree.
     pub dialog: Option<String>,
     /// Steps run one by one once the view loaded, each followed by a state
     /// line: exclude, undo, redo, save, folder (new folder with the first scan),
@@ -126,6 +126,10 @@ impl Workbench {
                 "shortcuts" => Some(Dialog::Shortcuts),
                 "new-project" => Some(Dialog::new_project(&self.settings, vec![])),
                 "cleanup" => Some(Dialog::Cleanup),
+                "export-las" => Some(Dialog::ExportLas {
+                    per_scan: false,
+                    laz: true,
+                }),
                 "subsample" => Some(Dialog::Filter(super::dialogs::Filter::Subsample {
                     size: self.settings.subsample_size,
                 })),

@@ -55,6 +55,7 @@ impl Workbench {
                     ui.separator();
                     self.menu_item(ui, Action::Import, &mut chosen);
                     self.menu_item(ui, Action::ExportE57, &mut chosen);
+                    self.menu_item(ui, Action::ExportLas, &mut chosen);
                     ui.separator();
                     self.menu_item(ui, Action::Cleanup, &mut chosen);
                     ui.separator();

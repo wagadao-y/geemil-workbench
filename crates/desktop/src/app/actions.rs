@@ -29,6 +29,7 @@ pub(super) enum Action {
     OpenRecent(PathBuf),
     Import,
     ExportE57,
+    ExportLas,
     Quit,
     Undo,
     Redo,
@@ -57,6 +58,7 @@ impl Action {
             Self::Open | Self::OpenRecent(_) => icon::FOLDER_OPEN,
             Self::Import => icon::FILE_ARROW_DOWN,
             Self::ExportE57 => icon::EXPORT,
+            Self::ExportLas => icon::FILE_ARROW_UP,
             Self::Quit => icon::SIGN_OUT,
             Self::Undo => icon::ARROW_U_UP_LEFT,
             Self::Redo => icon::ARROW_U_UP_RIGHT,
@@ -92,6 +94,7 @@ impl Action {
             Self::OpenRecent(path) => path.display().to_string(),
             Self::Import => t.import.into(),
             Self::ExportE57 => t.export_e57.into(),
+            Self::ExportLas => t.export_las.into(),
             Self::Quit => t.quit.into(),
             Self::Undo => t.undo.into(),
             Self::Redo => t.redo.into(),
@@ -191,7 +194,7 @@ impl Workbench {
         match action {
             Action::NewProject | Action::Open | Action::OpenRecent(_) => idle,
             Action::Import | Action::NewFolder => idle && project.is_some(),
-            Action::ExportE57 => idle && has_scans,
+            Action::ExportE57 | Action::ExportLas => idle && has_scans,
             Action::Undo => idle && self.undo.can_undo(),
             Action::Redo => idle && self.undo.can_redo(),
             Action::Exclude => idle && self.selection.is_ready(),
@@ -273,6 +276,12 @@ impl Workbench {
                     });
                 }
             }
+            Action::ExportLas => {
+                self.dialog = Some(Dialog::ExportLas {
+                    per_scan: false,
+                    laz: true,
+                })
+            }
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
@@ -347,6 +356,31 @@ impl Workbench {
         }
     }
 
+    /// Asks where to write and exports the current state as LAS or LAZ.
+    pub(super) fn export_las(&mut self, ctx: &egui::Context, per_scan: bool, laz: bool) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let project = (**project).clone();
+        let ext = if laz { "laz" } else { "las" };
+        if per_scan {
+            if let Some(dir) = rfd::FileDialog::new().pick_folder() {
+                self.start(ctx, false, move |job| {
+                    project.export_las_per_scan(&dir, laz, &job)?;
+                    Ok(project)
+                });
+            }
+        } else if let Some(path) = rfd::FileDialog::new()
+            .add_filter(ext.to_uppercase(), &[ext])
+            .set_file_name(format!("{}.{ext}", project.manifest.name))
+            .save_file()
+        {
+            self.start(ctx, false, move |job| {
+                project.export_las(&path, &job)?;
+                Ok(project)
+            });
+        }
+    }
     /// Runs a point filter on the visible scans and remembers its parameters.
     pub(super) fn run_filter(&mut self, ctx: &egui::Context, filter: Filter) {
         let Some(p) = &self.project else { return };

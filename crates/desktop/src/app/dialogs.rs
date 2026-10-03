@@ -27,6 +27,10 @@ pub(super) enum Dialog {
         name: String,
     },
     Filter(Filter),
+    ExportLas {
+        per_scan: bool,
+        laz: bool,
+    },
     Shortcuts,
     About,
 }
@@ -75,6 +79,7 @@ enum Outcome {
     Cleanup,
     RenameGroup(Uuid, String),
     Filter(Filter),
+    ExportLas { per_scan: bool, laz: bool },
 }
 
 fn buttons(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -243,6 +248,29 @@ impl Workbench {
                         }
                     });
                 }
+                Dialog::ExportLas { per_scan, laz } => {
+                    ui.heading(format!(
+                        "{} {}",
+                        icon::FILE_ARROW_UP,
+                        t.export_las.trim_end_matches('…')
+                    ));
+                    ui.label(t.export_las_message);
+                    ui.add_space(6.);
+                    ui.radio_value(per_scan, false, t.export_merged);
+                    ui.radio_value(per_scan, true, t.export_per_scan);
+                    ui.checkbox(laz, t.export_compress);
+                    buttons(ui, |ui| {
+                        if ui.button(t.export_button).clicked() {
+                            outcome = Outcome::ExportLas {
+                                per_scan: *per_scan,
+                                laz: *laz,
+                            };
+                        }
+                        if ui.button(t.cancel).clicked() {
+                            outcome = Outcome::Close;
+                        }
+                    });
+                }
                 Dialog::Shortcuts => {
                     ui.heading(format!("{} {}", icon::KEYBOARD, t.shortcuts));
                     egui::Grid::new("shortcuts")
@@ -314,6 +342,10 @@ impl Workbench {
             Outcome::Filter(filter) => {
                 self.dialog = None;
                 self.run_filter(ctx, filter);
+            }
+            Outcome::ExportLas { per_scan, laz } => {
+                self.dialog = None;
+                self.export_las(ctx, per_scan, laz);
             }
         }
     }

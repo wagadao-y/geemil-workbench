@@ -51,6 +51,11 @@ fn main() -> Result<()> {
         Some("compress") if args.len() == 2 => {
             Project::load(Path::new(&args[1]))?.compress_storage(&job)?;
         }
+        Some("export-las") if args.len() == 3 => {
+            let started = std::time::Instant::now();
+            let n = Project::load(Path::new(&args[1]))?.export_las(Path::new(&args[2]), &job)?;
+            println!("{n} points written in {:.2?}", started.elapsed());
+        }
         Some("subsample") if args.len() == 3 => {
             let mut p = Project::load(Path::new(&args[1]))?;
             let scans: Vec<_> = p.scans().map(|s| s.id).collect();
@@ -66,7 +71,7 @@ fn main() -> Result<()> {
             println!("{removed} points excluded in {:.2?}", started.elapsed());
         }
         _ => bail!(
-            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | compress PROJECT | subsample PROJECT VOXEL_M | noise PROJECT RADIUS_M MIN_NEIGHBOURS"
+            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | export-las PROJECT FILE.las|laz | compress PROJECT | subsample PROJECT VOXEL_M | noise PROJECT RADIUS_M MIN_NEIGHBOURS"
         ),
     }
     Ok(())

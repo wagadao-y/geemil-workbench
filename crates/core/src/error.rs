@@ -18,6 +18,7 @@ pub enum Stage {
     Subsampling,
     NoiseFilter,
     WritingE57,
+    WritingLas,
     ViewLod,
     ViewPoints,
 }
@@ -38,6 +39,7 @@ impl fmt::Display for Stage {
             Self::Subsampling => "Voxel subsampling",
             Self::NoiseFilter => "Noise filter",
             Self::WritingE57 => "Writing E57",
+            Self::WritingLas => "Writing LAS/LAZ",
             Self::ViewLod => "View LOD",
             Self::ViewPoints => "View points",
         })
