@@ -21,13 +21,14 @@ pub struct SmokeOptions {
     /// (mode, whether an inside exclusion limits its depth).
     pub select: Option<(SelectionMode, bool)>,
     /// Open this dialog for the capture: revisions, shortcuts, new-project,
-    /// cleanup or save-as. Also selects the first folder of the tree.
+    /// cleanup, save-as, subsample or noise. Also selects the first folder of the tree.
     pub dialog: Option<String>,
     /// Steps run one by one once the view loaded, each followed by a state
     /// line: exclude, undo, redo, save, folder (new folder with the first scan),
     /// remove (take out the first scan), measure (measure two picked points),
     /// preview (edit the first scan's transform without applying it),
-    /// apply-transform (apply the edited transform).
+    /// apply-transform (apply the edited transform), subsample (5 cm voxels),
+    /// noise (0.1 m radius, 4 neighbours).
     pub script: Vec<String>,
 }
 
@@ -125,6 +126,13 @@ impl Workbench {
                 "shortcuts" => Some(Dialog::Shortcuts),
                 "new-project" => Some(Dialog::new_project(&self.settings, vec![])),
                 "cleanup" => Some(Dialog::Cleanup),
+                "subsample" => Some(Dialog::Filter(super::dialogs::Filter::Subsample {
+                    size: self.settings.subsample_size,
+                })),
+                "noise" => Some(Dialog::Filter(super::dialogs::Filter::Noise {
+                    radius: self.settings.noise_radius,
+                    min_neighbours: self.settings.noise_neighbours,
+                })),
                 "save-as" => Some(Dialog::SaveAs {
                     name: "リビジョン 2".into(),
                 }),
@@ -306,6 +314,14 @@ impl Workbench {
                     self.points.len()
                 );
             }
+            "subsample" => self.run_filter(ctx, super::dialogs::Filter::Subsample { size: 0.05 }),
+            "noise" => self.run_filter(
+                ctx,
+                super::dialogs::Filter::Noise {
+                    radius: 0.1,
+                    min_neighbours: 4,
+                },
+            ),
             "apply-transform" => {
                 if let Some((id, pose)) = self.transform_preview() {
                     self.apply_edit(|p| p.set_transform(id, pose));

@@ -51,8 +51,22 @@ fn main() -> Result<()> {
         Some("compress") if args.len() == 2 => {
             Project::load(Path::new(&args[1]))?.compress_storage(&job)?;
         }
+        Some("subsample") if args.len() == 3 => {
+            let mut p = Project::load(Path::new(&args[1]))?;
+            let scans: Vec<_> = p.scans().map(|s| s.id).collect();
+            let started = std::time::Instant::now();
+            let removed = p.subsample(args[2].parse()?, &scans, &job)?;
+            println!("{removed} points excluded in {:.2?}", started.elapsed());
+        }
+        Some("noise") if args.len() == 4 => {
+            let mut p = Project::load(Path::new(&args[1]))?;
+            let scans: Vec<_> = p.scans().map(|s| s.id).collect();
+            let started = std::time::Instant::now();
+            let removed = p.remove_noise(args[2].parse()?, args[3].parse()?, &scans, &job)?;
+            println!("{removed} points excluded in {:.2?}", started.elapsed());
+        }
         _ => bail!(
-            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | compress PROJECT"
+            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | compress PROJECT | subsample PROJECT VOXEL_M | noise PROJECT RADIUS_M MIN_NEIGHBOURS"
         ),
     }
     Ok(())

@@ -7,7 +7,7 @@ use super::{
 use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
-use geemil_core::{Layer, Project, Revision};
+use geemil_core::{Layer, LayerKind, Project, Revision};
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -201,7 +201,15 @@ pub(super) fn saved_time(r: &Revision) -> String {
 }
 
 pub(super) fn layer_label(t: &Strings, layer: &Layer) -> String {
-    (t.exclusion_layer)(&t.count(layer.excluded))
+    let points = t.count(layer.excluded);
+    match layer.kind {
+        LayerKind::Manual => (t.exclusion_layer)(&points),
+        LayerKind::Subsample { size } => (t.subsample_layer)(&size.to_string(), &points),
+        LayerKind::Noise {
+            radius,
+            min_neighbours,
+        } => (t.noise_layer)(&radius.to_string(), min_neighbours, &points),
+    }
 }
 
 impl Workbench {

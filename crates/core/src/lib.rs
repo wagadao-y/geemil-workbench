@@ -3,6 +3,7 @@
 mod codec;
 mod edit;
 mod error;
+mod filter;
 mod history;
 pub mod interchange;
 mod model;

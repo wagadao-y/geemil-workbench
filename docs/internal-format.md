@@ -91,7 +91,7 @@ GUIの「ツール → 旧形式のデータを圧縮」またはCLIの`compress
 
 ## レイヤー、pose、リビジョン
 
-`.mask`はチャンクごとのpacked bit列。index `i`はbyte `i / 8`のbit `i % 8`に対応し、1が除外。レイヤーメタデータがdataset UUID・chunk index・byte offset・長さを持つ。現在のリビジョンが有効にしているレイヤーのORを点の除外状態とする。
+`.mask`はチャンクごとのpacked bit列。index `i`はbyte `i / 8`のbit `i % 8`に対応し、1が除外。レイヤーメタデータがdataset UUID・chunk index・byte offset・長さを持つ。現在のリビジョンが有効にしているレイヤーのORを点の除外状態とする。レイヤーの`kind`は作成した操作を表す（`manual`: 範囲除外、`subsample`: ボクセル間引きと`size`、`noise`: ノイズ除去と`radius`・`min_neighbours`）。`kind`のない古いレイヤーは`manual`として読む。
 
 各リビジョンは親ID、対象スキャンID、レイヤーID、追加剛体変換、フォルダー（`groups`: ID・名前・親フォルダー）、スキャンの所属フォルダー（`scan_groups`）、操作内容、保存日時（`saved_at`、Unix秒）を持つ。`transforms`はスキャンとフォルダーの両方の追加変換を持ち、スキャンの世界座標は「上位フォルダーから順の変換 × スキャン自身の変換 × スキャンpose × ローカル座標」で求める。
 

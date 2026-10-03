@@ -44,6 +44,10 @@ pub(super) struct Settings {
     point_size: f32,
     edl: bool,
     edl_strength: f32,
+    /// Last filter parameters, offered again next time.
+    subsample_size: f64,
+    noise_radius: f64,
+    noise_neighbours: u32,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -54,6 +58,9 @@ impl Default for Settings {
             point_size: 2.,
             edl: true,
             edl_strength: 1.,
+            subsample_size: 0.01,
+            noise_radius: 0.05,
+            noise_neighbours: 4,
         }
     }
 }

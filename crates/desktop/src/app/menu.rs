@@ -92,6 +92,9 @@ impl Workbench {
                         self.menu_item(ui, Action::Tool(tool), &mut chosen);
                     }
                     ui.separator();
+                    self.menu_item(ui, Action::Subsample, &mut chosen);
+                    self.menu_item(ui, Action::RemoveNoise, &mut chosen);
+                    ui.separator();
                     self.menu_item(ui, Action::CompressStorage, &mut chosen);
                 });
                 ui.menu_button(t.menu_help, |ui| {

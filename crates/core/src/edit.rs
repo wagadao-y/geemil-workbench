@@ -1,5 +1,7 @@
 use crate::storage::{position, valid};
-use crate::{Bounds, ChunkMask, JobControl, Layer, Pose, Project, Sample, Scan, Stage, ViewCache};
+use crate::{
+    Bounds, ChunkMask, JobControl, Layer, LayerKind, Pose, Project, Sample, Scan, Stage, ViewCache,
+};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3, DVec4};
 use serde::{Deserialize, Serialize};
@@ -284,6 +286,97 @@ pub(crate) fn is_excluded(mask: &[u8], i: usize) -> bool {
     mask[i / 8] & (1 << (i % 8)) != 0
 }
 
+/// Writes the chunk masks of a new exclusion layer to staging, then adds the
+/// layer and turns it on in the working state.
+pub(crate) struct LayerWriter {
+    id: Uuid,
+    tmp: std::path::PathBuf,
+    file: File,
+    masks: Vec<ChunkMask>,
+    offset: u64,
+    total: u64,
+}
+impl LayerWriter {
+    pub(crate) fn new(project: &Project) -> Result<Self> {
+        let id = Uuid::new_v4();
+        let tmp = project.root.join("staging").join(format!("{id}.mask"));
+        Ok(Self {
+            id,
+            file: File::create(&tmp)?,
+            tmp,
+            masks: vec![],
+            offset: 0,
+            total: 0,
+        })
+    }
+    /// Adds the newly excluded points of one chunk; `count` set bits in `mask`.
+    pub(crate) fn push(&mut self, scan: Uuid, chunk: u32, mask: &[u8], count: u64) -> Result<()> {
+        if count == 0 {
+            return Ok(());
+        }
+        self.file.write_all(mask)?;
+        self.masks.push(ChunkMask {
+            scan,
+            chunk,
+            offset: self.offset,
+            bytes: mask.len() as u32,
+            excluded: count,
+        });
+        self.offset += mask.len() as u64;
+        self.total += count;
+        Ok(())
+    }
+    /// Commits the layer as one edit described by `operation`, to which the
+    /// layer id and point count are added. Excluding nothing changes nothing.
+    pub(crate) fn finish(
+        self,
+        project: &mut Project,
+        kind: LayerKind,
+        mut operation: serde_json::Value,
+    ) -> Result<u64> {
+        let Self {
+            id,
+            tmp,
+            file,
+            masks,
+            total,
+            ..
+        } = self;
+        file.sync_all()?;
+        drop(file);
+        if total == 0 {
+            fs::remove_file(tmp)?;
+            return Ok(0);
+        }
+        let relative = format!("layers/{id}.mask");
+        fs::rename(tmp, project.path(&relative)?)?;
+        let mut next = project.clone();
+        next.manifest.layers.push(Layer {
+            id,
+            name: match kind {
+                LayerKind::Manual => format!("Manual exclusion ({total} points)"),
+                LayerKind::Subsample { size } => format!("Voxel subsampling {size} m"),
+                LayerKind::Noise {
+                    radius,
+                    min_neighbours,
+                } => format!("Noise filter {radius} m, {min_neighbours} neighbours"),
+            },
+            mask_file: relative,
+            masks,
+            excluded: total,
+            kind,
+        });
+        operation["layer"] = serde_json::json!(id);
+        operation["excluded"] = serde_json::json!(total);
+        next.edit(operation, |s| {
+            s.layers.push(id);
+            Ok(())
+        })?;
+        *project = next;
+        Ok(total)
+    }
+}
+
 impl Project {
     pub fn exclusion_mask(&self, scan: &Scan, chunk: u32) -> Result<Vec<u8>> {
         let count = scan
@@ -318,6 +411,22 @@ impl Project {
             }
         }
         Ok(mask)
+    }
+    /// The valid, not excluded original points of a chunk in scan coordinates.
+    pub fn points(&self, scan: &Scan, chunk: u32) -> Result<Vec<Sample>> {
+        let data = self.read_chunk(scan, chunk)?;
+        let mask = self.exclusion_mask(scan, chunk)?;
+        Ok(data
+            .chunks_exact(scan.stride)
+            .enumerate()
+            .filter(|(i, p)| valid(p) && !is_excluded(&mask, *i))
+            .map(|(i, p)| Sample {
+                chunk,
+                index: i as u32,
+                position: position(p),
+                color: crate::storage::point_color(p),
+            })
+            .collect())
     }
     /// Depth of the nearest surviving original point inside the polygon among
     /// `scan_ids`, which `ExcludeInside` measures `depth_meters` from.
@@ -403,13 +512,7 @@ impl Project {
             }
             _ => (None, f64::INFINITY, None),
         };
-        let id = Uuid::new_v4();
-        let relative = format!("layers/{id}.mask");
-        let tmp = self.root.join("staging").join(format!("{id}.mask"));
-        let mut file = File::create(&tmp)?;
-        let mut masks = vec![];
-        let mut offset = 0;
-        let mut total = 0;
+        let mut layer = LayerWriter::new(self)?;
         for (index, scan) in scans.iter().enumerate() {
             let world = self.world_matrix(scan);
             for (chunk, c) in scan.chunks.iter().enumerate() {
@@ -444,46 +547,16 @@ impl Project {
                         count += 1;
                     }
                 }
-                if count > 0 {
-                    file.write_all(&mask)?;
-                    masks.push(ChunkMask {
-                        scan: scan.id,
-                        chunk: chunk as u32,
-                        offset,
-                        bytes: mask.len() as u32,
-                        excluded: count,
-                    });
-                    offset += mask.len() as u64;
-                    total += count;
-                }
+                layer.push(scan.id, chunk as u32, &mask, count)?;
             }
         }
-        file.sync_all()?;
-        drop(file);
         job.check()?;
-        if total == 0 {
-            fs::remove_file(tmp)?;
-            return Ok(0);
-        }
-        fs::rename(tmp, self.path(&relative)?)?;
-        let mut next = self.clone();
-        next.manifest.layers.push(Layer {
-            id,
-            name: format!("Manual exclusion ({total} points)"),
-            mask_file: relative,
-            masks,
-            excluded: total,
-        });
-        next.edit(
+        layer.finish(
+            self,
+            LayerKind::Manual,
             serde_json::json!({"kind": "selection", "selection": selection, "scans": scan_ids,
-                "nearest": nearest, "layer": id, "excluded": total}),
-            |s| {
-                s.layers.push(id);
-                Ok(())
-            },
-        )?;
-        *self = next;
-        Ok(total)
+                "nearest": nearest}),
+        )
     }
     /// Turns an exclusion layer on or off in the working state.
     pub fn set_layer_enabled(&mut self, id: Uuid, enabled: bool) -> Result<()> {

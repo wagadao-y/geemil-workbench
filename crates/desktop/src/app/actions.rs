@@ -1,7 +1,7 @@
 //! Everything the menus, the toolbar and the keyboard can do, in one place.
 use super::{
     Workbench,
-    dialogs::{AfterDiscard, Dialog},
+    dialogs::{AfterDiscard, Dialog, Filter},
     jobs::Notice,
     selection::Tool,
 };
@@ -44,6 +44,8 @@ pub(super) enum Action {
     Discard,
     Cleanup,
     CompressStorage,
+    Subsample,
+    RemoveNoise,
     Tool(Tool),
     Shortcuts,
     About,
@@ -73,6 +75,8 @@ impl Action {
             Self::Discard => icon::ARROW_COUNTER_CLOCKWISE,
             Self::Cleanup => icon::BROOM,
             Self::CompressStorage => icon::ARCHIVE,
+            Self::Subsample => icon::DOTS_NINE,
+            Self::RemoveNoise => icon::FUNNEL,
             Self::Tool(Tool::Navigate) => icon::HAND,
             Self::Tool(Tool::Rect) => icon::SELECTION,
             Self::Tool(Tool::Polygon) => icon::POLYGON,
@@ -106,6 +110,8 @@ impl Action {
             Self::Discard => t.discard.into(),
             Self::Cleanup => t.cleanup.into(),
             Self::CompressStorage => t.compress_storage.into(),
+            Self::Subsample => t.subsample.into(),
+            Self::RemoveNoise => t.remove_noise.into(),
             Self::Tool(Tool::Navigate) => t.navigate.into(),
             Self::Tool(Tool::Rect) => t.tool_rect.into(),
             Self::Tool(Tool::Polygon) => t.tool_polygon.into(),
@@ -192,6 +198,7 @@ impl Workbench {
             Action::Save | Action::SaveAs | Action::Discard => idle && unsaved,
             Action::Revisions | Action::Cleanup => idle && project.is_some(),
             Action::CompressStorage => idle && project.is_some_and(|p| p.has_legacy_storage()),
+            Action::Subsample | Action::RemoveNoise => idle && !self.visible.is_empty(),
             Action::FitView | Action::View(_) => project.is_some(),
             Action::Quit
             | Action::ClearSelection
@@ -318,6 +325,17 @@ impl Workbench {
                     Ok(project)
                 });
             }
+            Action::Subsample => {
+                self.dialog = Some(Dialog::Filter(Filter::Subsample {
+                    size: self.settings.subsample_size,
+                }))
+            }
+            Action::RemoveNoise => {
+                self.dialog = Some(Dialog::Filter(Filter::Noise {
+                    radius: self.settings.noise_radius,
+                    min_neighbours: self.settings.noise_neighbours,
+                }))
+            }
             Action::Tool(tool) => {
                 self.selection.tool = tool;
                 if tool != Tool::Measure {
@@ -329,6 +347,32 @@ impl Workbench {
         }
     }
 
+    /// Runs a point filter on the visible scans and remembers its parameters.
+    pub(super) fn run_filter(&mut self, ctx: &egui::Context, filter: Filter) {
+        let Some(p) = &self.project else { return };
+        let mut project = (**p).clone();
+        let ids: Vec<_> = self.visible.iter().copied().collect();
+        match filter {
+            Filter::Subsample { size } => self.settings.subsample_size = size,
+            Filter::Noise {
+                radius,
+                min_neighbours,
+            } => {
+                self.settings.noise_radius = radius;
+                self.settings.noise_neighbours = min_neighbours;
+            }
+        }
+        self.start(ctx, true, move |job| {
+            match filter {
+                Filter::Subsample { size } => project.subsample(size, &ids, &job)?,
+                Filter::Noise {
+                    radius,
+                    min_neighbours,
+                } => project.remove_noise(radius, min_neighbours, &ids, &job)?,
+            };
+            Ok(project)
+        });
+    }
     /// The folder new folders go into: the selected folder, or the selected
     /// scan's folder.
     fn selected_group(&self) -> Option<uuid::Uuid> {

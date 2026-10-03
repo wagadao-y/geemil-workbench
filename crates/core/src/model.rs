@@ -161,6 +161,19 @@ pub struct ChunkMask {
     pub bytes: u32,
     pub excluded: u64,
 }
+/// What produced an exclusion layer.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LayerKind {
+    /// A range exclusion drawn in the viewport.
+    #[default]
+    Manual,
+    /// Voxel subsampling: one original point kept per voxel of `size` metres.
+    Subsample { size: f64 },
+    /// Isolated point removal: points with fewer than `min_neighbours` other
+    /// points within `radius` metres.
+    Noise { radius: f64, min_neighbours: u32 },
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Layer {
     pub id: Uuid,
@@ -168,6 +181,8 @@ pub struct Layer {
     pub mask_file: String,
     pub masks: Vec<ChunkMask>,
     pub excluded: u64,
+    #[serde(default)]
+    pub kind: LayerKind,
 }
 /// A folder in the scan tree. Its transform, kept in `Revision::transforms`
 /// under its id, moves everything below it.

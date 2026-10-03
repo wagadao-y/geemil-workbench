@@ -26,8 +26,15 @@ pub(super) enum Dialog {
         id: Uuid,
         name: String,
     },
+    Filter(Filter),
     Shortcuts,
     About,
+}
+/// A point filter and its parameters, as edited in its dialog.
+#[derive(Clone, Copy)]
+pub(super) enum Filter {
+    Subsample { size: f64 },
+    Noise { radius: f64, min_neighbours: u32 },
 }
 #[derive(Clone, Copy)]
 pub(super) enum AfterDiscard {
@@ -67,6 +74,7 @@ enum Outcome {
     Discard(AfterDiscard),
     Cleanup,
     RenameGroup(Uuid, String),
+    Filter(Filter),
 }
 
 fn buttons(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
@@ -90,6 +98,7 @@ impl Workbench {
         }
         let id = egui::Id::new("dialog");
         let mut outcome = Outcome::Keep;
+        let visible = self.visible.len();
         let response = egui::Modal::new(id).show(ctx, |ui| {
             ui.set_max_width(520.);
             match dialog {
@@ -190,6 +199,50 @@ impl Workbench {
                         }
                     });
                 }
+                Dialog::Filter(filter) => {
+                    let (heading, message) = match filter {
+                        Filter::Subsample { .. } => (
+                            format!("{} {}", icon::DOTS_NINE, t.subsample),
+                            t.subsample_message,
+                        ),
+                        Filter::Noise { .. } => (
+                            format!("{} {}", icon::FUNNEL, t.remove_noise),
+                            t.noise_message,
+                        ),
+                    };
+                    ui.heading(heading.trim_end_matches('…'));
+                    ui.label(message);
+                    ui.add_space(6.);
+                    egui::Grid::new("filter")
+                        .num_columns(2)
+                        .show(ui, |ui| match filter {
+                            Filter::Subsample { size } => {
+                                ui.label(t.voxel_size);
+                                ui.add(metres(size));
+                                ui.end_row();
+                            }
+                            Filter::Noise {
+                                radius,
+                                min_neighbours,
+                            } => {
+                                ui.label(t.search_radius);
+                                ui.add(metres(radius));
+                                ui.end_row();
+                                ui.label(t.min_neighbours);
+                                ui.add(egui::DragValue::new(min_neighbours).range(1..=100));
+                                ui.end_row();
+                            }
+                        });
+                    ui.small((t.filter_targets)(visible));
+                    buttons(ui, |ui| {
+                        if ui.button(t.run).clicked() {
+                            outcome = Outcome::Filter(*filter);
+                        }
+                        if ui.button(t.cancel).clicked() {
+                            outcome = Outcome::Close;
+                        }
+                    });
+                }
                 Dialog::Shortcuts => {
                     ui.heading(format!("{} {}", icon::KEYBOARD, t.shortcuts));
                     egui::Grid::new("shortcuts")
@@ -258,6 +311,10 @@ impl Workbench {
                 self.dialog = None;
                 self.apply_edit(|p| p.rename_group(id, name));
             }
+            Outcome::Filter(filter) => {
+                self.dialog = None;
+                self.run_filter(ctx, filter);
+            }
         }
     }
     fn cleanup(&mut self, ctx: &egui::Context) {
@@ -272,4 +329,12 @@ impl Workbench {
             Ok(project)
         });
     }
+}
+
+/// A length input in metres for filter parameters.
+fn metres(v: &mut f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(v)
+        .range(0.001..=10.)
+        .speed(0.001)
+        .max_decimals(3)
 }
