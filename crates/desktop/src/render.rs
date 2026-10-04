@@ -30,8 +30,11 @@ struct Vertex {
 struct Uniform {
     matrix: [[f32; 4]; 4],
     viewport: [f32; 2],
+    /// Splat diameter in physical pixels, or with `adaptive` above zero the
+    /// smallest one.
     size: f32,
-    padding: f32,
+    /// Potree's adaptive size factor; 0 draws every splat `size` wide.
+    adaptive: f32,
     tint: [f32; 4],
     /// View depth of a vertex for EDL as `dot(depth, (position, 1))`.
     depth: [f32; 4],
@@ -41,7 +44,9 @@ struct Uniform {
     box_highlight_on: f32,
     /// 1 to colour by height with `ramp`.
     ramp_on: f32,
-    padding2: [f32; 2],
+    /// Physical pixels a metre spans at a clip-space w of 1.
+    pixels_per_metre: f32,
+    padding: f32,
     /// Height scaled to 0..1 over the ramp as `dot(ramp, (position, 1))`.
     ramp: [f32; 4],
 }
@@ -72,6 +77,11 @@ struct Targets {
 pub struct DrawOptions<'a> {
     /// Splat diameter in physical pixels.
     pub point_size: f32,
+    /// Potree's adaptive point size with this size factor: each point is as
+    /// wide as 1.7 times its spacing (see `DrawNode::spacings`), but at least
+    /// `min_size` physical pixels.
+    pub adaptive: Option<f32>,
+    pub min_size: f32,
     pub edl: Edl,
     /// Maps the project frame into a box whose interior points are highlighted.
     pub highlight_box: Option<DMat4>,
@@ -90,6 +100,8 @@ pub struct DrawNode<'a> {
     pub tint: [f32; 4],
     /// Points to highlight, e.g. those a move would take.
     pub marks: Option<&'a [bool]>,
+    /// Each point's spacing in metres, for adaptive point size.
+    pub spacings: Option<&'a Arc<[f32]>>,
 }
 /// A node's points on the GPU. It keeps their samples, so a new node never
 /// reuses the address that identifies this one.
@@ -99,6 +111,10 @@ struct GpuNode {
     vertices: wgpu::Buffer,
     /// One u32 per point; bit 0 highlights it.
     flags: wgpu::Buffer,
+    /// One f32 per point: its spacing for adaptive point size.
+    spacings: wgpu::Buffer,
+    /// The spacings written, kept so their address identifies them.
+    spacings_written: Option<Arc<[f32]>>,
     count: u32,
     marked: bool,
     marks_revision: u64,
@@ -173,6 +189,11 @@ impl PointRenderer {
                         array_stride: 4,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![2=>Uint32],
+                    }),
+                    Some(wgpu::VertexBufferLayout {
+                        array_stride: 4,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &wgpu::vertex_attr_array![3=>Float32],
                     }),
                 ],
             },
@@ -262,6 +283,8 @@ impl PointRenderer {
                 origin,
                 vertices: create("node points", bytemuck::cast_slice(&vertices)),
                 flags: create("node flags", &vec![0u8; node.samples.len() * 4]),
+                spacings: create("node spacings", &vec![0u8; node.samples.len() * 4]),
+                spacings_written: None,
                 count: node.samples.len() as u32,
                 marked: false,
                 marks_revision: 0,
@@ -272,6 +295,16 @@ impl PointRenderer {
         }
         let gpu = self.nodes.get_mut(&key).unwrap();
         gpu.used = self.frame;
+        if let Some(spacings) = node.spacings
+            && gpu
+                .spacings_written
+                .as_ref()
+                .is_none_or(|w| !Arc::ptr_eq(w, spacings))
+        {
+            self.queue
+                .write_buffer(&gpu.spacings, 0, bytemuck::cast_slice(spacings));
+            gpu.spacings_written = Some(spacings.clone());
+        }
         if gpu.marks_revision != revision {
             gpu.marks_revision = revision;
             let marks = node.marks.filter(|m| m.iter().any(|m| *m));
@@ -316,6 +349,8 @@ impl PointRenderer {
     ) -> egui::TextureId {
         let DrawOptions {
             point_size,
+            adaptive,
+            min_size,
             edl,
             highlight_box,
             height_ramp,
@@ -372,6 +407,14 @@ impl PointRenderer {
         if camera.ortho {
             depth_row.w += camera.distance;
         }
+        // A metre at clip-space w = 1 spans this many pixels vertically: the
+        // projection's y scale over the half-height in pixels.
+        let pixels_per_metre = (if camera.ortho {
+            1. / camera.half_height()
+        } else {
+            1. / (camera.fov * 0.5).tan()
+        } * size[1] as f64
+            * 0.5) as f32;
         let mut uniforms = vec![0u8; segments.len() * self.uniform_stride as usize];
         for ((key, segment), slot) in segments
             .iter()
@@ -383,8 +426,12 @@ impl PointRenderer {
             let uniform = Uniform {
                 matrix: matrix.as_mat4().to_cols_array_2d(),
                 viewport: [size[0] as f32, size[1] as f32],
-                size: point_size,
-                padding: 0.,
+                size: if adaptive.is_some() {
+                    min_size
+                } else {
+                    point_size
+                },
+                adaptive: adaptive.unwrap_or(0.),
                 tint: segment.tint,
                 depth: depth.as_vec4().to_array(),
                 highlight_box: highlight_box
@@ -393,7 +440,8 @@ impl PointRenderer {
                     .to_cols_array_2d(),
                 box_highlight_on: highlight_box.is_some() as u32 as f32,
                 ramp_on: height_ramp.is_some() as u32 as f32,
-                padding2: [0.; 2],
+                pixels_per_metre,
+                padding: 0.,
                 ramp: height_ramp
                     .map_or(glam::DVec4::ZERO, |[low, high]| {
                         let z = to_world.row(2) - glam::DVec4::new(0., 0., 0., low);
@@ -461,6 +509,7 @@ impl PointRenderer {
                 pass.set_bind_group(0, &self.bind, &[(i as u64 * self.uniform_stride) as u32]);
                 pass.set_vertex_buffer(0, node.vertices.slice(..));
                 pass.set_vertex_buffer(1, node.flags.slice(..));
+                pass.set_vertex_buffer(2, node.spacings.slice(..));
                 pass.draw(0..6, 0..node.count);
             }
         }

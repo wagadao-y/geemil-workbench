@@ -1,6 +1,7 @@
 struct Camera {
-    matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, padding: f32, tint: vec4<f32>,
-    depth: vec4<f32>, highlight_box: mat4x4<f32>, box_highlight_on: f32, ramp_on: f32, pad_b: f32, pad_c: f32,
+    matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, adaptive: f32, tint: vec4<f32>,
+    depth: vec4<f32>, highlight_box: mat4x4<f32>, box_highlight_on: f32, ramp_on: f32,
+    pixels_per_metre: f32, padding: f32,
     // Height in the ramp's 0..1 range as dot(ramp, (position, 1)).
     ramp: vec4<f32>,
 };
@@ -22,11 +23,19 @@ struct Out {
 const BOX_HIGHLIGHT = vec3<f32>(1.0, 0.863, 0.314);
 // sRGB colour of points a move would take (flag bit 0).
 const HIGHLIGHT = vec3<f32>(1.0, 0.188, 0.188);
-@vertex fn vertex(@builtin(vertex_index) id: u32, @location(0) position: vec3<f32>, @location(1) color: vec4<f32>, @location(2) flags: u32) -> Out {
+// Largest adaptive splat in physical pixels, like Potree's maximum size.
+const MAX_ADAPTIVE = 64.0;
+@vertex fn vertex(@builtin(vertex_index) id: u32, @location(0) position: vec3<f32>, @location(1) color: vec4<f32>, @location(2) flags: u32, @location(3) spacing: f32) -> Out {
     let corners = array<vec2<f32>, 6>(vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,1.0));
     var out: Out;
     out.position = camera.matrix * vec4(position,1.0);
-    out.position = vec4(out.position.xy + corners[id] * camera.size / camera.viewport * out.position.w, out.position.zw);
+    var size = camera.size;
+    if camera.adaptive > 0.0 {
+        // Potree's adaptive size: 1.7 times the point's spacing, on screen.
+        let world = camera.adaptive * 1.7 * spacing;
+        size = clamp(world * camera.pixels_per_metre / out.position.w, camera.size, MAX_ADAPTIVE);
+    }
+    out.position = vec4(out.position.xy + corners[id] * size / camera.viewport * out.position.w, out.position.zw);
     out.corner = corners[id];
     var base = color.rgb;
     if camera.ramp_on > 0.5 {

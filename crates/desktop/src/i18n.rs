@@ -137,6 +137,9 @@ pub struct Strings {
     // Display settings.
     pub point_budget: &'static str,
     pub point_size: &'static str,
+    pub point_size_fixed: &'static str,
+    pub point_size_adaptive: &'static str,
+    pub point_size_adaptive_hint: &'static str,
     pub edl_strength: &'static str,
 
     // Project tree and properties.
@@ -424,6 +427,9 @@ pub static JA: Strings = Strings {
 
     point_budget: "描画点数",
     point_size: "点サイズ",
+    point_size_fixed: "固定",
+    point_size_adaptive: "適応",
+    point_size_adaptive_hint: "PotreeのADAPTIVEと同じく、表示中の細かいノードがない場所ほど点を大きく描きます。Potreeで公開する前に、孤立した点やまばらな所の見え方を確認できます。点サイズの2がPotreeのサイズ1に当たります。",
     edl_strength: "強度",
 
     no_project_hint: "プロジェクトを作成するか開いてください。",

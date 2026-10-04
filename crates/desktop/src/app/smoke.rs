@@ -494,6 +494,15 @@ impl Workbench {
                 self.smoke_pairs();
                 eprintln!("Smoke align: {}", self.align_summary());
             }
+            "zoom" => {
+                self.camera.distance /= 8.;
+                self.dirty = true;
+            }
+            "adaptive" => {
+                self.settings.adaptive_size = true;
+                self.view.invalidate();
+                self.dirty = true;
+            }
             "align-switch" => {
                 let last = self
                     .project

@@ -183,6 +183,23 @@ impl Workbench {
                 }
                 ui.label(t.point_size);
                 ui.add(egui::Slider::new(&mut self.settings.point_size, 1.0..=8.0).step_by(0.5));
+                let adaptive = &mut self.settings.adaptive_size;
+                let before = *adaptive;
+                egui::ComboBox::from_id_salt("point size mode")
+                    .selected_text(if *adaptive {
+                        t.point_size_adaptive
+                    } else {
+                        t.point_size_fixed
+                    })
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(adaptive, false, t.point_size_fixed);
+                        ui.selectable_value(adaptive, true, t.point_size_adaptive)
+                            .on_hover_text(t.point_size_adaptive_hint);
+                    });
+                if *adaptive != before {
+                    self.view.invalidate();
+                    self.dirty = true;
+                }
                 ui.label(t.color_by);
                 let mode = &mut self.settings.color_mode;
                 egui::ComboBox::from_id_salt("color mode")

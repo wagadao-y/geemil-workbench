@@ -29,6 +29,9 @@ impl Workbench {
                 [(size.x * pixels) as u32, (size.y * pixels) as u32],
                 &DrawOptions {
                     point_size: settings.point_size * pixels,
+                    // Potree's size 1 matches the default fixed size of 2.
+                    adaptive: settings.adaptive_size.then_some(settings.point_size / 2.),
+                    min_size: pixels,
                     edl: Edl {
                         radius: 1.4 * pixels,
                         strength: if settings.edl {

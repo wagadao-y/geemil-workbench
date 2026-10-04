@@ -63,12 +63,16 @@ struct ViewRequest {
     visible: Vec<Uuid>,
     /// The transform being previewed, which places scans as they are drawn.
     preview: Option<(Uuid, Pose)>,
+    /// Also find each point's spacing, for Potree's adaptive point size.
+    adaptive: bool,
     epoch: u64,
 }
+/// Loaded nodes, and with adaptive point size each point's spacing.
+type ViewNodes = (Vec<LoadedNode>, Vec<Arc<[f32]>>);
 struct ViewResult {
     /// Increases with every result sent.
     serial: u64,
-    result: anyhow::Result<Vec<LoadedNode>>,
+    result: anyhow::Result<ViewNodes>,
     elapsed_ms: f64,
     epoch: u64,
     /// Whether nodes are still loading for this request.
@@ -117,12 +121,18 @@ impl ViewLoader {
                     sent
                 };
                 let outcome = load(&request, &mut cache, &live_epoch, &requests, |nodes| {
-                    send(Ok(nodes), true, &mut serial, request.epoch);
+                    let nodes = with_spacings(&request, nodes);
+                    send(nodes, true, &mut serial, request.epoch);
                 });
                 match outcome {
                     Outcome::Done(nodes) => {
                         if live_epoch.load(Ordering::Relaxed) == request.epoch
-                            && !send(Ok(nodes), false, &mut serial, request.epoch)
+                            && !send(
+                                with_spacings(&request, nodes),
+                                false,
+                                &mut serial,
+                                request.epoch,
+                            )
                         {
                             return;
                         }
@@ -169,6 +179,20 @@ enum Outcome {
     Superseded(ViewRequest),
     /// The epoch changed; nothing is sent.
     Stale,
+}
+
+/// The nodes with their points' spacings when the request asks for them.
+fn with_spacings(request: &ViewRequest, nodes: Vec<LoadedNode>) -> anyhow::Result<ViewNodes> {
+    if !request.adaptive {
+        return Ok((nodes, vec![]));
+    }
+    let spacings = request
+        .project
+        .view_spacings(&nodes, &JobControl::default())?
+        .into_iter()
+        .map(Arc::from)
+        .collect();
+    Ok((nodes, spacings))
 }
 
 /// Chooses the nodes for a request and loads them, cached ones first, then
@@ -267,6 +291,7 @@ impl Workbench {
                     budget: self.settings.point_budget,
                     visible: self.visible.iter().copied().collect(),
                     preview,
+                    adaptive: self.settings.adaptive_size,
                     epoch: self.view.epoch.load(Ordering::Relaxed),
                 })
                 .is_ok()
@@ -284,8 +309,9 @@ impl Workbench {
                 continue;
             }
             match result.result {
-                Ok(nodes) => {
+                Ok((nodes, spacings)) => {
                     self.view.shown = result.serial;
+                    self.spacings = spacings;
                     let moving = self.last_motion.elapsed() < Duration::from_millis(150);
                     let points = nodes.iter().map(|n| n.samples.len()).sum();
                     self.smoke.view_loaded(moving, points, result.partial);
@@ -357,7 +383,7 @@ impl Workbench {
         let marks = self.selection.marks();
         let mut offset = 0;
         let mut result = Vec::with_capacity(self.nodes.len());
-        for node in &self.nodes {
+        for (i, node) in self.nodes.iter().enumerate() {
             let range = offset..offset + node.samples.len();
             offset = range.end;
             let Some(world) = worlds.get(&node.scan) else {
@@ -374,6 +400,10 @@ impl Workbench {
                 world: *world,
                 tint,
                 marks: marks.and_then(|(m, _)| m.get(range)),
+                spacings: self
+                    .spacings
+                    .get(i)
+                    .filter(|s| self.settings.adaptive_size && s.len() == node.samples.len()),
             });
         }
         result

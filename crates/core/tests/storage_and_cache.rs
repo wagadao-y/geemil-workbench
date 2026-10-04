@@ -467,3 +467,75 @@ fn previewed_transform_chooses_detail_where_the_scan_is_drawn() {
     assert_eq!(key(&previewed), key(&applied));
     assert_ne!(key(&previewed), key(&unpreviewed));
 }
+
+#[test]
+fn view_spacings_follow_the_deepest_loaded_node_holding_each_point() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("demo.e57");
+    interchange::create_demo(&input).unwrap();
+    let mut p = Project::create(&dir.path().join("project"), "Test").unwrap();
+    // Small display nodes, so the tree has levels below the roots.
+    let options = ImportOptions {
+        view_grid: 4,
+        view_leaf_points: 64,
+        ..Default::default()
+    };
+    p.import_file(&input, options, &JobControl::default())
+        .unwrap();
+    let ids: Vec<_> = p.scans().map(|s| s.id).collect();
+    let job = JobControl::default();
+    let camera = Camera {
+        target: p.bounds().center().to_array(),
+        distance: 30.,
+        ..Camera::default()
+    };
+    let mut cache = ViewCache::new(0);
+    let view = p
+        .load_view_cached(&camera, 1 << 30, &ids, &job, &mut cache)
+        .unwrap();
+    let spacing = |scan: uuid::Uuid, node: u32| {
+        let b = p.scan(scan).unwrap().nodes[node as usize].bounds;
+        ((0..3).map(|k| b.max[k] - b.min[k]).fold(0., f64::max) / 128.) as f32
+    };
+    // Each point takes the spacing of a loaded node holding it that has no
+    // loaded child holding it.
+    let all = p.view_spacings(&view.nodes, &job).unwrap();
+    let loaded: std::collections::HashSet<_> =
+        view.nodes.iter().map(|n| (n.scan, n.node)).collect();
+    let holds = |scan: &geemil_core::Scan, node: u32, q: [f64; 3]| {
+        let b = scan.nodes[node as usize].bounds;
+        (0..3).all(|k| b.min[k] <= q[k] && q[k] <= b.max[k])
+    };
+    let mut deeper = 0;
+    for (node, spacings) in view.nodes.iter().zip(&all) {
+        assert_eq!(spacings.len(), node.samples.len());
+        let scan = p.scan(node.scan).unwrap();
+        for (sample, s) in node.samples.iter().zip(spacings) {
+            let q = sample.position;
+            let deepest = (0..scan.nodes.len() as u32).find(|&n| {
+                loaded.contains(&(node.scan, n))
+                    && holds(scan, n, q)
+                    && !scan.nodes[n as usize]
+                        .children
+                        .iter()
+                        .any(|c| loaded.contains(&(node.scan, *c)) && holds(scan, *c, q))
+            });
+            assert_eq!(Some(*s), deepest.map(|n| spacing(node.scan, n)));
+            deeper += (deepest != Some(node.node)) as usize;
+        }
+    }
+    assert!(deeper > 0);
+    // With only the roots, each point takes its root's, which is coarser.
+    let roots: Vec<_> = view.nodes.iter().filter(|n| n.node == 0).cloned().collect();
+    let coarse = p.view_spacings(&roots, &job).unwrap();
+    for (node, spacings) in roots.iter().zip(&coarse) {
+        assert!(spacings.iter().all(|s| *s == spacing(node.scan, 0)));
+        let fine = &all[view
+            .nodes
+            .iter()
+            .position(|n| n.scan == node.scan && n.node == 0)
+            .unwrap()];
+        assert!(fine.iter().zip(spacings).all(|(f, c)| f <= c));
+        assert!(fine.iter().zip(spacings).any(|(f, c)| f < c));
+    }
+}

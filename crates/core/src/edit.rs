@@ -794,6 +794,79 @@ impl Project {
         }
         Ok(())
     }
+    /// For Potree's adaptive point size: each loaded point's spacing, the
+    /// spacing of the deepest loaded node of its scan that holds its place.
+    /// Starting from the point's own node, it descends into loaded children
+    /// whose box holds the point. A node's spacing is the longest side of its
+    /// box over 128 cells, the grid it picks its points on (and about the
+    /// spacing of a leaf's points). So where finer nodes are loaded points
+    /// draw small, and where none are, such as around stray points, large.
+    pub fn view_spacings(&self, nodes: &[LoadedNode], job: &JobControl) -> Result<Vec<Vec<f32>>> {
+        const CELLS: f64 = 128.;
+        let index = self.scan_index();
+        let loaded: HashSet<(Uuid, u32)> = nodes.iter().map(|n| (n.scan, n.node)).collect();
+        let spacing = |node: &crate::Node| {
+            let b = &node.bounds;
+            (DVec3::from(b.max) - DVec3::from(b.min)).max_element() / CELLS
+        };
+        let one = |n: &LoadedNode| -> Result<Vec<f32>> {
+            job.check()?;
+            let scan = &self.manifest.scans[*index
+                .get(&n.scan)
+                .ok_or_else(|| anyhow::anyhow!("Missing scan"))?];
+            let node = scan
+                .nodes
+                .get(n.node as usize)
+                .ok_or_else(|| anyhow::anyhow!("Invalid node"))?;
+            let children: Vec<u32> = node
+                .children
+                .iter()
+                .copied()
+                .filter(|c| loaded.contains(&(n.scan, *c)))
+                .collect();
+            let own = spacing(node) as f32;
+            Ok(n.samples
+                .iter()
+                .map(|s| {
+                    let p = DVec3::from(s.position);
+                    let holds = |id: &u32| {
+                        let b = &scan.nodes[*id as usize].bounds;
+                        p.cmpge(DVec3::from(b.min)).all() && p.cmple(DVec3::from(b.max)).all()
+                    };
+                    let Some(mut at) = children.iter().copied().find(|c| holds(c)) else {
+                        return own;
+                    };
+                    loop {
+                        let deeper = scan.nodes[at as usize]
+                            .children
+                            .iter()
+                            .copied()
+                            .find(|c| loaded.contains(&(n.scan, *c)) && holds(c));
+                        match deeper {
+                            Some(c) => at = c,
+                            None => return spacing(&scan.nodes[at as usize]) as f32,
+                        }
+                    }
+                })
+                .collect())
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let per = nodes.len().div_ceil(threads).max(1);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = nodes
+                .chunks(per)
+                .map(|part| scope.spawn(move || part.iter().map(one).collect::<Result<Vec<_>>>()))
+                .collect();
+            let mut all = Vec::with_capacity(nodes.len());
+            for h in handles {
+                all.extend(
+                    h.join()
+                        .map_err(|_| anyhow::anyhow!("Spacing worker panicked"))??,
+                );
+            }
+            Ok(all)
+        })
+    }
     /// [`Project::select_view`] and the chosen nodes' points, grouped by scan.
     pub fn load_view_cached(
         &self,

@@ -58,6 +58,8 @@ pub(super) struct Settings {
     last_location: Option<PathBuf>,
     point_budget: usize,
     point_size: f32,
+    /// Potree's adaptive point size instead of a fixed one.
+    adaptive_size: bool,
     edl: bool,
     edl_strength: f32,
     color_mode: ColorMode,
@@ -81,6 +83,7 @@ impl Default for Settings {
             last_location: None,
             point_budget: 2_000_000,
             point_size: 2.,
+            adaptive_size: false,
             edl: true,
             edl_strength: 1.,
             color_mode: ColorMode::Rgb,
@@ -126,6 +129,8 @@ pub struct Workbench {
     view: ViewLoader,
     /// The display octree nodes shown, in scan coordinates.
     nodes: Vec<LoadedNode>,
+    /// With adaptive point size, each shown point's spacing, by node.
+    spacings: Vec<Arc<[f32]>>,
     /// Increases whenever `nodes` changes.
     points_generation: u64,
     /// Height range for colouring by height, and what it was taken from.
@@ -190,6 +195,7 @@ impl Workbench {
             cleanup_report: None,
             view: ViewLoader::spawn(cc.egui_ctx.clone()),
             nodes: vec![],
+            spacings: vec![],
             points_generation: 0,
             height_range: None,
             height_for: None,
