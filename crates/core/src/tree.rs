@@ -6,7 +6,7 @@
 //! points stay where they are.
 use crate::{Group, Pose, Project, Revision, Scan};
 use anyhow::{Result, ensure};
-use glam::DMat4;
+use glam::{DMat4, DQuat};
 use serde_json::json;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -222,5 +222,47 @@ impl Project {
             s.scans.retain(|id| !ids.contains(id));
             Ok(())
         })
+    }
+    /// Undoes the registration on purpose, for practising it: turns each scan
+    /// by a random angle about Z and moves the centre of its bounding box to
+    /// one shared point, the centre of all scans before. One edit, one undo.
+    pub fn scatter_scans(&mut self, seed: u64) -> Result<()> {
+        let target = self.bounds().center();
+        let mut random = seed;
+        let mut next_angle = || {
+            // SplitMix64; no randomness crate for a practice tool.
+            random = random.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = random;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            (z >> 11) as f64 / (1u64 << 53) as f64 * std::f64::consts::TAU
+        };
+        let poses: Vec<(Uuid, Pose)> = self
+            .scans()
+            .filter_map(|scan| {
+                let bounds = scan.nodes.first()?.bounds;
+                let centre = self.world_matrix(scan).transform_point3(bounds.center());
+                let motion = DMat4::from_translation(target)
+                    * DMat4::from_quat(DQuat::from_rotation_z(next_angle()))
+                    * DMat4::from_translation(-centre);
+                let above = self
+                    .parent_of(scan.id)
+                    .map_or(DMat4::IDENTITY, |g| self.correction(g));
+                let own = above.inverse() * motion * self.correction(scan.id);
+                Some((scan.id, Pose::from_matrix(own)))
+            })
+            .collect();
+        let ids: Vec<Uuid> = poses.iter().map(|(id, _)| *id).collect();
+        let scans = self.scans_record(&ids);
+        self.edit(
+            json!({"kind": "scatter", "scans": scans, "seed": seed}),
+            |s| {
+                for (id, pose) in poses {
+                    s.transforms.insert(id, pose);
+                }
+                Ok(())
+            },
+        )
     }
 }

@@ -106,6 +106,11 @@ impl Workbench {
                     self.menu_item(ui, Action::RemoveOutliers, &mut chosen);
                     ui.separator();
                     self.menu_item(ui, Action::ReduceOverlap, &mut chosen);
+                    ui.separator();
+                    // Out of the way: it throws the registration away.
+                    ui.menu_button(t.menu_practice, |ui| {
+                        self.menu_item(ui, Action::Scatter, &mut chosen);
+                    });
                 });
                 ui.menu_button(t.menu_help, |ui| {
                     self.menu_item(ui, Action::Shortcuts, &mut chosen);

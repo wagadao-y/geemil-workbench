@@ -24,7 +24,7 @@ pub struct SmokeOptions {
     /// (mode, whether an inside selection limits its depth).
     pub select: Option<(SelectionMode, bool)>,
     /// Open this dialog for the capture: revisions, shortcuts, new-project,
-    /// cleanup, save-as, subsample, noise, export or export-las. Also selects the first folder of the tree.
+    /// cleanup, scatter, save-as, subsample, noise, export or export-las. Also selects the first folder of the tree.
     pub dialog: Option<String>,
     /// Steps run one by one once the view loaded, each followed by a state
     /// line: exclude (move the selection to the "deleted" layer), undo, redo,
@@ -182,6 +182,7 @@ impl Workbench {
                 "shortcuts" => Some(Dialog::Shortcuts),
                 "new-project" => Some(Dialog::new_project(&self.settings, vec![])),
                 "cleanup" => Some(Dialog::Cleanup),
+                "scatter" => Some(Dialog::Scatter),
                 "export-las" => Some(Dialog::Export {
                     format: super::dialogs::ExportFormat::Laz,
                     per_scan: false,

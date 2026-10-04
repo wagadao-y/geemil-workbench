@@ -10,6 +10,7 @@ pub struct Strings {
     pub menu_edit: &'static str,
     pub menu_view: &'static str,
     pub menu_tools: &'static str,
+    pub menu_practice: &'static str,
     pub menu_help: &'static str,
 
     // Actions, as shown in menus, toolbar tooltips and the shortcut list.
@@ -61,6 +62,7 @@ pub struct Strings {
     pub remove_noise: &'static str,
     pub remove_outliers: &'static str,
     pub reduce_overlap: &'static str,
+    pub scatter: &'static str,
     pub overlap_message: &'static str,
     pub overlap_cell: &'static str,
     pub overlap_cell_hint: &'static str,
@@ -221,6 +223,10 @@ pub struct Strings {
     pub cleanup_message: &'static str,
     pub cleanup_run: &'static str,
     pub cleanup_done: fn(report: &CleanupReport, size: &str) -> String,
+    pub scatter_title: &'static str,
+    pub scatter_message: &'static str,
+    pub scatter_run: &'static str,
+    pub scatter_done: &'static str,
 
     // New project and welcome screen.
     pub new_project_title: &'static str,
@@ -299,6 +305,7 @@ pub static JA: Strings = Strings {
     menu_edit: "編集",
     menu_view: "表示",
     menu_tools: "ツール",
+    menu_practice: "練習用",
     menu_help: "ヘルプ",
 
     new_project: "新規プロジェクト…",
@@ -349,6 +356,7 @@ pub static JA: Strings = Strings {
     remove_noise: "ノイズ除去…",
     remove_outliers: "統計的外れ値除去（SOR）…",
     reduce_overlap: "スキャンの重なりを整理…",
+    scatter: "位置合わせ練習用にスキャンをばらす…",
     overlap_message: "スキャンが重なる場所では、場所ごとに最も密に点を取っているスキャン（近い・正面から撮ったスキャン）の点だけを残し、ほかのスキャンの点を移動先のレイヤーへ移します。スキャンごとの色の違いで点群がざらついて見えるのを防ぎます。スキャン位置は不要で、表示中のスキャンをまとめて判定します。移した点は「点群」へ戻せます。",
     overlap_cell: "判定の格子（m）",
     overlap_cell_hint: "この大きさの格子で各スキャンの点の密度を数えます（周囲の格子も合わせて数えます）。残すスキャンは格子を8×8×8に分けた小マスごとに決めます。小さいほど細かく判定し、大きいほど判定が安定します。",
@@ -504,6 +512,7 @@ pub static JA: Strings = Strings {
         "box" => "ボックス切り出し",
         "create_group" | "rename_group" | "move" | "ungroup" => "ツリー編集",
         "remove_scans" => "スキャンを外す",
+        "scatter" => "練習用にばらす",
         _ => "その他",
     },
     save_title: "リビジョンを保存",
@@ -524,6 +533,10 @@ pub static JA: Strings = Strings {
     cleanup_title: "履歴のクリーンアップ",
     cleanup_message: "保存済みのリビジョンと現在の作業状態のどれからも使われていないスキャン・点のレイヤー情報・一時ファイルを削除し、ディスク容量を空けます。不要なリビジョンは先にリビジョン一覧で削除してください。元に戻す・やり直すの履歴は消去されます。",
     cleanup_run: "クリーンアップを実行",
+    scatter_title: "位置合わせの練習用にスキャンをばらしますか？",
+    scatter_message: "すべてのスキャンをZ軸まわりにランダムな角度で回転させ、バウンディングボックスの中心が同じ位置に来るよう移動します。現在の位置合わせは失われます。元に戻す（Ctrl+Z）で戻せます。",
+    scatter_run: "ばらす",
+    scatter_done: "スキャンをばらしました。元に戻すで戻せます。",
     cleanup_done: |report, size| {
         format!(
             "クリーンアップしました: スキャン {} 件・レイヤー情報 {} 件・{} ファイル（{size}）を削除",

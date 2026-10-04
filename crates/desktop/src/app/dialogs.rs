@@ -28,6 +28,8 @@ pub(super) enum Dialog {
         return_to_revisions: Option<RevisionsState>,
     },
     Cleanup,
+    /// Confirms scattering the scans for registration practice.
+    Scatter,
     /// Asks what to do with an unapplied alignment result before the tool
     /// moves on to `next`, which the tree selected.
     AlignPending {
@@ -142,6 +144,7 @@ enum Outcome {
         next: Option<Uuid>,
     },
     Cleanup,
+    Scatter,
     RenameGroup(Uuid, String),
     RenameLayer(Option<u8>, String),
     Filter(Filter, Option<u8>),
@@ -293,6 +296,17 @@ impl Workbench {
                     if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.cleanup_run).clicked() {
                             outcome = Outcome::Cleanup;
+                        }
+                    }) {
+                        outcome = Outcome::Close;
+                    }
+                }
+                Dialog::Scatter => {
+                    ui.heading(format!("{} {}", icon::SHUFFLE, t.scatter_title));
+                    ui.label(t.scatter_message);
+                    if buttons(ui, t.cancel, |ui| {
+                        if ui.button(t.scatter_run).clicked() {
+                            outcome = Outcome::Scatter;
                         }
                     }) {
                         outcome = Outcome::Close;
@@ -617,6 +631,15 @@ impl Workbench {
             Outcome::Cleanup => {
                 self.dialog = None;
                 self.cleanup(ctx);
+            }
+            Outcome::Scatter => {
+                self.dialog = None;
+                let seed = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_nanos() as u64);
+                if self.apply_edit(|p| p.scatter_scans(seed)).is_some() {
+                    self.status = t.scatter_done.into();
+                }
             }
             Outcome::RenameGroup(id, name) => {
                 self.dialog = None;

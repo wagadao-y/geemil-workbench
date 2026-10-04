@@ -48,6 +48,7 @@ pub(super) enum Action {
     RemoveNoise,
     RemoveOutliers,
     ReduceOverlap,
+    Scatter,
     Tool(Tool),
     Shortcuts,
     About,
@@ -80,6 +81,7 @@ impl Action {
             Self::RemoveNoise => icon::FUNNEL,
             Self::RemoveOutliers => icon::CHART_SCATTER,
             Self::ReduceOverlap => icon::INTERSECT,
+            Self::Scatter => icon::SHUFFLE,
             Self::Tool(Tool::Navigate) => icon::HAND,
             Self::Tool(Tool::Rect) => icon::SELECTION,
             Self::Tool(Tool::Polygon) => icon::POLYGON,
@@ -119,6 +121,7 @@ impl Action {
             Self::RemoveNoise => t.remove_noise.into(),
             Self::RemoveOutliers => t.remove_outliers.into(),
             Self::ReduceOverlap => t.reduce_overlap.into(),
+            Self::Scatter => t.scatter.into(),
             Self::Tool(Tool::Navigate) => t.navigate.into(),
             Self::Tool(Tool::Rect) => t.tool_rect.into(),
             Self::Tool(Tool::Polygon) => t.tool_polygon.into(),
@@ -207,7 +210,7 @@ impl Workbench {
         match action {
             Action::NewProject | Action::Open | Action::OpenRecent(_) => idle,
             Action::Import | Action::NewFolder => idle && project.is_some(),
-            Action::Export => idle && has_scans,
+            Action::Export | Action::Scatter => idle && has_scans,
             Action::Undo => idle && self.undo.can_undo(),
             Action::Redo => idle && self.undo.can_redo(),
             Action::Exclude => idle && self.selection.is_ready(),
@@ -381,6 +384,7 @@ impl Workbench {
                     self.measure.clear();
                 }
             }
+            Action::Scatter => self.dialog = Some(Dialog::Scatter),
             Action::Shortcuts => self.dialog = Some(Dialog::Shortcuts),
             Action::About => self.dialog = Some(Dialog::About),
         }
