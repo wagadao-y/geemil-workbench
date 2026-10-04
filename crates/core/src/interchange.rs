@@ -782,8 +782,9 @@ impl Project {
         let mut next = self.clone();
         next.manifest.scans.extend(scans);
         next.manifest.images.extend(images);
-        // Several scans from one file share a folder named after it.
-        let group = (ids.len() > 1).then(Uuid::new_v4);
+        // Scans from an E57 file go in a folder named after it, even a single
+        // scan, since scanners often give every file's scan the same name.
+        let group = (extension == "e57" || ids.len() > 1).then(Uuid::new_v4);
         next.edit(
             serde_json::json!({"kind": "import", "file": file, "scans": ids, "group": group}),
             |s| {

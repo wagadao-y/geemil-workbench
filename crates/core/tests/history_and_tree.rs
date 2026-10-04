@@ -108,6 +108,40 @@ fn undo_snapshots_restore_states_with_their_identity() {
 }
 
 #[test]
+fn single_scan_e57_import_creates_a_folder_but_las_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let las = dir.path().join("scan.las");
+    let mut writer = las::Writer::from_path(&las, las::Header::default()).unwrap();
+    for i in 0..100 {
+        writer
+            .write_point(las::Point {
+                x: i as f64,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+    drop(writer);
+    let mut p = Project::create(&dir.path().join("p"), "Test").unwrap();
+    p.import_file(&las, ImportOptions::default(), &JobControl::default())
+        .unwrap();
+    let (groups, top_scans) = p.children(None);
+    assert!(groups.is_empty());
+    assert_eq!(top_scans.len(), 1);
+
+    let e57 = dir.path().join("spb024.e57");
+    p.export_e57(&e57, &JobControl::default()).unwrap();
+    let mut q = Project::create(&dir.path().join("q"), "Test").unwrap();
+    q.import_file(&e57, ImportOptions::default(), &JobControl::default())
+        .unwrap();
+    let (groups, top_scans) = q.children(None);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].name, "spb024");
+    assert!(top_scans.is_empty());
+    assert_eq!(q.children(Some(groups[0].id)).1.len(), 1);
+}
+
+#[test]
 fn multi_scan_import_creates_a_folder_and_folder_transforms_compose() {
     let dir = tempfile::tempdir().unwrap();
     let mut p = imported(dir.path());
