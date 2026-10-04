@@ -12,13 +12,7 @@ pub(crate) fn pack(data: &[u8], stride: usize) -> Result<(BlockCodec, Vec<u8>)> 
         "Invalid block layout"
     );
     ensure!(data.len() <= MAX_BLOCK_BYTES, "Block exceeds budget");
-    let count = data.len() / stride;
-    let mut shuffled = vec![0; data.len()];
-    for column in 0..stride {
-        for row in 0..count {
-            shuffled[column * count + row] = data[row * stride + column];
-        }
-    }
+    let shuffled = transpose(data, data.len() / stride, stride);
     let mut compressor = zstd::bulk::Compressor::new(1)?;
     compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
     let compressed = compressor.compress(&shuffled)?;
@@ -56,16 +50,31 @@ pub(crate) fn read_block(
             reader.read_exact(&mut bytes)?;
             let shuffled = zstd::bulk::decompress(&bytes, expected)?;
             ensure!(shuffled.len() == expected, "Decoded block size differs");
-            let count = expected / stride;
-            let mut data = vec![0; expected];
-            for column in 0..stride {
-                for row in 0..count {
-                    data[row * stride + column] = shuffled[column * count + row];
-                }
-            }
-            Ok(data)
+            Ok(transpose(&shuffled, stride, expected / stride))
         }
     }
+}
+
+/// `data`, `rows` rows of `columns` bytes, written column by column.
+fn transpose(data: &[u8], rows: usize, columns: usize) -> Vec<u8> {
+    // Square tiles keep the rows read and the rows written in cache; going
+    // down whole columns touched a new cache line per byte and took most of
+    // a chunk's decode time.
+    const TILE: usize = 64;
+    let mut result = vec![0; data.len()];
+    for row in (0..rows).step_by(TILE) {
+        let row_end = (row + TILE).min(rows);
+        for column in (0..columns).step_by(TILE) {
+            let column_end = (column + TILE).min(columns);
+            for c in column..column_end {
+                let target = &mut result[c * rows + row..c * rows + row_end];
+                for (r, byte) in (row..row_end).zip(target) {
+                    *byte = data[r * columns + c];
+                }
+            }
+        }
+    }
+    result
 }
 
 /// One Zstd frame of point labels; long runs of one layer shrink to almost nothing.
@@ -119,5 +128,18 @@ mod tests {
             .is_err()
         );
         assert!(read_block(&mut packed.as_slice(), codec, packed.len(), 32, 32).is_err());
+    }
+    #[test]
+    fn transposition_matches_the_column_definition_for_ragged_tiles() {
+        for (rows, columns) in [(1, 1), (3, 114), (130, 7), (200, 65), (64, 64)] {
+            let data: Vec<u8> = (0..rows * columns).map(|i| (i * 31 % 251) as u8).collect();
+            let shuffled = transpose(&data, rows, columns);
+            for r in 0..rows {
+                for c in 0..columns {
+                    assert_eq!(shuffled[c * rows + r], data[r * columns + c]);
+                }
+            }
+            assert_eq!(transpose(&shuffled, columns, rows), data);
+        }
     }
 }

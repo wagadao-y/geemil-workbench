@@ -125,6 +125,145 @@ impl<T: Send + 'static, R: Send + 'static> OrderedPool<T, R> {
     }
 }
 
+/// Runs `work` on every item on `workers` threads, started once, and hands
+/// each result to `consume` on the calling thread as it arrives, in no
+/// particular order. The first error, from either side, stops the rest.
+pub(crate) fn for_each_unordered<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    job: &JobControl,
+    work: impl Fn(&T) -> Result<R> + Sync,
+    mut consume: impl FnMut(R) -> Result<()>,
+) -> Result<()> {
+    let workers = workers.clamp(1, items.len().max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    // Bounded, so results wait for the consumer instead of piling up.
+    let (sender, receiver) = mpsc::sync_channel::<Result<R>>(workers * 2);
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let sender = sender.clone();
+            let (next, failed, work) = (&next, &failed, &work);
+            scope.spawn(move || {
+                while !failed.load(Ordering::Relaxed) {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else {
+                        break;
+                    };
+                    let result = job.check().and_then(|_| work(item));
+                    if result.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    if sender.send(result).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(sender);
+        // Drain until every worker has stopped, so none blocks on a full
+        // channel after a failure.
+        let mut first = None;
+        for result in receiver {
+            if first.is_some() {
+                continue;
+            }
+            if let Err(e) = result.and_then(&mut consume) {
+                failed.store(true, Ordering::Relaxed);
+                first = Some(e);
+            }
+        }
+        first.map_or(Ok(()), Err)
+    })
+}
+
+/// Runs `work` on every item on `workers` threads, started once, and hands
+/// the results to `consume` on the calling thread in item order. Workers
+/// stay at most two items each ahead of `consume`, so results never pile
+/// up. The first error, from either side, stops the rest.
+pub(crate) fn for_each_ordered<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    job: &JobControl,
+    work: impl Fn(usize, &T) -> Result<R> + Sync,
+    mut consume: impl FnMut(usize, R) -> Result<()>,
+) -> Result<()> {
+    struct State<R> {
+        next: usize,
+        consumed: usize,
+        ready: std::collections::HashMap<usize, Result<R>>,
+        failed: bool,
+    }
+    let workers = workers.clamp(1, items.len().max(1));
+    let window = workers * 2;
+    let state = Mutex::new(State {
+        next: 0,
+        consumed: 0,
+        ready: std::collections::HashMap::new(),
+        failed: false,
+    });
+    let changed = std::sync::Condvar::new();
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            let (state, changed, work) = (&state, &changed, &work);
+            scope.spawn(move || {
+                let mut s = state.lock().unwrap();
+                loop {
+                    if s.failed || s.next >= items.len() {
+                        return;
+                    }
+                    if s.next >= s.consumed + window {
+                        s = changed.wait(s).unwrap();
+                        continue;
+                    }
+                    let index = s.next;
+                    s.next += 1;
+                    drop(s);
+                    let result = job.check().and_then(|_| work(index, &items[index]));
+                    s = state.lock().unwrap();
+                    s.failed |= result.is_err();
+                    s.ready.insert(index, result);
+                    changed.notify_all();
+                }
+            });
+        }
+        let fail = |e| {
+            state.lock().unwrap().failed = true;
+            changed.notify_all();
+            Err(e)
+        };
+        for index in 0..items.len() {
+            let result = {
+                let mut s = state.lock().unwrap();
+                loop {
+                    if let Some(result) = s.ready.remove(&index) {
+                        break result;
+                    }
+                    if s.failed {
+                        // Items after a failure may never start; report the
+                        // earliest error that did happen.
+                        let first = s
+                            .ready
+                            .iter()
+                            .filter(|(_, r)| r.is_err())
+                            .map(|(i, _)| *i)
+                            .min()
+                            .expect("a failed item");
+                        break s.ready.remove(&first).unwrap();
+                    }
+                    s = changed.wait(s).unwrap();
+                }
+            };
+            if let Err(e) = result.and_then(|r| consume(index, r)) {
+                return fail(e);
+            }
+            state.lock().unwrap().consumed = index + 1;
+            changed.notify_all();
+        }
+        Ok(())
+    })
+}
+
 impl<T, R> Drop for OrderedPool<T, R> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -139,6 +278,104 @@ impl<T, R> Drop for OrderedPool<T, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ordered_jobs_arrive_in_order_and_stop_at_the_first_error() {
+        let items: Vec<u64> = (0..1000).collect();
+        let job = JobControl::default();
+        let mut seen = vec![];
+        for_each_ordered(
+            &items,
+            4,
+            &job,
+            |i, item| {
+                // Uneven work, so later items often finish first.
+                if i % 7 == 0 {
+                    thread::sleep(Duration::from_micros(200));
+                }
+                Ok(*item * 2)
+            },
+            |i, value| {
+                assert_eq!(value, i as u64 * 2);
+                seen.push(i);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(seen, (0..1000).collect::<Vec<_>>());
+        let mut consumed = 0;
+        let error = for_each_ordered(
+            &items,
+            4,
+            &job,
+            |i, _| {
+                if i == 500 {
+                    Err(anyhow!("work"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_, _| {
+                consumed += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(error.unwrap_err().to_string(), "work");
+        assert_eq!(consumed, 500);
+        let error = for_each_ordered(
+            &items,
+            4,
+            &job,
+            |_, _| Ok(()),
+            |i, _| {
+                if i == 10 {
+                    Err(anyhow!("consume"))
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(error.unwrap_err().to_string(), "consume");
+        job.cancel.store(true, Ordering::Relaxed);
+        assert!(for_each_ordered(&items, 4, &job, |_, _| Ok(()), |_, _| Ok(())).is_err());
+    }
+    #[test]
+    fn unordered_jobs_consume_every_result_and_stop_at_the_first_error() {
+        let items: Vec<u64> = (0..1000).collect();
+        let job = JobControl::default();
+        let mut sum = 0;
+        for_each_unordered(
+            &items,
+            4,
+            &job,
+            |i| Ok(*i),
+            |i| {
+                sum += i;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(sum, 499_500);
+        // Failing workers and a failing consumer both end the run, with
+        // workers still producing while the consumer has stopped taking.
+        let error = for_each_unordered(
+            &items,
+            4,
+            &job,
+            |i| {
+                if *i == 500 {
+                    Err(anyhow!("work"))
+                } else {
+                    Ok(*i)
+                }
+            },
+            |_| Ok(()),
+        );
+        assert_eq!(error.unwrap_err().to_string(), "work");
+        let error = for_each_unordered(&items, 4, &job, |i| Ok(*i), |_| Err(anyhow!("consume")));
+        assert_eq!(error.unwrap_err().to_string(), "consume");
+        job.cancel.store(true, Ordering::Relaxed);
+        assert!(for_each_unordered(&items, 4, &job, |i| Ok(*i), |_| Ok(())).is_err());
+    }
     #[test]
     fn overlapping_jobs_return_in_order_and_completed_results_keep_their_budget() {
         let (release, wait) = mpsc::channel();

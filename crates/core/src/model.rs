@@ -407,6 +407,8 @@ pub struct Project {
     pub filter_options: crate::FilterOptions,
     // Kept alive by UI, worker and undo-state clones, including during reload.
     pub(crate) _lock: std::sync::Arc<fs::File>,
+    /// Where each chunk's labels are in the current state, shared by clones.
+    pub(crate) label_index: crate::layers::LabelIndexCache,
 }
 impl Project {
     pub fn create(root: &Path, name: &str) -> Result<Self> {
@@ -419,6 +421,7 @@ impl Project {
         let p = Self {
             root: fs::canonicalize(root)?,
             _lock: crate::project_lock::acquire(&fs::canonicalize(root)?)?,
+            label_index: Default::default(),
             filter_options: crate::FilterOptions::default(),
             manifest: Manifest {
                 format_version: FORMAT_VERSION,
@@ -545,6 +548,7 @@ impl Project {
             root,
             manifest,
             _lock: lock,
+            label_index: Default::default(),
             filter_options: crate::FilterOptions::default(),
         };
         for s in &p.manifest.scans {

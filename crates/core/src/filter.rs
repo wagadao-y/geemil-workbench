@@ -4,7 +4,8 @@
 //! looks, so the result does not depend on where chunks split the scan. They
 //! judge the points of visible layers and move the points they pick to
 //! another layer instead of rewriting points.
-use crate::layers::{LabelWriter, is_set};
+use crate::layers::{ChunkLabels, LabelWriter, is_set, relabel};
+use crate::parallel::for_each_ordered;
 use crate::storage::{TempFile, create_scratch, position, valid};
 use crate::{Bounds, CropBox, JobControl, LayerTarget, Project, Scan, Stage};
 use anyhow::{Result, ensure};
@@ -15,7 +16,7 @@ use std::{
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 use uuid::Uuid;
@@ -56,6 +57,9 @@ struct ChunkCache<'a> {
     scan: &'a Scan,
     state: Mutex<CacheState>,
     limit: usize,
+    /// Whether to empty the cache once its scan's chunks are done, for
+    /// filters that read only the scan they judge.
+    release: bool,
 }
 #[derive(Default)]
 struct CacheState {
@@ -64,6 +68,7 @@ struct CacheState {
     bytes: usize,
 }
 impl<'a> ChunkCache<'a> {
+    #[cfg(test)]
     fn new(project: &'a Project, scan: &'a Scan) -> Self {
         Self::with_limit(project, scan, project.filter_options.memory_bytes / 4)
     }
@@ -73,7 +78,22 @@ impl<'a> ChunkCache<'a> {
             scan,
             state: Mutex::default(),
             limit,
+            release: false,
         }
+    }
+    /// One cache per scan, each read only for its own scan and emptied once
+    /// that scan is done. Workers stay a few chunks ahead, so besides scans
+    /// with fewer chunks than that, at most two scans (one finishing, one
+    /// starting) hold points at a time: each gets half the usual share.
+    fn for_scans(project: &'a Project, scans: &[&'a Scan]) -> Vec<Self> {
+        let limit = project.filter_options.memory_bytes / 8;
+        scans
+            .iter()
+            .map(|scan| Self {
+                release: true,
+                ..Self::with_limit(project, scan, limit)
+            })
+            .collect()
     }
     fn get(&self, chunk: u32, job: &JobControl) -> Result<Arc<ChunkPoints>> {
         {
@@ -1026,15 +1046,18 @@ impl Project {
         let merged = Merged::new(self, scan_ids);
         let progress = Progress::new(Stage::Subsampling, &merged.scans, 1);
         let mut labels = LabelWriter::new(self, target)?;
-        for (si, scan) in merged.scans.iter().enumerate() {
-            each_chunk(
-                &merged.caches[si],
-                job,
-                &progress,
-                &|_, chunk, job| merged_subsample_chunk(&merged, si, chunk, size, job),
-                |chunk, (mask, count)| labels.push(self, scan, chunk, &mask, count),
-            )?;
-        }
+        let moving = labels.target();
+        each_chunk(
+            &merged.caches,
+            job,
+            &progress,
+            &|si, chunk, job| {
+                let picked = merged_subsample_chunk(&merged, si, chunk, size, job)?;
+                relabelled(self, moving, merged.scans[si], chunk, picked)
+            },
+            |_, _, moved| moved.map_or(Ok(()), |moved| labels.add(moved)),
+        )?;
+        drop(merged);
         job.check()?;
         labels.commit(
             self,
@@ -1080,37 +1103,41 @@ impl Project {
         // those counts without reading its neighbours' points.
         let progress = Progress::new(Stage::ReducingOverlap, &merged.scans, 2);
         let budget = self.filter_options.memory_bytes / 2;
-        let mut cells = vec![];
+        let mut cells: Vec<Vec<_>> = merged
+            .scans
+            .iter()
+            .map(|s| Vec::with_capacity(s.chunks.len()))
+            .collect();
         let mut entries = 0usize;
-        for si in 0..merged.scans.len() {
-            let mut scan_cells = vec![];
-            each_chunk(
-                &merged.caches[si],
-                job,
-                &progress,
-                &|_, chunk, job| chunk_cells(&merged, &grid, si, chunk, job),
-                |_, chunk_cells| {
-                    entries += chunk_cells.len();
-                    ensure!(
-                        entries * std::mem::size_of::<CellPoints>() <= budget,
-                        crate::CoreError::FilterMemoryBudgetTooSmall
-                    );
-                    scan_cells.push(chunk_cells);
-                    Ok(())
-                },
-            )?;
-            cells.push(scan_cells);
-        }
+        each_chunk(
+            &merged.caches,
+            job,
+            &progress,
+            &|si, chunk, job| chunk_cells(&merged, &grid, si, chunk, job),
+            |si, _, chunk_cells| {
+                entries += chunk_cells.len();
+                ensure!(
+                    entries * std::mem::size_of::<CellPoints>() <= budget,
+                    crate::CoreError::FilterMemoryBudgetTooSmall
+                );
+                // Chunks arrive in order, so each lands at its index.
+                cells[si].push(chunk_cells);
+                Ok(())
+            },
+        )?;
         let mut labels = LabelWriter::new(self, target)?;
-        for (si, scan) in merged.scans.iter().enumerate() {
-            each_chunk(
-                &merged.caches[si],
-                job,
-                &progress,
-                &|_, chunk, job| overlap_chunk(&merged, &grid, &cells, &scanners, si, chunk, job),
-                |chunk, (mask, count)| labels.push(self, scan, chunk, &mask, count),
-            )?;
-        }
+        let moving = labels.target();
+        each_chunk(
+            &merged.caches,
+            job,
+            &progress,
+            &|si, chunk, job| {
+                let picked = overlap_chunk(&merged, &grid, &cells, &scanners, si, chunk, job)?;
+                relabelled(self, moving, merged.scans[si], chunk, picked)
+            },
+            |_, _, moved| moved.map_or(Ok(()), |moved| labels.add(moved)),
+        )?;
+        drop(merged);
         job.check()?;
         labels.commit(
             self,
@@ -1164,40 +1191,59 @@ impl Project {
             "Invalid box"
         );
         let unit = crop.unit_matrix();
-        self.filter(
-            scan_ids,
-            Stage::BoxCrop,
-            target,
-            serde_json::json!({"kind": "box", "box": crop, "inside": inside, "scans": self.scans_record(scan_ids)}),
-            job,
-            |cache, chunk, job| {
-                let to_box = unit * cache.project.world_matrix(cache.scan);
-                let info = &cache.scan.chunks[chunk as usize];
-                let mut mask = vec![0u8; (info.count as usize).div_ceil(8)];
-                // The chunk's bounds in box coordinates, conservatively.
-                let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
-                for c in info.bounds.corners() {
-                    let q = to_box.transform_point3(c);
-                    lo = lo.min(q);
-                    hi = hi.max(q);
+        let mut labels = LabelWriter::new(self, target)?;
+        {
+            let project: &Project = self;
+            // Chunks entirely on the kept side are left out before any
+            // worker starts, so their number costs nothing but this test.
+            let mut chunks = vec![];
+            for scan in project.scans().filter(|s| scan_ids.contains(&s.id)) {
+                let to_box = unit * project.world_matrix(scan);
+                for (chunk, info) in scan.chunks.iter().enumerate() {
+                    // The chunk's bounds in box coordinates, conservatively.
+                    let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
+                    for c in info.bounds.corners() {
+                        let q = to_box.transform_point3(c);
+                        lo = lo.min(q);
+                        hi = hi.max(q);
+                    }
+                    let disjoint = lo.cmpgt(DVec3::ONE).any() || hi.cmplt(-DVec3::ONE).any();
+                    let within = lo.cmpge(-DVec3::ONE).all() && hi.cmple(DVec3::ONE).all();
+                    if !((inside && disjoint) || (!inside && within)) {
+                        chunks.push((scan, chunk as u32));
+                    }
                 }
-                let disjoint = lo.cmpgt(DVec3::ONE).any() || hi.cmplt(-DVec3::ONE).any();
-                let within = lo.cmpge(-DVec3::ONE).all() && hi.cmple(DVec3::ONE).all();
-                if (inside && disjoint) || (!inside && within) {
-                    return Ok((mask, 0));
-                }
-                let points = cache.get(chunk, job)?;
+            }
+            labels.push_parallel(project, &chunks, Stage::BoxCrop, job, |scan, chunk| {
+                let to_box = unit * project.world_matrix(scan);
+                let data = project.read_chunk(scan, chunk)?;
+                let hidden = project.hidden_mask(scan, chunk)?;
+                let mut mask = vec![0u8; data.len().div_ceil(scan.stride).div_ceil(8)];
                 let mut count = 0;
-                for (p, index) in points.positions.iter().zip(&points.indices) {
-                    let q = to_box.transform_point3(*p);
-                    if q.abs().cmple(DVec3::ONE).all() == inside {
-                        mask[*index as usize / 8] |= 1 << (index % 8);
+                for (i, p) in data.chunks_exact(scan.stride).enumerate() {
+                    if i % 8192 == 0 {
+                        job.check()?;
+                    }
+                    if valid(p)
+                        && !is_set(&hidden, i)
+                        && to_box
+                            .transform_point3(DVec3::from(position(p)))
+                            .abs()
+                            .cmple(DVec3::ONE)
+                            .all()
+                            == inside
+                    {
+                        mask[i / 8] |= 1 << (i % 8);
                         count += 1;
                     }
                 }
                 Ok((mask, count))
-            },
-        )
+            })?;
+        }
+        job.check()?;
+        let operation = serde_json::json!({"kind": "box", "box": crop, "inside": inside,
+            "scans": self.scans_record(scan_ids)});
+        labels.commit(self, operation, |_| Ok(()), false)
     }
     /// Statistical outlier removal, per scan: a point moves to `target` when its mean
     /// distance to its `neighbours` nearest points is more than `deviations`
@@ -1227,84 +1273,98 @@ impl Project {
         let statistics = Progress::new(Stage::OutlierStatistics, &scans, 1);
         let filtering = Progress::new(Stage::OutlierFilter, &scans, 1);
         let mut labels = LabelWriter::new(self, target)?;
-        for scan in &scans {
-            let cache = ChunkCache::new(self, scan);
-            // The first pass keeps each point's mean distance in a scratch
-            // file (NaN where too few neighbours are in reach), so the second
-            // pass need not search again.
-            let path = self
-                .root
-                .join("staging")
-                .join(format!("{}.sor", Uuid::new_v4()));
-            let _remove = TempFile(path.clone());
-            let mut spill = BufWriter::new(create_scratch(&path)?);
-            let mut offsets = vec![0u64; scan.chunks.len() + 1];
-            let (mut n, mut sum, mut squares) = (0u64, 0., 0.);
-            each_chunk(
-                &cache,
-                job,
-                &statistics,
-                &|cache, chunk, job| {
-                    let (_, distances) =
-                        mean_neighbour_distances(cache, chunk, k, max_distance, job)?;
-                    let stats = distances
-                        .iter()
-                        .flatten()
-                        .fold((0u64, 0., 0.), |(n, s, q), d| (n + 1, s + d, q + d * d));
-                    let bytes: Vec<u8> = distances
-                        .iter()
-                        .flat_map(|d| d.unwrap_or(f64::NAN).to_le_bytes())
-                        .collect();
-                    Ok((stats, bytes))
-                },
-                |chunk, ((a, b, c), bytes)| {
-                    n += a;
-                    sum += b;
-                    squares += c;
-                    spill.write_all(&bytes)?;
-                    offsets[chunk as usize + 1] = offsets[chunk as usize] + bytes.len() as u64;
-                    Ok(())
-                },
-            )?;
-            spill.flush()?;
-            drop(spill);
-            let mean = sum / n.max(1) as f64;
-            let sigma = (squares / n.max(1) as f64 - mean * mean).max(0.).sqrt();
-            let threshold = mean + deviations * sigma;
-            each_chunk(
-                &cache,
-                job,
-                &filtering,
-                &|cache, chunk, job| {
-                    let own = cache.get(chunk, job)?;
-                    let (start, end) = (offsets[chunk as usize], offsets[chunk as usize + 1]);
-                    ensure!(
-                        end - start == own.positions.len() as u64 * 8,
-                        "Outlier distances do not match the points"
-                    );
-                    let mut bytes = vec![0u8; (end - start) as usize];
-                    let mut file = File::open(&path)?;
-                    file.seek(SeekFrom::Start(start))?;
-                    file.read_exact(&mut bytes)?;
-                    let distances = bytes
-                        .as_chunks::<8>()
-                        .0
-                        .iter()
-                        .map(|b| f64::from_le_bytes(*b));
-                    let mut mask =
-                        vec![0u8; (cache.scan.chunks[chunk as usize].count as usize).div_ceil(8)];
-                    let mut count = 0;
-                    for (index, d) in own.indices.iter().zip(distances) {
-                        if d.is_nan() || d > threshold {
-                            mask[*index as usize / 8] |= 1 << (index % 8);
-                            count += 1;
-                        }
+        let moving = labels.target();
+        let caches = ChunkCache::for_scans(self, &scans);
+        // The first pass keeps each point's mean distance in a scratch file
+        // (NaN where too few neighbours are in reach), so the second pass
+        // need not search again. Statistics and thresholds are per scan.
+        let path = self
+            .root
+            .join("staging")
+            .join(format!("{}.sor", Uuid::new_v4()));
+        let _remove = TempFile(path.clone());
+        let mut spill = BufWriter::new(create_scratch(&path)?);
+        let mut written = 0u64;
+        let mut ranges: Vec<Vec<(u64, u64)>> = scans
+            .iter()
+            .map(|s| Vec::with_capacity(s.chunks.len()))
+            .collect();
+        let mut stats = vec![(0u64, 0., 0.); scans.len()];
+        each_chunk(
+            &caches,
+            job,
+            &statistics,
+            &|si, chunk, job| {
+                let (_, distances) =
+                    mean_neighbour_distances(&caches[si], chunk, k, max_distance, job)?;
+                let stats = distances
+                    .iter()
+                    .flatten()
+                    .fold((0u64, 0., 0.), |(n, s, q), d| (n + 1, s + d, q + d * d));
+                let bytes: Vec<u8> = distances
+                    .iter()
+                    .flat_map(|d| d.unwrap_or(f64::NAN).to_le_bytes())
+                    .collect();
+                Ok((stats, bytes))
+            },
+            |si, _, ((a, b, c), bytes)| {
+                let (n, sum, squares) = &mut stats[si];
+                *n += a;
+                *sum += b;
+                *squares += c;
+                spill.write_all(&bytes)?;
+                // Chunks arrive in order, so each lands at its index.
+                ranges[si].push((written, written + bytes.len() as u64));
+                written += bytes.len() as u64;
+                Ok(())
+            },
+        )?;
+        spill.flush()?;
+        drop(spill);
+        let thresholds: Vec<f64> = stats
+            .iter()
+            .map(|&(n, sum, squares)| {
+                let mean = sum / n.max(1) as f64;
+                let sigma = (squares / n.max(1) as f64 - mean * mean).max(0.).sqrt();
+                mean + deviations * sigma
+            })
+            .collect();
+        each_chunk(
+            &caches,
+            job,
+            &filtering,
+            &|si, chunk, job| {
+                let cache = &caches[si];
+                let own = cache.get(chunk, job)?;
+                let (start, end) = ranges[si][chunk as usize];
+                ensure!(
+                    end - start == own.positions.len() as u64 * 8,
+                    "Outlier distances do not match the points"
+                );
+                let mut bytes = vec![0u8; (end - start) as usize];
+                let mut file = File::open(&path)?;
+                file.seek(SeekFrom::Start(start))?;
+                file.read_exact(&mut bytes)?;
+                let distances = bytes
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|b| f64::from_le_bytes(*b));
+                let mut mask =
+                    vec![0u8; (cache.scan.chunks[chunk as usize].count as usize).div_ceil(8)];
+                let mut count = 0;
+                for (index, d) in own.indices.iter().zip(distances) {
+                    if d.is_nan() || d > thresholds[si] {
+                        mask[*index as usize / 8] |= 1 << (index % 8);
+                        count += 1;
                     }
-                    Ok((mask, count))
-                },
-                |chunk, (mask, count)| labels.push(self, scan, chunk, &mask, count),
-            )?;
-        }
+                }
+                drop(own);
+                relabelled(self, moving, cache.scan, chunk, (mask, count))
+            },
+            |_, _, moved| moved.map_or(Ok(()), |moved| labels.add(moved)),
+        )?;
+        drop(caches);
         job.check()?;
         labels.commit(
             self,
@@ -1328,12 +1388,19 @@ impl Project {
         let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
         let progress = Progress::new(stage, &scans, 1);
         let mut labels = LabelWriter::new(self, target)?;
-        for scan in &scans {
-            let cache = ChunkCache::new(self, scan);
-            each_chunk(&cache, job, &progress, &judge, |chunk, (mask, count)| {
-                labels.push(self, scan, chunk, &mask, count)
-            })?;
-        }
+        let moving = labels.target();
+        let caches = ChunkCache::for_scans(self, &scans);
+        each_chunk(
+            &caches,
+            job,
+            &progress,
+            &|si, chunk, job| {
+                let picked = judge(&caches[si], chunk, job)?;
+                relabelled(self, moving, scans[si], chunk, picked)
+            },
+            |_, _, moved| moved.map_or(Ok(()), |moved| labels.add(moved)),
+        )?;
+        drop(caches);
         job.check()?;
         labels.commit(self, operation, |_| Ok(()), false)
     }
@@ -1362,37 +1429,21 @@ impl Progress {
     }
 }
 
-/// Runs `work` on every chunk of the cache's scan on worker threads and
-/// consumes bounded batches in chunk order; the first error stops the rest.
-fn each_chunk<R: Send>(
-    cache: &ChunkCache,
-    job: &JobControl,
-    progress: &Progress,
-    work: &(impl Fn(&ChunkCache, u32, &JobControl) -> Result<R> + Sync),
-    mut consume: impl FnMut(u32, R) -> Result<()>,
-) -> Result<()> {
-    let chunks = cache.scan.chunks.len();
-    if chunks == 0 {
-        return Ok(());
-    }
-    let options = cache.project.filter_options;
+/// Workers for filtering chunks: the CPUs (or the options' count), at most
+/// 16, while each can hold the largest possible decode (compressed input,
+/// shuffled and final bytes), neighbour/own arrays, search structures,
+/// labels and scratch. Merged filtering can read a chunk from any current
+/// scan.
+fn filter_workers(project: &Project) -> Result<usize> {
+    let options = project.filter_options;
     ensure!(options.worker_threads <= 64, "Too many filter workers");
-    // Count the largest possible decode (compressed input, shuffled and final
-    // bytes), held neighbour/own arrays, search structures, labels and scratch.
-    // Merged filtering can read a chunk from any current scan.
-    let largest_raw = cache
-        .project
-        .scans()
-        .flat_map(|s| s.chunks.iter().map(move |c| c.count as usize * s.stride))
-        .max()
-        .unwrap_or(0);
-    let largest_points = cache
-        .project
-        .scans()
-        .flat_map(|s| &s.chunks)
-        .map(|c| c.count as usize)
-        .max()
-        .unwrap_or(0);
+    let (mut largest_raw, mut largest_points) = (0, 0);
+    for scan in project.scans() {
+        for c in &scan.chunks {
+            largest_raw = largest_raw.max(c.count as usize * scan.stride);
+            largest_points = largest_points.max(c.count as usize);
+        }
+    }
     let per_worker = largest_raw
         .saturating_mul(4)
         .saturating_add(largest_points.saturating_mul(512))
@@ -1407,50 +1458,63 @@ fn each_chunk<R: Send>(
         cpus.min(16)
     } else {
         options.worker_threads
+    };
+    Ok(workers.min(capacity))
+}
+
+/// The labels of a chunk with the points a filter picked moved to `target`;
+/// none when it picked none.
+fn relabelled(
+    project: &Project,
+    target: u8,
+    scan: &Scan,
+    chunk: u32,
+    (mask, count): ChunkResult,
+) -> Result<Option<ChunkLabels>> {
+    if count == 0 {
+        return Ok(None);
     }
-    .min(capacity)
-    .min(chunks);
-    let width = workers * 2;
-    for start in (0..chunks).step_by(width) {
-        job.check()?;
-        let length = width.min(chunks - start);
-        let results: Vec<Mutex<Option<R>>> = (0..length).map(|_| Mutex::new(None)).collect();
-        let next = AtomicUsize::new(0);
-        let failed = AtomicBool::new(false);
-        let error = Mutex::new(None);
-        std::thread::scope(|scope| {
-            for _ in 0..workers.min(length) {
-                scope.spawn(|| {
-                    while !failed.load(Ordering::Relaxed) {
-                        let index = next.fetch_add(1, Ordering::Relaxed);
-                        if index >= length {
-                            break;
-                        }
-                        match work(cache, (start + index) as u32, job) {
-                            Ok(result) => *results[index].lock().unwrap() = Some(result),
-                            Err(e) => {
-                                failed.store(true, Ordering::Relaxed);
-                                *error.lock().unwrap() = Some(e);
-                                break;
-                            }
-                        }
-                        progress.step(job);
-                    }
-                });
+    relabel(project, target, scan, chunk, &mask)
+}
+
+/// Runs `work` on every chunk of the caches' scans, scan after scan, on
+/// worker threads started once, and consumes the results in that order;
+/// the first error stops the rest. A scan's cache from
+/// [`ChunkCache::for_scans`] is emptied once its last chunk is consumed.
+fn each_chunk<R: Send>(
+    caches: &[ChunkCache],
+    job: &JobControl,
+    progress: &Progress,
+    work: &(impl Fn(usize, u32, &JobControl) -> Result<R> + Sync),
+    mut consume: impl FnMut(usize, u32, R) -> Result<()>,
+) -> Result<()> {
+    let Some(first) = caches.first() else {
+        return Ok(());
+    };
+    let chunks: Vec<(usize, u32)> = caches
+        .iter()
+        .enumerate()
+        .flat_map(|(si, c)| (0..c.scan.chunks.len() as u32).map(move |chunk| (si, chunk)))
+        .collect();
+    for_each_ordered(
+        &chunks,
+        filter_workers(first.project)?,
+        job,
+        |_, &(si, chunk)| {
+            let result = work(si, chunk, job)?;
+            progress.step(job);
+            Ok(result)
+        },
+        |index, result| {
+            let (si, chunk) = chunks[index];
+            consume(si, chunk, result)?;
+            let cache = &caches[si];
+            if cache.release && chunk as usize + 1 == cache.scan.chunks.len() {
+                *cache.state.lock().unwrap() = CacheState::default();
             }
-        });
-        if let Some(e) = error.into_inner().unwrap() {
-            return Err(e);
-        }
-        for (index, result) in results.into_iter().enumerate() {
-            job.check()?;
-            consume(
-                (start + index) as u32,
-                result.into_inner().unwrap().expect("chunk processed"),
-            )?;
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+    )
 }
 
 #[cfg(test)]

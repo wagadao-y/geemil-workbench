@@ -3,6 +3,7 @@
 //! writes a patch of the chunks whose labels changed and lists it in the
 //! working state, so undo and revision switches only swap states.
 use crate::codec::{pack_labels, unpack_labels};
+use crate::parallel::for_each_unordered;
 use crate::{
     DEFAULT_LAYER, JobControl, LabelBlock, LabelPatch, Layer, LayerTarget, Project, Revision, Scan,
     Stage,
@@ -12,6 +13,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
+    sync::{Arc, Mutex},
 };
 use uuid::Uuid;
 
@@ -29,6 +31,37 @@ fn layer_points(total: u32, block: Option<&LabelBlock>) -> Vec<(u8, u64)> {
     counts.extend_from_slice(others);
     counts
 }
+
+/// The block holding each chunk's labels in one state, with its patch file.
+#[derive(Debug)]
+pub(crate) struct LabelIndex {
+    /// The state's patches the index was built from. Patches never change
+    /// once written, so the same list means the same index.
+    labels: Vec<Uuid>,
+    blocks: HashMap<(Uuid, u32), (Arc<str>, LabelBlock)>,
+}
+impl LabelIndex {
+    fn new(project: &Project) -> Self {
+        let labels = project.current().labels.clone();
+        let patches: HashMap<Uuid, &LabelPatch> =
+            project.manifest.patches.iter().map(|p| (p.id, p)).collect();
+        let mut blocks = HashMap::new();
+        // The last patch listing a chunk holds its labels.
+        for patch in labels.iter().rev().filter_map(|id| patches.get(id)) {
+            let file: Arc<str> = patch.file.as_str().into();
+            for block in &patch.blocks {
+                blocks
+                    .entry((block.scan, block.chunk))
+                    .or_insert_with(|| (file.clone(), block.clone()));
+            }
+        }
+        Self { labels, blocks }
+    }
+}
+/// The [`LabelIndex`] of the state last asked about. Clones of a project
+/// share it, and a different state's question replaces it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LabelIndexCache(Arc<Mutex<Option<Arc<LabelIndex>>>>);
 
 /// The lowest code no layer of `state` uses.
 fn free_code(state: &Revision) -> Result<u8> {
@@ -48,13 +81,19 @@ impl Project {
             None => LayerTarget::New(name.into()),
         }
     }
-    /// The block holding a chunk's labels in the current state; none means
-    /// every point is in the default layer.
-    fn label_block(&self, scan: Uuid, chunk: u32) -> Option<(&LabelPatch, &LabelBlock)> {
-        self.current().labels.iter().rev().find_map(|id| {
-            let patch = self.manifest.patches.iter().find(|p| p.id == *id)?;
-            patch.block(scan, chunk).map(|b| (patch, b))
-        })
+    /// Where every chunk's labels are in the current state, built once per
+    /// state rather than searching the state's patches for each chunk.
+    fn label_index(&self) -> Arc<LabelIndex> {
+        let mut cached = self.label_index.0.lock().unwrap();
+        match &*cached {
+            Some(index) if index.labels == self.current().labels => index.clone(),
+            _ => cached.insert(Arc::new(LabelIndex::new(self))).clone(),
+        }
+    }
+    /// The patch file and block holding a chunk's labels in the current
+    /// state; none means every point is in the default layer.
+    fn label_block(&self, scan: Uuid, chunk: u32) -> Option<(Arc<str>, LabelBlock)> {
+        self.label_index().blocks.get(&(scan, chunk)).cloned()
     }
     /// The layer code of every point of a chunk.
     pub fn labels(&self, scan: &Scan, chunk: u32) -> Result<Vec<u8>> {
@@ -63,13 +102,13 @@ impl Project {
             .get(chunk as usize)
             .ok_or_else(|| anyhow!("Invalid chunk"))?
             .count as usize;
-        let Some((patch, block)) = self
+        let Some((file, block)) = self
             .label_block(scan.id, chunk)
             .filter(|(_, b)| b.bytes > 0)
         else {
             return Ok(vec![DEFAULT_LAYER; count]);
         };
-        let mut f = File::open(self.path(&patch.file)?)?;
+        let mut f = File::open(self.path(&file)?)?;
         ensure!(
             block.offset + block.bytes as u64 <= f.metadata()?.len(),
             "Truncated labels"
@@ -82,7 +121,7 @@ impl Project {
     /// Points of a chunk per layer, without reading its labels.
     fn chunk_counts(&self, scan: &Scan, chunk: u32) -> Vec<(u8, u64)> {
         let block = self.label_block(scan.id, chunk).map(|(_, b)| b);
-        layer_points(scan.chunks[chunk as usize].count, block)
+        layer_points(scan.chunks[chunk as usize].count, block.as_ref())
     }
     /// The block holding each chunk's labels in the current state for every
     /// chunk of `scans`, parallel to them: [`Project::label_block`] for all
@@ -167,6 +206,29 @@ impl Project {
             .filter(|(code, _)| hidden[*code as usize])
             .map(|(_, n)| n)
             .sum()
+    }
+    /// Workers for judging chunks of `scans` one at a time: the CPUs (or the
+    /// filter options' count), at most 16, while each can decode the largest
+    /// chunk (compressed, shuffled and final bytes) with its labels and mask.
+    pub(crate) fn chunk_workers(&self, scans: &[&Scan]) -> Result<usize> {
+        let per_worker = scans
+            .iter()
+            .flat_map(|s| {
+                s.chunks
+                    .iter()
+                    .map(move |c| c.count as usize * (s.stride * 3 + 2))
+            })
+            .max()
+            .unwrap_or(0)
+            .max(1);
+        let options = self.filter_options;
+        let capacity = (options.memory_bytes - options.memory_bytes / 4) / per_worker;
+        ensure!(capacity > 0, crate::CoreError::FilterMemoryBudgetTooSmall);
+        let workers = match options.worker_threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get().min(16)),
+            n => n,
+        };
+        Ok(workers.min(capacity))
     }
     /// Points per layer over the scans of the current state, for every layer.
     pub fn layer_counts(&self) -> BTreeMap<u8, u64> {
@@ -255,6 +317,59 @@ impl Project {
     }
 }
 
+/// A chunk's labels after a move, packed for a patch.
+pub(crate) struct ChunkLabels {
+    scan: Uuid,
+    chunk: u32,
+    /// Empty when every point is in the default layer.
+    packed: Vec<u8>,
+    counts: Vec<(u8, u64)>,
+    moved: u64,
+}
+impl ChunkLabels {
+    /// None when the move changed nothing.
+    fn new(scan: Uuid, chunk: u32, labels: &[u8], moved: u64) -> Result<Option<Self>> {
+        if moved == 0 {
+            return Ok(None);
+        }
+        let mut counts = BTreeMap::new();
+        for label in labels.iter().filter(|l| **l != DEFAULT_LAYER) {
+            *counts.entry(*label).or_insert(0u64) += 1;
+        }
+        let packed = if counts.is_empty() {
+            vec![]
+        } else {
+            pack_labels(labels)?
+        };
+        Ok(Some(Self {
+            scan,
+            chunk,
+            packed,
+            counts: counts.into_iter().collect(),
+            moved,
+        }))
+    }
+}
+
+/// A chunk's labels with the points set in `mask` moved to `target`.
+pub(crate) fn relabel(
+    project: &Project,
+    target: u8,
+    scan: &Scan,
+    chunk: u32,
+    mask: &[u8],
+) -> Result<Option<ChunkLabels>> {
+    let mut labels = project.labels(scan, chunk)?;
+    let mut moved = 0;
+    for (i, label) in labels.iter_mut().enumerate() {
+        if is_set(mask, i) && *label != target {
+            *label = target;
+            moved += 1;
+        }
+    }
+    ChunkLabels::new(scan.id, chunk, &labels, moved)
+}
+
 /// Writes the labels of the chunks an operation changes to staging, then
 /// commits them as one patch that moves points to the target layer.
 pub(crate) struct LabelWriter {
@@ -300,27 +415,39 @@ impl LabelWriter {
             new_layer,
         })
     }
-    /// Moves the points of a chunk set in `mask`, of which there are `count`.
-    pub(crate) fn push(
+    /// Moves the points `judge` picks in each of `chunks`, judging and
+    /// relabelling the chunks on worker threads.
+    pub(crate) fn push_parallel(
         &mut self,
         project: &Project,
-        scan: &Scan,
-        chunk: u32,
-        mask: &[u8],
-        count: u64,
+        chunks: &[(&Scan, u32)],
+        stage: Stage,
+        job: &JobControl,
+        judge: impl Fn(&Scan, u32) -> Result<(Vec<u8>, u64)> + Sync,
     ) -> Result<()> {
-        if count == 0 {
-            return Ok(());
-        }
-        let mut labels = project.labels(scan, chunk)?;
-        let mut moved = 0;
-        for (i, label) in labels.iter_mut().enumerate() {
-            if is_set(mask, i) && *label != self.target {
-                *label = self.target;
-                moved += 1;
-            }
-        }
-        self.write(scan.id, chunk, &labels, moved)
+        let scans: Vec<_> = chunks.iter().map(|(scan, _)| *scan).collect();
+        let workers = project.chunk_workers(&scans)?;
+        let target = self.target;
+        let total = chunks.len() as u64;
+        let mut done = 0;
+        job.report(stage, 0, total);
+        for_each_unordered(
+            chunks,
+            workers,
+            job,
+            |&(scan, chunk)| {
+                let (mask, count) = judge(scan, chunk)?;
+                if count == 0 {
+                    return Ok(None);
+                }
+                relabel(project, target, scan, chunk, &mask)
+            },
+            |labels| {
+                done += 1;
+                job.report(stage, done, total);
+                labels.map_or(Ok(()), |labels| self.add(labels))
+            },
+        )
     }
     /// Moves every point of layer `from` in the current scans.
     fn push_layer_all(&mut self, project: &Project, from: u8, job: &JobControl) -> Result<()> {
@@ -345,34 +472,35 @@ impl LabelWriter {
                     *label = self.target;
                     moved += 1;
                 }
-                self.write(scan.id, chunk, &labels, moved)?;
+                if let Some(labels) = ChunkLabels::new(scan.id, chunk, &labels, moved)? {
+                    self.add(labels)?;
+                }
             }
         }
         Ok(())
     }
-    fn write(&mut self, scan: Uuid, chunk: u32, labels: &[u8], moved: u64) -> Result<()> {
-        if moved == 0 {
-            return Ok(());
-        }
-        let mut counts = BTreeMap::new();
-        for label in labels.iter().filter(|l| **l != DEFAULT_LAYER) {
-            *counts.entry(*label).or_insert(0u64) += 1;
-        }
-        let bytes = if counts.is_empty() {
-            0
-        } else {
-            let packed = pack_labels(labels)?;
-            self.file.write_all(&packed)?;
-            packed.len() as u32
-        };
+    /// The code of the layer points move to.
+    pub(crate) fn target(&self) -> u8 {
+        self.target
+    }
+    /// Appends a chunk's new labels to the patch.
+    pub(crate) fn add(&mut self, labels: ChunkLabels) -> Result<()> {
+        let ChunkLabels {
+            scan,
+            chunk,
+            packed,
+            counts,
+            moved,
+        } = labels;
+        self.file.write_all(&packed)?;
         self.blocks.push(LabelBlock {
             scan,
             chunk,
             offset: self.offset,
-            bytes,
-            counts: counts.into_iter().collect(),
+            bytes: packed.len() as u32,
+            counts,
         });
-        self.offset += bytes as u64;
+        self.offset += packed.len() as u64;
         self.moved += moved;
         Ok(())
     }

@@ -1,5 +1,5 @@
 use crate::layers::{LabelWriter, is_set};
-use crate::parallel::OrderedPool;
+use crate::parallel::{OrderedPool, for_each_unordered};
 use crate::storage::{position, valid};
 use crate::view_cache::NodeEstimates;
 use crate::{Bounds, JobControl, LayerTarget, Pose, Project, Sample, Scan, Stage, ViewCache};
@@ -386,22 +386,32 @@ impl Project {
         scans: &[&Scan],
         job: &JobControl,
     ) -> Result<Vec<Vec<f64>>> {
-        let mut result = vec![];
-        for scan in scans {
+        let mut result: Vec<_> = scans
+            .iter()
+            .map(|s| vec![f64::INFINITY; s.chunks.len()])
+            .collect();
+        let mut chunks = vec![];
+        for (index, scan) in scans.iter().enumerate() {
             let world = self.world_matrix(scan);
-            let mut depths = vec![f64::INFINITY; scan.chunks.len()];
-            for (id, c) in scan.chunks.iter().enumerate() {
-                job.check()?;
-                job.report(
-                    Stage::SelectionNearestDepth,
-                    id as u64,
-                    scan.chunks.len() as u64,
-                );
-                if !test.may_contain(&c.bounds, world, f64::INFINITY) {
-                    continue;
+            for (chunk, c) in scan.chunks.iter().enumerate() {
+                if test.may_contain(&c.bounds, world, f64::INFINITY) {
+                    chunks.push((index, chunk));
                 }
-                let data = self.read_chunk(scan, id as u32)?;
-                let hidden = self.hidden_mask(scan, id as u32)?;
+            }
+        }
+        let total = chunks.len() as u64;
+        let mut done = 0;
+        job.report(Stage::SelectionNearestDepth, 0, total);
+        for_each_unordered(
+            &chunks,
+            self.chunk_workers(scans)?,
+            job,
+            |&(index, chunk)| {
+                let scan = scans[index];
+                let world = self.world_matrix(scan);
+                let data = self.read_chunk(scan, chunk as u32)?;
+                let hidden = self.hidden_mask(scan, chunk as u32)?;
+                let mut nearest = f64::INFINITY;
                 for (i, p) in data.chunks_exact(scan.stride).enumerate() {
                     if i % 8192 == 0 {
                         job.check()?;
@@ -411,12 +421,18 @@ impl Project {
                         && let Some(depth) =
                             test.contains(world.transform_point3(DVec3::from(position(p))))
                     {
-                        depths[id] = depths[id].min(depth);
+                        nearest = nearest.min(depth);
                     }
                 }
-            }
-            result.push(depths);
-        }
+                Ok((index, chunk, nearest))
+            },
+            |(index, chunk, nearest)| {
+                done += 1;
+                job.report(Stage::SelectionNearestDepth, done, total);
+                result[index][chunk] = nearest;
+                Ok(())
+            },
+        )?;
         Ok(result)
     }
     /// Moves the visible original points of `scan_ids` the selection takes to
@@ -449,40 +465,42 @@ impl Project {
             }
             _ => (None, f64::INFINITY, None),
         };
-        let mut labels = LabelWriter::new(self, target)?;
+        let mut chunks = vec![];
         for (index, scan) in scans.iter().enumerate() {
             let world = self.world_matrix(scan);
             for (chunk, c) in scan.chunks.iter().enumerate() {
-                job.check()?;
-                job.report(Stage::SelectionMove, chunk as u64, scan.chunks.len() as u64);
                 let skip = match (&chunk_nearest, selection.mode) {
                     (Some(depths), _) => depths[index][chunk] > limit,
                     (None, SelectionMode::ExcludeInside) => !test.may_cover(&c.bounds, world),
                     // A box inside a non-convex polygon may still have outside points.
                     (None, SelectionMode::ExcludeOutside) => false,
                 };
-                if skip {
-                    continue;
+                if !skip {
+                    chunks.push((*scan, chunk as u32));
                 }
-                let data = self.read_chunk(scan, chunk as u32)?;
-                let hidden = self.hidden_mask(scan, chunk as u32)?;
-                let mut mask = vec![0; (c.count as usize).div_ceil(8)];
-                let mut count = 0;
-                for (i, p) in data.chunks_exact(scan.stride).enumerate() {
-                    if i % 8192 == 0 {
-                        job.check()?;
-                    }
-                    if valid(p)
-                        && !is_set(&hidden, i)
-                        && test.excludes(world.transform_point3(DVec3::from(position(p))), limit)
-                    {
-                        mask[i / 8] |= 1 << (i % 8);
-                        count += 1;
-                    }
-                }
-                labels.push(self, scan, chunk as u32, &mask, count)?;
             }
         }
+        let mut labels = LabelWriter::new(self, target)?;
+        labels.push_parallel(self, &chunks, Stage::SelectionMove, job, |scan, chunk| {
+            let world = self.world_matrix(scan);
+            let data = self.read_chunk(scan, chunk)?;
+            let hidden = self.hidden_mask(scan, chunk)?;
+            let mut mask = vec![0; data.len().div_ceil(scan.stride).div_ceil(8)];
+            let mut count = 0;
+            for (i, p) in data.chunks_exact(scan.stride).enumerate() {
+                if i % 8192 == 0 {
+                    job.check()?;
+                }
+                if valid(p)
+                    && !is_set(&hidden, i)
+                    && test.excludes(world.transform_point3(DVec3::from(position(p))), limit)
+                {
+                    mask[i / 8] |= 1 << (i % 8);
+                    count += 1;
+                }
+            }
+            Ok((mask, count))
+        })?;
         job.check()?;
         let scans = self.scans_record(scan_ids);
         labels.commit(
