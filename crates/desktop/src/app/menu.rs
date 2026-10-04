@@ -158,15 +158,8 @@ impl Workbench {
                     self.tool_button(ui, Action::Tool(tool), selected, &mut chosen);
                 }
                 ui.separator();
-                self.tool_button(ui, Action::FitView, false, &mut chosen);
-                for preset in [
-                    ViewPreset::Top,
-                    ViewPreset::Front,
-                    ViewPreset::Side,
-                    ViewPreset::Iso,
-                ] {
-                    self.tool_button(ui, Action::View(preset), false, &mut chosen);
-                }
+                // Fit and the view presets move the camera at once, so they
+                // stay in the View menu and on keys, away from the tools.
                 let ortho = self.camera.ortho;
                 self.tool_button(ui, Action::ToggleOrtho, ortho, &mut chosen);
                 let edl = self.settings.edl;
