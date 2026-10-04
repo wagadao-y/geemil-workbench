@@ -1,6 +1,7 @@
 //! The bounding box of the scan or folder selected in the tree, and the move
 //! and rotate tool: like Potree's transformation tool, dragging an arrow moves
-//! the item along a world axis and dragging a ring turns it about one, around
+//! the item along a world axis, dragging the square between X and Y moves it
+//! in the horizontal plane, and dragging a ring turns it about an axis, around
 //! the scanner position, or the centre of the box where there is none. A drag
 //! is previewed live and becomes one edit, which can be undone, when released.
 use super::{Workbench, selection::Tool};
@@ -23,11 +24,43 @@ const RING: f64 = 65.;
 /// How near a handle the pointer must be to grab it, in points.
 const GRAB: f32 = 7.;
 const RING_SEGMENTS: usize = 64;
+/// The XY square's extent along X and Y, as fractions of the arrow length:
+/// clear of the arrows and inside the Z ring.
+const PLANE: (f64, f64) = (0.2, 0.45);
+/// Below this on-screen area (square points) the XY square is seen edge on
+/// and cannot be dragged.
+const PLANE_MIN_AREA: f32 = 80.;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum Handle {
     Move(usize),
     Turn(usize),
+    /// Moves in the horizontal (XY) plane.
+    Plane,
+}
+impl Handle {
+    /// The world axis moved along or turned about; the plane's normal (Z).
+    pub(super) fn axis(self) -> usize {
+        match self {
+            Handle::Move(i) | Handle::Turn(i) => i,
+            Handle::Plane => 2,
+        }
+    }
+    /// What a drag has done so far: metres, radians, or for the plane the
+    /// offset; as shown next to the pointer.
+    pub(super) fn describe(self, amount: f64, offset: DVec3) -> String {
+        match self {
+            Handle::Move(i) => format!("{} {:+.3} m", AXIS_NAMES[i], amount),
+            Handle::Turn(i) => format!("{} {:+.2}°", AXIS_NAMES[i], amount.to_degrees()),
+            Handle::Plane => format!("X {:+.3} m  Y {:+.3} m", offset.x, offset.y),
+        }
+    }
+}
+/// How far a drag on the XY square has moved: from where the pointer's ray met
+/// the horizontal plane through the pivot at the start to where it meets it now.
+pub(super) fn plane_offset(start: Option<DVec3>, now: Option<DVec3>) -> Option<DVec3> {
+    let offset = now? - start?;
+    Some(DVec3::new(offset.x, offset.y, 0.))
 }
 
 #[derive(Default)]
@@ -47,10 +80,13 @@ struct Drag {
     start: egui::Pos2,
     /// Moves: where one metre along the axis goes on screen.
     per_metre: egui::Vec2,
-    /// Turns: where the pointer's ray met the ring's plane at the start.
+    /// Turns, and drags on the XY square: where the pointer's ray met the
+    /// ring's or square's plane at the start.
     start_hit: Option<DVec3>,
-    /// Metres or radians so far, and the transform they give.
+    /// Metres or radians so far, the XY square's offset, and the transform
+    /// they give.
     amount: f64,
+    offset: DVec3,
     preview: Option<Pose>,
 }
 impl Gizmo {
@@ -204,6 +240,30 @@ pub(super) fn plane_hit(origin: DVec3, dir: DVec3, center: DVec3, axis: DVec3) -
     (along.abs() > 0.05).then(|| origin + dir * ((center - origin).dot(axis) / along))
 }
 
+/// The area of a simple polygon on screen.
+fn polygon_area(points: &[egui::Pos2]) -> f32 {
+    let n = points.len();
+    let twice: f32 = (0..n)
+        .map(|i| {
+            let (a, b) = (points[i], points[(i + 1) % n]);
+            a.x * b.y - b.x * a.y
+        })
+        .sum();
+    twice.abs() / 2.
+}
+
+/// Whether `p` is inside a convex polygon, whichever way it winds.
+fn inside(polygon: &[egui::Pos2], p: egui::Pos2) -> bool {
+    let n = polygon.len();
+    let sides: Vec<f32> = (0..n)
+        .map(|i| {
+            let (edge, to) = (polygon[(i + 1) % n] - polygon[i], p - polygon[i]);
+            edge.x * to.y - edge.y * to.x
+        })
+        .collect();
+    sides.iter().all(|s| *s >= 0.) || sides.iter().all(|s| *s <= 0.)
+}
+
 fn segment_distance(p: egui::Pos2, a: egui::Pos2, b: egui::Pos2) -> f32 {
     let ab = b - a;
     let t = ((p - a).dot(ab) / ab.length_sq().max(1e-6)).clamp(0., 1.);
@@ -217,6 +277,8 @@ pub(super) struct Handles {
     pub(super) tips: [Option<egui::Pos2>; 3],
     /// Ring outlines; points behind the eye are left out.
     rings: [Vec<egui::Pos2>; 3],
+    /// The XY square's corners, unless it is seen edge on or behind the eye.
+    plane: Option<[egui::Pos2; 4]>,
     /// Arrow length and ring radius in metres.
     pub(super) arm: f64,
 }
@@ -235,14 +297,23 @@ impl Handles {
                 })
                 .collect()
         });
+        let (a, b) = (PLANE.0 * arm, PLANE.1 * arm);
+        let corners =
+            [(a, a), (b, a), (b, b), (a, b)].map(|(x, y)| to_screen(center + DVec3::new(x, y, 0.)));
+        let plane = corners
+            .iter()
+            .all(Option::is_some)
+            .then(|| corners.map(Option::unwrap))
+            .filter(|q| polygon_area(q) >= PLANE_MIN_AREA);
         Some(Self {
             center: to_screen(center)?,
             tips,
             rings,
+            plane,
             arm,
         })
     }
-    /// The handle under `pos`: arrows before rings.
+    /// The handle under `pos`: arrows before the XY square before rings.
     pub(super) fn hit(&self, pos: egui::Pos2) -> Option<Handle> {
         let arrows = (0..3).filter_map(|i| {
             let tip = self.tips[i]?;
@@ -255,7 +326,14 @@ impl Handles {
                 .fold(f32::INFINITY, f32::min);
             d.is_finite().then_some((d + 0.5, Handle::Turn(i)))
         });
+        // Inside the square scores as a near miss, so an arrow right under the
+        // pointer still wins where they overlap.
+        let plane = self
+            .plane
+            .filter(|q| inside(q, pos))
+            .map(|_| (2., Handle::Plane));
         arrows
+            .chain(plane)
             .chain(rings)
             .filter(|(d, _)| *d <= GRAB)
             .min_by(|a, b| a.0.total_cmp(&b.0))
@@ -281,6 +359,26 @@ impl Handles {
             painter.add(egui::Shape::line(
                 ring.clone(),
                 egui::Stroke::new(w, color(i, handle)),
+            ));
+        }
+        if let Some(square) = self.plane {
+            let active = active == Some(Handle::Plane);
+            let [r, g, b, _] = AXES[2].1.to_array();
+            let (fill, stroke) = if active {
+                (
+                    egui::Color32::from_rgba_unmultiplied(255, 230, 90, 150),
+                    egui::Color32::from_rgb(255, 230, 90),
+                )
+            } else {
+                (
+                    egui::Color32::from_rgba_unmultiplied(r, g, b, 90),
+                    AXES[2].1,
+                )
+            };
+            painter.add(egui::Shape::convex_polygon(
+                square.to_vec(),
+                fill,
+                egui::Stroke::new(if active { 2.5 } else { 1.5 }, stroke),
             ));
         }
         for (i, tip) in self.tips.iter().enumerate() {
@@ -344,9 +442,7 @@ impl Workbench {
             if response.dragged_by(egui::PointerButton::Primary)
                 && let Some(pos) = response.interact_pointer_pos()
             {
-                let (axis, _) = AXES[match drag.handle {
-                    Handle::Move(i) | Handle::Turn(i) => i,
-                }];
+                let (axis, _) = AXES[drag.handle.axis()];
                 let motion = match drag.handle {
                     Handle::Move(_) => {
                         let s = drag.per_metre;
@@ -364,6 +460,14 @@ impl Workbench {
                         DMat4::from_translation(drag.center)
                             * DMat4::from_axis_angle(axis, drag.amount)
                             * DMat4::from_translation(-drag.center)
+                    }
+                    Handle::Plane => {
+                        let (origin, dir) = ray(&camera, rect, pos);
+                        let hit = plane_hit(origin, dir, drag.center, axis);
+                        if let Some(offset) = plane_offset(drag.start_hit, hit) {
+                            drag.offset = offset;
+                        }
+                        DMat4::from_translation(drag.offset)
                     }
                 };
                 drag.preview = Some(p.moved_pose(item, drag.own, motion));
@@ -397,14 +501,12 @@ impl Workbench {
         let Some(handle) = handles.hit(start) else {
             return;
         };
-        let (axis, _) = AXES[match handle {
-            Handle::Move(i) | Handle::Turn(i) => i,
-        }];
+        let (axis, _) = AXES[handle.axis()];
         let per_metre = match handle {
             Handle::Move(i) => handles.tips[i].map_or(egui::Vec2::ZERO, |tip| {
                 (tip - handles.center) / handles.arm as f32
             }),
-            Handle::Turn(_) => egui::Vec2::ZERO,
+            Handle::Turn(_) | Handle::Plane => egui::Vec2::ZERO,
         };
         let (origin, dir) = ray(&camera, rect, start);
         self.gizmo.drag = Some(Drag {
@@ -422,6 +524,7 @@ impl Workbench {
             per_metre,
             start_hit: plane_hit(origin, dir, center, axis),
             amount: 0.,
+            offset: DVec3::ZERO,
             preview: None,
         });
     }
@@ -461,10 +564,7 @@ impl Workbench {
         if let Some(drag) = &self.gizmo.drag
             && let Some(pos) = ui.ctx().pointer_hover_pos()
         {
-            let text = match drag.handle {
-                Handle::Move(i) => format!("{} {:+.3} m", AXIS_NAMES[i], drag.amount),
-                Handle::Turn(i) => format!("{} {:+.2}°", AXIS_NAMES[i], drag.amount.to_degrees()),
-            };
+            let text = drag.handle.describe(drag.amount, drag.offset);
             painter.text(
                 pos + egui::vec2(14., -14.),
                 egui::Align2::LEFT_BOTTOM,
@@ -473,5 +573,58 @@ impl Workbench {
                 egui::Color32::WHITE,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Camera, Handle, Handles, plane_hit, plane_offset, ray, screen};
+    use eframe::egui;
+    use glam::DVec3;
+
+    fn rect() -> egui::Rect {
+        egui::Rect::from_min_size(egui::pos2(40., 30.), egui::vec2(1200., 800.))
+    }
+
+    #[test]
+    fn the_xy_square_moves_with_the_ground_under_the_pointer() {
+        let camera = Camera {
+            target: [10., 20., 5.],
+            yaw: 0.6,
+            pitch: 0.9,
+            distance: 30.,
+            aspect: 1.5,
+            ..Camera::default()
+        };
+        let center = DVec3::from(camera.target);
+        let handles = Handles::new(&camera, rect(), center).unwrap();
+        let square = handles.plane.expect("seen from above");
+        let middle = (square.iter().fold(egui::Vec2::ZERO, |a, p| a + p.to_vec2()) / 4.).to_pos2();
+        assert_eq!(handles.hit(middle), Some(Handle::Plane));
+        // The arrows' tips still grab their own handles.
+        assert_eq!(handles.hit(handles.tips[0].unwrap()), Some(Handle::Move(0)));
+
+        let hit = |pos| {
+            let (origin, dir) = ray(&camera, rect(), pos);
+            plane_hit(origin, dir, center, DVec3::Z)
+        };
+        let moved = DVec3::new(1.5, -0.7, 0.);
+        let pos = screen(&camera, rect())(hit(middle).unwrap() + moved).unwrap();
+        let offset = plane_offset(hit(middle), hit(pos)).unwrap();
+        assert!((offset - moved).length() < 1e-2, "{offset:?}");
+        assert_eq!(offset.z, 0.);
+    }
+
+    #[test]
+    fn the_xy_square_is_left_out_edge_on() {
+        let camera = Camera {
+            target: [0., 0., 0.],
+            pitch: 0.,
+            distance: 30.,
+            aspect: 1.5,
+            ..Camera::default()
+        };
+        let handles = Handles::new(&camera, rect(), DVec3::ZERO).unwrap();
+        assert!(handles.plane.is_none());
     }
 }

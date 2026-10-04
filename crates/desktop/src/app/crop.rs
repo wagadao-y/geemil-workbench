@@ -50,6 +50,8 @@ struct BoxDrag {
     per_metre: egui::Vec2,
     start_hit: Option<DVec3>,
     amount: f64,
+    /// Drags on the XY square: how far the box has moved.
+    offset: DVec3,
 }
 impl Crop {
     pub(super) fn dragging(&self) -> bool {
@@ -265,12 +267,7 @@ impl Workbench {
             && let Some(pos) = ui.ctx().pointer_hover_pos()
         {
             let text = match drag.handle {
-                BoxHandle::Transform(Handle::Turn(i)) => {
-                    format!("{} {:+.2}°", ["X", "Y", "Z"][i], drag.amount.to_degrees())
-                }
-                BoxHandle::Transform(Handle::Move(i)) => {
-                    format!("{} {:+.3} m", ["X", "Y", "Z"][i], drag.amount)
-                }
+                BoxHandle::Transform(h) => h.describe(drag.amount, drag.offset),
                 BoxHandle::Face(i, _) => format!("{} {:.3} m", ["X", "Y", "Z"][i], region.size[i]),
             };
             painter.text(
@@ -313,6 +310,15 @@ impl Workbench {
                             .normalize()
                             .to_array();
                         }
+                    }
+                    BoxHandle::Transform(Handle::Plane) => {
+                        let (origin, dir) = gizmo::ray(&self.camera, rect, pos);
+                        let center = DVec3::from(drag.original.center);
+                        let hit = gizmo::plane_hit(origin, dir, center, drag.axis);
+                        if let Some(offset) = gizmo::plane_offset(drag.start_hit, hit) {
+                            drag.offset = offset;
+                        }
+                        next.center = (center + drag.offset).to_array();
                     }
                     _ => {
                         drag.amount = ((pos - drag.start).dot(drag.per_metre)
@@ -359,16 +365,17 @@ impl Workbench {
             .or_else(|| {
                 Handles::new(&self.camera, rect, center).and_then(|h| {
                     let handle = h.hit(start)?;
-                    let i = match handle {
-                        Handle::Move(i) | Handle::Turn(i) => i,
+                    let i = handle.axis();
+                    let per_metre = match handle {
+                        Handle::Move(_) => h.tips[i]
+                            .map_or(egui::Vec2::ZERO, |tip| (tip - h.center) / h.arm as f32),
+                        Handle::Turn(_) | Handle::Plane => egui::Vec2::ZERO,
                     };
-                    let per_metre =
-                        h.tips[i].map_or(egui::Vec2::ZERO, |tip| (tip - h.center) / h.arm as f32);
                     if matches!(handle, Handle::Move(_)) && per_metre.length_sq() < 1e-9 {
                         return None;
                     }
                     let (origin, dir) = gizmo::ray(&self.camera, rect, start);
-                    if matches!(handle, Handle::Turn(_))
+                    if matches!(handle, Handle::Turn(_) | Handle::Plane)
                         && gizmo::plane_hit(origin, dir, center, AXES[i].0).is_none()
                     {
                         return None;
@@ -393,6 +400,7 @@ impl Workbench {
                 per_metre,
                 start_hit: gizmo::plane_hit(origin, dir, center, axis),
                 amount: 0.,
+                offset: DVec3::ZERO,
             });
         }
     }
@@ -470,6 +478,7 @@ mod tests {
                 per_metre: egui::Vec2::X,
                 start_hit: None,
                 amount: 2.,
+                offset: DVec3::ZERO,
             }),
             ..Default::default()
         };
