@@ -574,3 +574,62 @@ fn overlap_reduction_keeps_the_denser_scan_where_scans_overlap() {
     }
     assert_eq!(results[0], results[1]);
 }
+
+#[test]
+fn overlap_reduction_keeps_other_scans_where_the_denser_one_has_a_hole() {
+    let dir = tempfile::tempdir().unwrap();
+    // A dense scan with a round hole, like the blind spot under a scanner,
+    // over a sparse scan of the same plane.
+    let centre = (1., 0.5);
+    let distance = |x: f64, y: f64| ((x - centre.0).powi(2) + (y - centre.1).powi(2)).sqrt();
+    let write = |name: &str, spacing: f64, hole: f64| {
+        let path = dir.path().join(name);
+        let mut writer = las::Writer::from_path(&path, las::Header::default()).unwrap();
+        for i in 0..(2. / spacing).round() as usize {
+            for j in 0..(1. / spacing).round() as usize {
+                let (x, y) = ((i as f64 + 0.5) * spacing, (j as f64 + 0.5) * spacing);
+                if distance(x, y) >= hole {
+                    writer
+                        .write_point(las::Point {
+                            x,
+                            y,
+                            ..Default::default()
+                        })
+                        .unwrap();
+                }
+            }
+        }
+        writer.close().unwrap();
+        path
+    };
+    let dense = write("dense.las", 0.01, 0.2);
+    let sparse = write("sparse.las", 0.03, 0.);
+    let mut p = Project::create(&dir.path().join("p"), "p").unwrap();
+    for file in [&dense, &sparse] {
+        p.import_file(file, ImportOptions::default(), &JobControl::default())
+            .unwrap();
+    }
+    let scans = ids(&p);
+    p.reduce_overlap(
+        0.1,
+        &scans,
+        &p.layer_named("Overlap"),
+        &JobControl::default(),
+    )
+    .unwrap();
+    let scan = p.scan(scans[1]).unwrap();
+    let kept: Vec<_> = (0..scan.chunks.len())
+        .flat_map(|c| p.points(scan, c as u32).unwrap())
+        .map(|s| s.position)
+        .collect();
+    // The sparse scan fills the hole to within a sub-cell (1.25 cm) of its
+    // edge, and keeps little else.
+    let filled = kept.iter().filter(|q| distance(q[0], q[1]) < 0.185).count();
+    let expected = (0..67)
+        .flat_map(|i| (0..33).map(move |j| ((i as f64 + 0.5) * 0.03, (j as f64 + 0.5) * 0.03)))
+        .filter(|&(x, y)| distance(x, y) < 0.185)
+        .count();
+    assert!(expected > 50);
+    assert_eq!(filled, expected);
+    assert!(kept.iter().all(|q| distance(q[0], q[1]) < 0.2));
+}

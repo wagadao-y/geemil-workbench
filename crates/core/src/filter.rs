@@ -560,10 +560,19 @@ fn merged_subsample_chunk(
 }
 
 /// The overlap reduction grid in the project frame, with cells packed into
-/// one integer: 21 bits per axis from `origin`.
+/// one integer: 21 bits per axis from `origin`. Each cell splits into 8×8×8
+/// sub-cells, which one bit each of eight `u64`s marks as holding points.
 struct Grid {
     origin: DVec3,
     size: f64,
+}
+/// A cell's points of one chunk: the cell, their number and the sub-cells
+/// they lie in.
+type CellPoints = (u64, u32, SubCells);
+/// One bit per sub-cell of a cell.
+type SubCells = [u64; 8];
+fn has(subs: &SubCells, sub: u32) -> bool {
+    subs[sub as usize / 64] & (1 << (sub % 64)) != 0
 }
 impl Grid {
     const SIDE: u64 = 1 << 21;
@@ -572,33 +581,56 @@ impl Grid {
             (DVec3::INFINITY, DVec3::NEG_INFINITY),
             |(lo, hi), (a, b)| (lo.min(*a), hi.max(*b)),
         );
-        // One spare cell on each side keeps neighbours of every cell in range.
-        let origin = ((lo / size).floor() - 1.) * size;
+        // Spare cells on each side keep every neighbour looked at in range.
+        let origin = ((lo / size).floor() - 3.) * size;
         ensure!(
-            lo.is_finite() && ((hi - origin) / size).max_element() < (Self::SIDE - 2) as f64,
+            lo.is_finite() && ((hi - origin) / size).max_element() < (Self::SIDE - 4) as f64,
             "Cell size too small for the extent of the scans"
         );
         Ok(Self { origin, size })
     }
-    fn key(&self, p: DVec3) -> u64 {
-        let c = ((p - self.origin) / self.size).floor().as_u64vec3();
-        c.x | (c.y << 21) | (c.z << 42)
+    /// The cell of `p` and its sub-cell, 0 to 511.
+    fn locate(&self, p: DVec3) -> (u64, u32) {
+        let g = (p - self.origin) / self.size;
+        let c = g.floor();
+        let sub = ((g - c) * 8.)
+            .floor()
+            .clamp(DVec3::ZERO, DVec3::splat(7.))
+            .as_uvec3();
+        (
+            Self::pack(c.as_i64vec3().to_array()),
+            sub.x + sub.y * 8 + sub.z * 64,
+        )
     }
-    fn neighbour(key: u64, d: [i64; 3]) -> u64 {
-        let mask = Self::SIDE - 1;
-        let at = |axis: u64, d: i64| (((key >> (21 * axis)) & mask) as i64 + d) as u64;
-        at(0, d[0]) | (at(1, d[1]) << 21) | (at(2, d[2]) << 42)
+    fn pack(c: [i64; 3]) -> u64 {
+        c[0] as u64 | ((c[1] as u64) << 21) | ((c[2] as u64) << 42)
     }
-    fn centre(&self, key: u64) -> DVec3 {
+    fn unpack(key: u64) -> [i64; 3] {
         let mask = Self::SIDE - 1;
-        let c = DVec3::new(
-            (key & mask) as f64,
-            ((key >> 21) & mask) as f64,
-            ((key >> 42) & mask) as f64,
-        );
-        self.origin + (c + 0.5) * self.size
+        [0, 1, 2].map(|axis| ((key >> (21 * axis)) & mask) as i64)
+    }
+    fn offset(key: u64, d: [i64; 3]) -> u64 {
+        let c = Self::unpack(key);
+        Self::pack([c[0] + d[0], c[1] + d[1], c[2] + d[2]])
+    }
+    /// The centre of sub-cell `sub` of cell `key`, in cell units from `origin`.
+    fn sub_centre(key: u64, sub: u32) -> DVec3 {
+        let c = Self::unpack(key);
+        let s = DVec3::new((sub % 8) as f64, (sub / 8 % 8) as f64, (sub / 64) as f64);
+        DVec3::new(c[0] as f64, c[1] as f64, c[2] as f64) + (s + 0.5) / 8.
     }
 }
+
+/// Offsets to a cell and its 26 neighbours.
+const NEIGHBOURS: [[i64; 3]; 27] = {
+    let mut all = [[0; 3]; 27];
+    let mut i = 0;
+    while i < 27 {
+        all[i] = [i as i64 % 3 - 1, i as i64 / 3 % 3 - 1, i as i64 / 9 - 1];
+        i += 1;
+    }
+    all
+};
 
 /// Visible points of chunk `chunk` of scan `si` per grid cell, by cell.
 fn chunk_cells(
@@ -607,75 +639,102 @@ fn chunk_cells(
     si: usize,
     chunk: u32,
     job: &JobControl,
-) -> Result<Vec<(u64, u32)>> {
+) -> Result<Vec<CellPoints>> {
     let own = merged.caches[si].get(chunk, job)?;
     let world = merged.worlds[si];
-    let mut keys: Vec<u64> = own
+    let mut located: Vec<(u64, u32)> = own
         .positions
         .iter()
-        .map(|p| grid.key(world.transform_point3(*p)))
+        .map(|p| grid.locate(world.transform_point3(*p)))
         .collect();
-    keys.sort_unstable();
-    let mut cells: Vec<(u64, u32)> = vec![];
-    for key in keys {
+    located.sort_unstable();
+    let mut cells: Vec<CellPoints> = vec![];
+    for (key, sub) in located {
         match cells.last_mut() {
-            Some((last, n)) if *last == key => *n += 1,
-            _ => cells.push((key, 1)),
+            Some((last, n, subs)) if *last == key => {
+                *n += 1;
+                subs[sub as usize / 64] |= 1 << (sub % 64);
+            }
+            _ => {
+                let mut subs = [0; 8];
+                subs[sub as usize / 64] |= 1 << (sub % 64);
+                cells.push((key, 1, subs));
+            }
         }
     }
     Ok(cells)
 }
 
 /// Overlap reduction of chunk `chunk` of scan `si`; see
-/// `Project::reduce_overlap`. `cells` are every chunk's cell counts, and
+/// `Project::reduce_overlap`. `cells` are every chunk's points per cell, and
 /// `scanners` the scanner positions in the project frame, where known.
 fn overlap_chunk(
     merged: &Merged,
     grid: &Grid,
-    cells: &[Vec<Vec<(u64, u32)>>],
+    cells: &[Vec<Vec<CellPoints>>],
     scanners: &[Option<DVec3>],
     si: usize,
     chunk: u32,
     job: &JobControl,
 ) -> Result<ChunkResult> {
-    const NEIGHBOURS: [[i64; 3]; 27] = {
-        let mut all = [[0; 3]; 27];
-        let mut i = 0;
-        while i < 27 {
-            all[i] = [i as i64 % 3 - 1, i as i64 / 3 % 3 - 1, i as i64 / 9 - 1];
-            i += 1;
-        }
-        all
-    };
-    // Points per scan in the chunk's cells and around them, as (scan, count).
-    let mut counts: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
-    for &(key, _) in &cells[si][chunk as usize] {
-        for d in NEIGHBOURS {
-            counts.entry(Grid::neighbour(key, d)).or_default();
+    // Each scan's points and sub-cells in the cells within two of the
+    // chunk's own: densities around the cells next to them are interpolated.
+    let mut counts: HashMap<u64, Vec<(u32, u32, SubCells)>> = HashMap::new();
+    for &(key, _, _) in &cells[si][chunk as usize] {
+        for dz in -2..=2 {
+            for dy in -2..=2 {
+                for dx in -2..=2 {
+                    counts.entry(Grid::offset(key, [dx, dy, dz])).or_default();
+                }
+            }
         }
     }
     let (lo, hi) = merged.boxes[si][chunk as usize];
-    let (lo, hi) = (lo - grid.size, hi + grid.size);
+    let (lo, hi) = (lo - 2. * grid.size, hi + 2. * grid.size);
     for (sj, boxes) in merged.boxes.iter().enumerate() {
         for (cj, (a, b)) in boxes.iter().enumerate() {
             if a.cmpgt(hi).any() || b.cmplt(lo).any() {
                 continue;
             }
             job.check()?;
-            for &(key, n) in &cells[sj][cj] {
+            for &(key, n, subs) in &cells[sj][cj] {
                 if let Some(entry) = counts.get_mut(&key) {
-                    match entry.iter_mut().find(|(s, _)| *s == sj as u32) {
-                        Some((_, total)) => *total += n,
-                        None => entry.push((sj as u32, n)),
+                    match entry.iter_mut().find(|(s, ..)| *s == sj as u32) {
+                        Some((_, total, all)) => {
+                            *total += n;
+                            for (a, b) in all.iter_mut().zip(subs) {
+                                *a |= b;
+                            }
+                        }
+                        None => entry.push((sj as u32, n, subs)),
                     }
                 }
             }
         }
     }
+    // Each scan's points around a cell: the cell and its 26 neighbours.
+    let mut smoothed: HashMap<u64, Vec<(u32, f64)>> = HashMap::new();
+    let mut density = |key: u64| -> Vec<(u32, f64)> {
+        smoothed
+            .entry(key)
+            .or_insert_with(|| {
+                let mut total: Vec<(u32, f64)> = vec![];
+                for d in NEIGHBOURS {
+                    for &(scan, n, _) in &counts[&Grid::offset(key, d)] {
+                        match total.iter_mut().find(|(s, _)| *s == scan) {
+                            Some((_, sum)) => *sum += n as f64,
+                            None => total.push((scan, n as f64)),
+                        }
+                    }
+                }
+                total
+            })
+            .clone()
+    };
     let own = merged.caches[si].get(chunk, job)?;
     let world = merged.worlds[si];
-    // The scan each cell of the chunk keeps, decided once per cell.
-    let mut keep: HashMap<u64, u32> = HashMap::new();
+    // The scan each sub-cell keeps, decided once per sub-cell.
+    let mut keep: HashMap<(u64, u32), u32> = HashMap::new();
     let count_bits = merged.scans[si].chunks[chunk as usize].count as usize;
     let mut mask = vec![0u8; count_bits.div_ceil(8)];
     let mut moved = 0;
@@ -683,29 +742,48 @@ fn overlap_chunk(
         if i % 8192 == 0 {
             job.check()?;
         }
-        let key = grid.key(world.transform_point3(*p));
-        let winner = *keep.entry(key).or_insert_with(|| {
-            let mut density: Vec<(u32, u32)> = vec![];
-            for d in NEIGHBOURS {
-                for &(scan, n) in &counts[&Grid::neighbour(key, d)] {
-                    match density.iter_mut().find(|(s, _)| *s == scan) {
-                        Some((_, total)) => *total += n,
-                        None => density.push((scan, n)),
+        let (key, sub) = grid.locate(world.transform_point3(*p));
+        let winner = *keep.entry((key, sub)).or_insert_with(|| {
+            // Densities at the sub-cell's centre, interpolated between the
+            // centres of the eight cells around it.
+            let at = Grid::sub_centre(key, sub) - 0.5;
+            let base = at.floor();
+            let t = at - base;
+            let base = base.as_i64vec3();
+            let mut here: Vec<(u32, f64)> = vec![];
+            for corner in 0..8 {
+                let d = [corner & 1, (corner >> 1) & 1, (corner >> 2) & 1];
+                let w = (0..3)
+                    .map(|k| if d[k] == 1 { t[k] } else { 1. - t[k] })
+                    .product::<f64>();
+                let c = Grid::pack([
+                    base.x + d[0] as i64,
+                    base.y + d[1] as i64,
+                    base.z + d[2] as i64,
+                ]);
+                for (scan, n) in density(c) {
+                    match here.iter_mut().find(|(s, _)| *s == scan) {
+                        Some((_, sum)) => *sum += w * n,
+                        None => here.push((scan, w * n)),
                     }
                 }
             }
-            let centre = grid.centre(key);
+            let centre = grid.origin + Grid::sub_centre(key, sub) * grid.size;
             let distance = |scan: u32| {
                 scanners[scan as usize].map_or(f64::INFINITY, |s| s.distance_squared(centre))
             };
-            // Only a scan with points in the cell can keep it, or the cell
-            // would lose all its points.
-            let here = &counts[&key];
-            density
-                .into_iter()
-                .filter(|(scan, _)| here.iter().any(|(s, _)| s == scan))
+            // Only a scan with points in the sub-cell can keep it, so a scan
+            // covering part of a cell leaves the rest to the others.
+            let present = &counts[&key];
+            let holds = |scan: u32| {
+                present
+                    .iter()
+                    .any(|(s, _, subs)| *s == scan && has(subs, sub))
+            };
+            here.into_iter()
+                .filter(|&(scan, _)| holds(scan))
                 .min_by(|a, b| {
-                    b.1.cmp(&a.1)
+                    b.1.total_cmp(&a.1)
                         .then(distance(a.0).total_cmp(&distance(b.0)))
                         .then(a.0.cmp(&b.0))
                 })
@@ -879,14 +957,18 @@ impl Project {
         )
     }
     /// Where scans overlap, keeps each place's points from one scan only, so
-    /// colour and noise do not alternate point by point between scans. On a
-    /// grid of `size` metres in the project frame, each cell keeps the scan
-    /// that samples it most densely, counted over the cell and its 26
-    /// neighbours so the choice does not flicker from cell to cell (only a
-    /// scan with points in the cell itself can keep it); a nearer
-    /// or more face-on scanner samples more densely, so no scanner position is
-    /// needed. Ties go to the nearer known scanner, then to scan order. The
-    /// other scans' points in the cell move to `target`.
+    /// colour and noise do not alternate point by point between scans. Each
+    /// scan's density is its number of points in a cell of `size` metres
+    /// (on a grid in the project frame) and its 26 neighbours; a nearer or
+    /// more face-on scanner samples more densely, so no scanner position is
+    /// needed. Each cell splits into 8×8×8 sub-cells, and each sub-cell keeps
+    /// the points of the scan densest at its centre, interpolated between the
+    /// cell centres around it, so the boundary between scans follows where
+    /// their densities meet instead of the grid. Only scans with points in a
+    /// sub-cell take part, so a scan that covers part of a cell, or leaves
+    /// gaps between its scan lines, leaves the rest to the others. Ties go to
+    /// the nearer known scanner, then to scan order. The other scans' points
+    /// move to `target`.
     pub fn reduce_overlap(
         &mut self,
         size: f64,
@@ -922,7 +1004,7 @@ impl Project {
                 |_, chunk_cells| {
                     entries += chunk_cells.len();
                     ensure!(
-                        entries * std::mem::size_of::<(u64, u32)>() <= budget,
+                        entries * std::mem::size_of::<CellPoints>() <= budget,
                         crate::CoreError::FilterMemoryBudgetTooSmall
                     );
                     scan_cells.push(chunk_cells);
