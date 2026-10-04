@@ -8,7 +8,7 @@ use super::ColorMode;
 use super::{Workbench, jobs::Notice, jobs::is_cancelled};
 use crate::render::DrawNode;
 use eframe::egui;
-use geemil_core::{Camera, JobControl, LoadedNode, Project, Sample, ViewCache};
+use geemil_core::{Camera, JobControl, LoadedNode, Pose, Project, Sample, ViewCache};
 use glam::{DMat4, DVec3};
 use std::{
     collections::HashMap,
@@ -61,6 +61,8 @@ struct ViewRequest {
     camera: Camera,
     budget: usize,
     visible: Vec<Uuid>,
+    /// The transform being previewed, which places scans as they are drawn.
+    preview: Option<(Uuid, Pose)>,
     epoch: u64,
 }
 struct ViewResult {
@@ -192,10 +194,11 @@ fn load(
         }),
     };
     let project = &request.project;
-    let picks = match project.select_view_cached(
+    let picks = match project.select_view_previewed(
         &request.camera,
         request.budget,
         &request.visible,
+        request.preview,
         &job,
         cache,
     ) {
@@ -245,6 +248,12 @@ impl Workbench {
             self.last_motion = Instant::now();
             self.dirty = true;
         }
+        // Detail follows the scans where a preview draws them.
+        let preview = self.transform_preview();
+        if preview != self.last_preview {
+            self.last_preview = preview;
+            self.dirty = true;
+        }
         if !self.dirty || self.last_request.elapsed() < Duration::from_millis(33) {
             return;
         }
@@ -257,6 +266,7 @@ impl Workbench {
                     camera: self.camera,
                     budget: self.settings.point_budget,
                     visible: self.visible.iter().copied().collect(),
+                    preview,
                     epoch: self.view.epoch.load(Ordering::Relaxed),
                 })
                 .is_ok()

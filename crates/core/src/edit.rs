@@ -587,10 +587,29 @@ impl Project {
         job: &JobControl,
         cache: &mut ViewCache,
     ) -> Result<Vec<ViewPick>> {
+        self.select_view_previewed(camera, budget, scan_ids, None, job, cache)
+    }
+    /// [`Project::select_view_cached`] with `preview` (an item and its own
+    /// transform, not yet applied) placing the scans as they are drawn.
+    pub fn select_view_previewed(
+        &self,
+        camera: &Camera,
+        budget: usize,
+        scan_ids: &[Uuid],
+        preview: Option<(Uuid, Pose)>,
+        job: &JobControl,
+        cache: &mut ViewCache,
+    ) -> Result<Vec<ViewPick>> {
         cache.prepare(self);
         let wanted: HashSet<Uuid> = scan_ids.iter().copied().collect();
         let scans: Vec<_> = self.scans().filter(|s| wanted.contains(&s.id)).collect();
-        let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
+        let worlds: Vec<_> = scans
+            .iter()
+            .map(|s| match preview {
+                Some((item, pose)) => self.world_matrix_with(s, item, pose),
+                None => self.world_matrix(s),
+            })
+            .collect();
         let estimates = cache.estimates(self, &scans);
         let cost = |si: usize, ni: u32| estimates[si].own[ni as usize].ceil() as usize;
         let shown = |si: usize, ni: u32| {

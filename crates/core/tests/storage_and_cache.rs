@@ -433,3 +433,37 @@ fn display_octree_holds_every_valid_point_once() {
         assert!((scan.nodes[0].count as u64) < scan.valid_points / 4);
     }
 }
+
+#[test]
+fn previewed_transform_chooses_detail_where_the_scan_is_drawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = fixture(dir.path());
+    let ids: Vec<_> = p.scans().map(|s| s.id).collect();
+    let pose = Pose {
+        translation: [500., 0., 0.],
+        ..Pose::default()
+    };
+    let moved = p.scans().next().unwrap().id;
+    let mut camera = Camera {
+        target: p.bounds().center().to_array(),
+        distance: 5.,
+        ..Camera::default()
+    };
+    camera.target[0] += 500.;
+    let job = JobControl::default();
+    let budget = 4000;
+    let mut cache = ViewCache::new(0);
+    let previewed = p
+        .select_view_previewed(&camera, budget, &ids, Some((moved, pose)), &job, &mut cache)
+        .unwrap();
+    let unpreviewed = p
+        .select_view_cached(&camera, budget, &ids, &job, &mut cache)
+        .unwrap();
+    p.set_transform(moved, pose).unwrap();
+    let applied = p.select_view(&camera, budget, &ids, &job).unwrap();
+    let key = |picks: &[geemil_core::ViewPick]| -> Vec<_> {
+        picks.iter().map(|p| (p.scan, p.node, p.quota)).collect()
+    };
+    assert_eq!(key(&previewed), key(&applied));
+    assert_ne!(key(&previewed), key(&unpreviewed));
+}
