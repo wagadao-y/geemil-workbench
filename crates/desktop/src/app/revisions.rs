@@ -278,7 +278,11 @@ impl Workbench {
                                 egui::vec2(text_rect.width().min(320.), ROW - 4.),
                             );
                             let edit = ui.put(edit_rect, egui::TextEdit::singleline(name));
-                            edit.request_focus();
+                            // Requesting focus interrupts IME composition, so only take it
+                            // when it is elsewhere; otherwise Japanese input never lands.
+                            if !edit.has_focus() {
+                                edit.request_focus();
+                            }
                             if edit.lost_focus() {
                                 rename = Some((row.id, name.clone()));
                             }

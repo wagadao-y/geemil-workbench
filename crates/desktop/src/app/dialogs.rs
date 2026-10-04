@@ -220,7 +220,11 @@ impl Workbench {
                     ui.horizontal(|ui| {
                         ui.label(t.name);
                         let edit = ui.add(egui::TextEdit::singleline(name).desired_width(320.));
-                        edit.request_focus();
+                        // Requesting focus interrupts IME composition, so only take it
+                        // when it is elsewhere; otherwise Japanese input never lands.
+                        if !edit.has_focus() {
+                            edit.request_focus();
+                        }
                         if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                             outcome = Outcome::Save(name.clone());
                         }
@@ -258,7 +262,11 @@ impl Workbench {
                 Dialog::RenameGroup { id, name } => {
                     ui.heading(format!("{} {}", icon::PENCIL_SIMPLE, t.rename));
                     let edit = ui.add(egui::TextEdit::singleline(name).desired_width(320.));
-                    edit.request_focus();
+                    // Requesting focus interrupts IME composition, so only take it
+                    // when it is elsewhere; otherwise Japanese input never lands.
+                    if !edit.has_focus() {
+                        edit.request_focus();
+                    }
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.apply).clicked() || enter {
@@ -275,7 +283,11 @@ impl Workbench {
                     };
                     ui.heading(heading);
                     let edit = ui.add(egui::TextEdit::singleline(name).desired_width(320.));
-                    edit.request_focus();
+                    // Requesting focus interrupts IME composition, so only take it
+                    // when it is elsewhere; otherwise Japanese input never lands.
+                    if !edit.has_focus() {
+                        edit.request_focus();
+                    }
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     let valid = !name.trim().is_empty();
                     let label = if code.is_some() { t.apply } else { t.create };
