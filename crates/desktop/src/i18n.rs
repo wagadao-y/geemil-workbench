@@ -412,10 +412,10 @@ pub static JA: Strings = Strings {
     align_need_three: "動かす側と基準の両方がそろった対応点が3組以上必要です。",
     align_clear_pairs: "すべて消去",
     align_icp: "2. ICPで微調整",
-    align_icp_hint: "重なる部分の形状で合わせます。最大対応距離は残っているずれより大きくします。",
+    align_icp_hint: "重なる部分の形状で合わせます。最大対応距離は残っているずれより大きくし、上から順に細かくしていきます。",
     align_icp_distance: "最大対応距離（m）",
     align_icp_samples: "サンプル点数",
-    align_run_icp: "ICPで微調整",
+    align_run_icp: "実行",
     align_pairs_result: |rms| format!("対応点の残差（RMS）: {rms:.3} m"),
     align_icp_result: |rms, overlap, iterations| {
         format!("ICP: RMS {rms:.4} m・重なり {overlap:.0}%・反復 {iterations} 回")

@@ -299,7 +299,8 @@ impl Workbench {
             Err(e) => self.error = Some(super::jobs::Notice::new(self.t, &e)),
         }
     }
-    fn run_icp(&mut self, ctx: &egui::Context) {
+    /// Runs ICP with correspondences up to `max_distance` metres.
+    fn run_icp(&mut self, ctx: &egui::Context, max_distance: f64) {
         let (Some(p), Some(item)) = (self.project.clone(), self.align.item) else {
             return;
         };
@@ -312,7 +313,7 @@ impl Workbench {
         });
         let (_, reference) = self.align_scans(&p);
         let options = IcpOptions {
-            max_distance: self.settings.icp_distance,
+            max_distance,
             samples: self.settings.icp_samples,
             ..Default::default()
         };
@@ -469,17 +470,34 @@ impl Workbench {
 
                 ui.strong(t.align_icp);
                 ui.small(t.align_icp_hint);
+                let mut run = None;
                 egui::Grid::new("icp options")
-                    .num_columns(2)
+                    .num_columns(3)
                     .show(ui, |ui| {
-                        ui.label(t.align_icp_distance);
-                        ui.add(
-                            egui::DragValue::new(&mut self.settings.icp_distance)
-                                .range(0.005..=20.)
-                                .speed(0.005)
-                                .max_decimals(3),
-                        );
-                        ui.end_row();
+                        // Coarse to fine, each run starting where the last left off.
+                        for (step, distance) in self.settings.icp_distances.iter_mut().enumerate() {
+                            ui.label(if step == 0 { t.align_icp_distance } else { "" });
+                            ui.add(
+                                egui::DragValue::new(distance)
+                                    .range(0.001..=20.)
+                                    .speed(0.005)
+                                    .max_decimals(3),
+                            );
+                            if ui
+                                .add_enabled(
+                                    idle && !reference.is_empty(),
+                                    egui::Button::new(format!(
+                                        "{} {}",
+                                        icon::MAGNET,
+                                        t.align_run_icp
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                run = Some(*distance);
+                            }
+                            ui.end_row();
+                        }
                         ui.label(t.align_icp_samples);
                         ui.add(
                             egui::DragValue::new(&mut self.settings.icp_samples)
@@ -488,14 +506,8 @@ impl Workbench {
                         );
                         ui.end_row();
                     });
-                if ui
-                    .add_enabled(
-                        idle && !reference.is_empty(),
-                        egui::Button::new(format!("{} {}", icon::MAGNET, t.align_run_icp)),
-                    )
-                    .clicked()
-                {
-                    self.run_icp(&ctx);
+                if let Some(distance) = run {
+                    self.run_icp(&ctx, distance);
                 }
                 ui.separator();
 
@@ -589,7 +601,7 @@ impl Workbench {
         self.selection.tool = Tool::Align;
         self.select_tree_item(first);
         self.align_update();
-        self.run_icp(ctx);
+        self.run_icp(ctx, self.settings.icp_distances[0]);
     }
     /// For smoke tests: four pairs between displayed points of the first scan
     /// and the same places expressed in another scan, then a fit. The points

@@ -69,7 +69,9 @@ pub(super) struct Settings {
     overlap_size: f64,
     noise_radius: f64,
     noise_neighbours: u32,
-    icp_distance: f64,
+    /// Maximum correspondence distances, coarse to fine, each with its own
+    /// run button: ICP from a rough manual placement, then closer.
+    icp_distances: [f64; 4],
     icp_samples: usize,
     outlier_neighbours: u32,
     outlier_deviations: f64,
@@ -92,7 +94,7 @@ impl Default for Settings {
             overlap_size: 0.1,
             noise_radius: 0.05,
             noise_neighbours: 4,
-            icp_distance: 0.5,
+            icp_distances: [0.5, 0.1, 0.03, 0.01],
             icp_samples: 60_000,
             // CloudCompare's defaults.
             outlier_neighbours: 6,
