@@ -192,7 +192,13 @@ fn load(
         }),
     };
     let project = &request.project;
-    let picks = match project.select_view(&request.camera, request.budget, &request.visible, &job) {
+    let picks = match project.select_view_cached(
+        &request.camera,
+        request.budget,
+        &request.visible,
+        &job,
+        cache,
+    ) {
         Ok(picks) => picks,
         Err(e) => return Outcome::Failed(e),
     };
@@ -332,10 +338,11 @@ impl Workbench {
     /// scan's world matrix and tint, and its preview marks.
     pub(super) fn draw_nodes(&self) -> Vec<DrawNode<'_>> {
         let worlds = self.scan_worlds(true);
-        let scans: Vec<_> = self
+        // Import order picks each scan's colour.
+        let scans: HashMap<Uuid, usize> = self
             .project
             .as_ref()
-            .map(|p| p.scans().map(|s| s.id).collect())
+            .map(|p| p.scans().enumerate().map(|(i, s)| (s.id, i)).collect())
             .unwrap_or_default();
         let marks = self.selection.marks();
         let mut offset = 0;
@@ -348,7 +355,7 @@ impl Workbench {
             };
             let mut tint = self.align_tint(node.scan);
             if tint[3] == 0. && self.settings.color_mode == ColorMode::Scan {
-                let i = scans.iter().position(|id| *id == node.scan).unwrap_or(0);
+                let i = scans.get(&node.scan).copied().unwrap_or(0);
                 let [r, g, b] = SCAN_COLORS[i % SCAN_COLORS.len()];
                 tint = [r as f32 / 255., g as f32 / 255., b as f32 / 255., 1.];
             }

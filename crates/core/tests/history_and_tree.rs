@@ -145,6 +145,10 @@ fn multi_scan_import_creates_a_folder_and_folder_transforms_compose() {
     assert!(p.move_to_group(&[outer], Some(folder)).is_err());
     assert!(p.move_to_group(&[outer], Some(outer)).is_err());
     assert_eq!(p.parent_of(folder), Some(outer));
+    // A folder holds the scans of the folders inside it; a scan holds itself.
+    assert_eq!(p.scans_within(outer), vec![scans[0]]);
+    assert_eq!(p.scans_within(folder), vec![scans[0]]);
+    assert_eq!(p.scans_within(scans[1]), vec![scans[1]]);
 
     // Dissolving a folder keeps its contents in place too.
     p.ungroup(outer).unwrap();

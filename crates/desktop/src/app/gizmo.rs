@@ -7,6 +7,7 @@ use super::{Workbench, selection::Tool};
 use eframe::egui;
 use geemil_core::{Bounds, Camera, Pose, Project};
 use glam::{DMat4, DVec3};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const BOX: egui::Color32 = egui::Color32::from_rgb(235, 235, 235);
@@ -76,7 +77,7 @@ pub(super) fn item_box(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<(D
     }
     let frame = p.correction(item);
     let to_frame = frame.inverse();
-    let inside = p.scans_within(item);
+    let inside: HashSet<Uuid> = p.scans_within(item).into_iter().collect();
     let mut bounds: Option<Bounds> = None;
     for scan in p.scans().filter(|s| inside.contains(&s.id)) {
         let Some(root) = scan.nodes.first() else {

@@ -5,7 +5,10 @@ use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::{Group, Pose, Project};
 use glam::DQuat;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 enum TreeAction {
@@ -100,6 +103,49 @@ impl TreeSelection {
     pub(super) fn retain(&mut self, items: &[Uuid]) {
         self.items.retain(|id| items.contains(id));
         self.anchor = self.anchor.filter(|id| items.contains(id));
+    }
+}
+
+/// Each folder's scans at any depth and their points, derived once per project
+/// state rather than for every folder row in every frame.
+#[derive(Default)]
+pub(super) struct FolderSummary {
+    state: Option<Uuid>,
+    folders: HashMap<Uuid, (Vec<Uuid>, u64)>,
+}
+impl FolderSummary {
+    fn update(&mut self, p: &Project) {
+        let state = p.current();
+        if self.state == Some(state.id) {
+            return;
+        }
+        let parents: HashMap<Uuid, Option<Uuid>> =
+            state.groups.iter().map(|g| (g.id, g.parent)).collect();
+        let mut folders: HashMap<Uuid, (Vec<Uuid>, u64)> = state
+            .groups
+            .iter()
+            .map(|g| (g.id, Default::default()))
+            .collect();
+        for scan in p.scans() {
+            let mut folder = state.scan_groups.get(&scan.id).copied();
+            // Validated states are acyclic; the bound only guards corrupt input.
+            for _ in 0..=parents.len() {
+                let Some(id) = folder else { break };
+                if let Some((scans, points)) = folders.get_mut(&id) {
+                    scans.push(scan.id);
+                    *points += scan.records;
+                }
+                folder = parents.get(&id).copied().flatten();
+            }
+        }
+        self.folders = folders;
+        self.state = Some(state.id);
+    }
+    /// The scans in a folder and below it, in import order, and their points.
+    fn get(&self, folder: Uuid) -> (&[Uuid], u64) {
+        self.folders
+            .get(&folder)
+            .map_or((&[][..], 0), |(scans, points)| (scans.as_slice(), *points))
     }
 }
 
@@ -229,6 +275,7 @@ impl Workbench {
                     ui.label(t.no_project_hint);
                     return;
                 };
+                self.folder_summary.update(&p);
                 let mut actions = vec![];
                 let mut layer_actions = vec![];
                 ui.horizontal(|ui| {
@@ -315,7 +362,7 @@ impl Workbench {
                     true,
                 )
                 .show_header(ui, |ui| {
-                    let inside = p.scans_within(group.id);
+                    let (inside, points) = self.folder_summary.get(group.id);
                     let shown = inside.iter().filter(|s| self.visible.contains(s)).count();
                     let mut all = !inside.is_empty() && shown == inside.len();
                     let checkbox = egui::Checkbox::new(&mut all, "")
@@ -323,11 +370,6 @@ impl Workbench {
                     if ui.add(checkbox).changed() {
                         actions.push(TreeAction::SetVisible(self.context_scans(p, group.id), all));
                     }
-                    let points: u64 = p
-                        .scans()
-                        .filter(|s| inside.contains(&s.id))
-                        .map(|s| s.records)
-                        .sum();
                     let label = format!("{} {}", icon::FOLDER, group.name);
                     let row = self.tree_row(ui, p, group.id, label, actions);
                     row.on_hover_text((t.folder_summary)(inside.len(), &t.count(points)))
@@ -661,12 +703,9 @@ impl Workbench {
                 });
             }
         } else if let Some(group) = p.groups().iter().find(|g| g.id == id) {
-            let inside = p.scans_within(id);
-            let points: u64 = p
-                .scans()
-                .filter(|s| inside.contains(&s.id))
-                .map(|s| s.records)
-                .sum();
+            self.folder_summary.update(p);
+            let (inside, points) = self.folder_summary.get(id);
+            let scans = inside.len() as u64;
             egui::Grid::new("folder properties")
                 .num_columns(2)
                 .show(ui, |ui| {
@@ -683,7 +722,7 @@ impl Workbench {
                     });
                     ui.end_row();
                     ui.label(t.prop_scans);
-                    ui.label(t.count(inside.len() as u64));
+                    ui.label(t.count(scans));
                     ui.end_row();
                     ui.label(t.prop_points);
                     ui.label(t.count(points));

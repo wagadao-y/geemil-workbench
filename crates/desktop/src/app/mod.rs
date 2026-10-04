@@ -109,6 +109,7 @@ pub struct Workbench {
     /// The scan or folder selected in the tree.
     selected: Option<Uuid>,
     tree_selection: tree::TreeSelection,
+    folder_summary: tree::FolderSummary,
     layer_counts: layers::LayerCounts,
     settings: Settings,
 
@@ -176,6 +177,7 @@ impl Workbench {
             visible: BTreeSet::new(),
             selected: None,
             tree_selection: tree::TreeSelection::default(),
+            folder_summary: Default::default(),
             layer_counts: None,
             settings,
             job: None,

@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow, ensure};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
 };
@@ -18,6 +18,16 @@ use uuid::Uuid;
 /// Whether bit `i` of a point mask is set.
 pub(crate) fn is_set(mask: &[u8], i: usize) -> bool {
     mask[i / 8] & (1 << (i % 8)) != 0
+}
+
+/// Points per layer of a chunk of `total` points whose labels `block` holds;
+/// none means every point is in the default layer.
+fn layer_points(total: u32, block: Option<&LabelBlock>) -> Vec<(u8, u64)> {
+    let others = block.map_or(&[][..], |b| &b.counts);
+    let moved: u64 = others.iter().map(|(_, n)| n).sum();
+    let mut counts = vec![(DEFAULT_LAYER, (total as u64).saturating_sub(moved))];
+    counts.extend_from_slice(others);
+    counts
 }
 
 /// The lowest code no layer of `state` uses.
@@ -71,14 +81,56 @@ impl Project {
     }
     /// Points of a chunk per layer, without reading its labels.
     fn chunk_counts(&self, scan: &Scan, chunk: u32) -> Vec<(u8, u64)> {
-        let total = scan.chunks[chunk as usize].count as u64;
-        let others = self
-            .label_block(scan.id, chunk)
-            .map_or(&[][..], |(_, b)| &b.counts);
-        let moved: u64 = others.iter().map(|(_, n)| n).sum();
-        let mut counts = vec![(DEFAULT_LAYER, total.saturating_sub(moved))];
-        counts.extend_from_slice(others);
-        counts
+        let block = self.label_block(scan.id, chunk).map(|(_, b)| b);
+        layer_points(scan.chunks[chunk as usize].count, block)
+    }
+    /// The block holding each chunk's labels in the current state for every
+    /// chunk of `scans`, parallel to them: [`Project::label_block`] for all
+    /// chunks at once, visiting each block of the state's patches once
+    /// instead of searching every patch for every chunk.
+    fn chunk_blocks<'a>(&'a self, scans: &[&Scan]) -> Vec<Vec<Option<&'a LabelBlock>>> {
+        let mut blocks: Vec<_> = scans.iter().map(|s| vec![None; s.chunks.len()]).collect();
+        let position: HashMap<Uuid, usize> =
+            scans.iter().enumerate().map(|(i, s)| (s.id, i)).collect();
+        let patches: HashMap<Uuid, &LabelPatch> =
+            self.manifest.patches.iter().map(|p| (p.id, p)).collect();
+        // The last patch listing a chunk holds its labels.
+        for patch in self.current().labels.iter().rev() {
+            let Some(patch) = patches.get(patch) else {
+                continue;
+            };
+            for block in &patch.blocks {
+                let slot = position
+                    .get(&block.scan)
+                    .and_then(|&i| blocks[i].get_mut(block.chunk as usize));
+                if let Some(slot @ None) = slot {
+                    *slot = Some(block);
+                }
+            }
+        }
+        blocks
+    }
+    /// The number of points in hidden layers of each chunk of `scans`,
+    /// parallel to them.
+    pub(crate) fn hidden_counts(&self, scans: &[&Scan]) -> Vec<Vec<u64>> {
+        let hidden = self.hidden_codes();
+        self.chunk_blocks(scans)
+            .into_iter()
+            .zip(scans)
+            .map(|(blocks, scan)| {
+                blocks
+                    .into_iter()
+                    .zip(&scan.chunks)
+                    .map(|(block, chunk)| {
+                        layer_points(chunk.count, block)
+                            .iter()
+                            .filter(|(code, _)| hidden[*code as usize])
+                            .map(|(_, n)| n)
+                            .sum()
+                    })
+                    .collect()
+            })
+            .collect()
     }
     /// Whether each code is hidden; codes of no layer count as hidden.
     fn hidden_codes(&self) -> [bool; 256] {
@@ -120,9 +172,10 @@ impl Project {
     pub fn layer_counts(&self) -> BTreeMap<u8, u64> {
         let mut result: BTreeMap<_, _> =
             self.current().layers.iter().map(|l| (l.code, 0)).collect();
-        for scan in self.scans() {
-            for chunk in 0..scan.chunks.len() as u32 {
-                for (code, n) in self.chunk_counts(scan, chunk) {
+        let scans: Vec<_> = self.scans().collect();
+        for (blocks, scan) in self.chunk_blocks(&scans).into_iter().zip(&scans) {
+            for (block, chunk) in blocks.into_iter().zip(&scan.chunks) {
+                for (code, n) in layer_points(chunk.count, block) {
                     *result.entry(code).or_default() += n;
                 }
             }

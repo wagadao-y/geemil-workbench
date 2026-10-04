@@ -1,11 +1,15 @@
 use crate::layers::{LabelWriter, is_set};
 use crate::parallel::OrderedPool;
 use crate::storage::{position, valid};
+use crate::view_cache::NodeEstimates;
 use crate::{Bounds, JobControl, LayerTarget, Pose, Project, Sample, Scan, Stage, ViewCache};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3, DVec4};
 use serde::{Deserialize, Serialize};
-use std::{collections::BinaryHeap, sync::Arc};
+use std::{
+    collections::{BinaryHeap, HashSet},
+    sync::Arc,
+};
 use uuid::Uuid;
 
 /// A display octree node chosen for a view, in priority order.
@@ -508,16 +512,13 @@ impl Project {
     }
 
     /// The expected number of each node's own points in visible layers, and
-    /// of the points in it and below, from the per-chunk layer counts.
-    fn visible_estimates(&self, scan: &Scan) -> (Vec<f64>, Vec<f64>) {
-        let visible: Vec<f64> = scan
-            .chunks
+    /// of the points in it and below, from the points of each chunk in hidden
+    /// layers ([`Project::hidden_counts`]).
+    pub(crate) fn visible_estimates(scan: &Scan, hidden: &[u64]) -> NodeEstimates {
+        let visible: Vec<f64> = hidden
             .iter()
-            .enumerate()
-            .map(|(i, c)| {
-                let hidden = self.hidden_count(scan, i as u32) as f64;
-                (1. - hidden / c.count.max(1) as f64).max(0.)
-            })
+            .zip(&scan.chunks)
+            .map(|(&hidden, c)| (1. - hidden as f64 / c.count.max(1) as f64).max(0.))
             .collect();
         let own: Vec<f64> = scan
             .nodes
@@ -536,7 +537,7 @@ impl Project {
                 below[i] += below[c as usize];
             }
         }
-        (own, below)
+        NodeEstimates { own, below }
     }
     /// The points to show for `camera` in the project frame.
     pub fn load_view(
@@ -547,12 +548,13 @@ impl Project {
         job: &JobControl,
     ) -> Result<Vec<Sample>> {
         let view = self.load_view_cached(camera, budget, scan_ids, job, &mut ViewCache::new(0))?;
+        let index = self.scan_index();
         let mut result = vec![];
         for node in view.nodes {
-            let Some(scan) = self.scans().find(|s| s.id == node.scan) else {
+            let Some(&i) = index.get(&node.scan) else {
                 continue;
             };
-            let world = self.world_matrix(scan);
+            let world = self.world_matrix(&self.manifest.scans[i]);
             result.extend(node.samples.iter().map(|s| Sample {
                 position: world.transform_point3(DVec3::from(s.position)).to_array(),
                 ..*s
@@ -571,12 +573,27 @@ impl Project {
         scan_ids: &[Uuid],
         job: &JobControl,
     ) -> Result<Vec<ViewPick>> {
-        let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
+        self.select_view_cached(camera, budget, scan_ids, job, &mut ViewCache::new(0))
+    }
+    /// [`Project::select_view`] reusing the per-node point estimates `cache`
+    /// keeps for the project state, so a moving camera does not recount
+    /// every chunk's layers.
+    pub fn select_view_cached(
+        &self,
+        camera: &Camera,
+        budget: usize,
+        scan_ids: &[Uuid],
+        job: &JobControl,
+        cache: &mut ViewCache,
+    ) -> Result<Vec<ViewPick>> {
+        cache.prepare(self);
+        let wanted: HashSet<Uuid> = scan_ids.iter().copied().collect();
+        let scans: Vec<_> = self.scans().filter(|s| wanted.contains(&s.id)).collect();
         let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
-        let estimates: Vec<_> = scans.iter().map(|s| self.visible_estimates(s)).collect();
-        let cost = |si: usize, ni: u32| estimates[si].0[ni as usize].ceil() as usize;
+        let estimates = cache.estimates(self, &scans);
+        let cost = |si: usize, ni: u32| estimates[si].own[ni as usize].ceil() as usize;
         let shown = |si: usize, ni: u32| {
-            estimates[si].1[ni as usize] > 0. && camera.sees(scans[si], ni, worlds[si])
+            estimates[si].below[ni as usize] > 0. && camera.sees(scans[si], ni, worlds[si])
         };
         let eye = camera.eye();
         let size = |si: usize, ni: u32| {
@@ -640,8 +657,7 @@ impl Project {
     ) -> Result<LoadedNode> {
         cache.prepare(self);
         let scan = self
-            .scans()
-            .find(|s| s.id == pick.scan)
+            .scan(pick.scan)
             .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
         let samples = cache.samples(self, scan, pick.node, job)?;
         Ok(Self::loaded_node(pick, samples))
@@ -680,24 +696,36 @@ impl Project {
         } else {
             workers
         };
+        cache.prepare(self);
+        // Picks name hundreds of nodes over possibly hundreds of scans.
+        let index = Arc::new(self.scan_index());
+        let scan = |id: Uuid| {
+            index
+                .get(&id)
+                .map(|&i| &self.manifest.scans[i])
+                .ok_or_else(|| anyhow::anyhow!("Missing scan"))
+        };
+        let serial = |pick: &ViewPick, cache: &mut ViewCache| -> Result<LoadedNode> {
+            job.report(Stage::ViewPoints, 0, 0);
+            job.check()?;
+            let samples = cache.samples(self, scan(pick.scan)?, pick.node, job)?;
+            Ok(Self::loaded_node(pick, samples))
+        };
         // Cached nodes require no worker or file access.
         let (cached, missing): (Vec<_>, Vec<_>) = picks
             .iter()
             .partition(|p| cache.contains(self, p.scan, p.node));
         for pick in cached {
-            job.report(Stage::ViewPoints, 0, 0);
-            job.check()?;
-            loaded(self.view_node(pick, job, cache)?)?;
+            loaded(serial(pick, cache)?)?;
         }
         if workers == 1 || missing.is_empty() {
             for pick in missing {
-                job.report(Stage::ViewPoints, 0, 0);
-                job.check()?;
-                loaded(self.view_node(pick, job, cache)?)?;
+                loaded(serial(pick, cache)?)?;
             }
             return Ok(());
         }
         let project = self.clone();
+        let worker_index = index.clone();
         let worker_job = job.clone();
         let mut pool = OrderedPool::new(
             workers.min(missing.len()),
@@ -706,9 +734,9 @@ impl Project {
             move |pick: ViewPick| {
                 worker_job.report(Stage::ViewPoints, 0, 0);
                 worker_job.check()?;
-                let scan = project
-                    .scans()
-                    .find(|s| s.id == pick.scan)
+                let scan = worker_index
+                    .get(&pick.scan)
+                    .map(|&i| &project.manifest.scans[i])
                     .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
                 let samples = project.read_view(scan, pick.node)?;
                 worker_job.check()?;
@@ -718,19 +746,11 @@ impl Project {
         let mut consume = |(pick, samples): (ViewPick, Vec<Sample>)| -> Result<()> {
             job.report(Stage::ViewPoints, 0, 0);
             job.check()?;
-            let scan = self
-                .scans()
-                .find(|s| s.id == pick.scan)
-                .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
-            let samples = cache.store_decoded(self, scan, pick.node, samples, job)?;
+            let samples = cache.store_decoded(self, scan(pick.scan)?, pick.node, samples, job)?;
             loaded(Self::loaded_node(&pick, samples))
         };
         for pick in missing {
-            let scan = self
-                .scans()
-                .find(|s| s.id == pick.scan)
-                .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
-            let node = scan
+            let node = scan(pick.scan)?
                 .nodes
                 .get(pick.node as usize)
                 .ok_or_else(|| anyhow::anyhow!("Invalid node"))?;
@@ -764,9 +784,9 @@ impl Project {
         cache: &mut ViewCache,
     ) -> Result<LoadedView> {
         cache.prepare(self);
-        let mut picks = self.select_view(camera, budget, scan_ids, job)?;
-        let order: Vec<_> = self.scans().map(|s| s.id).collect();
-        picks.sort_by_key(|p| order.iter().position(|id| *id == p.scan));
+        let mut picks = self.select_view_cached(camera, budget, scan_ids, job, cache)?;
+        let order = self.scan_index();
+        picks.sort_by_key(|p| order.get(&p.scan).copied());
         let mut nodes = Vec::with_capacity(picks.len());
         for pick in &picks {
             job.check()?;

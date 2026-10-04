@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use glam::{DMat4, DQuat, DVec3};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::Write,
     path::{Component, Path, PathBuf},
@@ -629,10 +629,32 @@ impl Project {
         }
         result.unwrap_or_default()
     }
+    /// The scans of the current state, in import order. Linear in the number
+    /// of scans, so projects with hundreds of scans list them cheaply.
     pub fn scans(&self) -> impl Iterator<Item = &Scan> {
+        let current: HashSet<Uuid> = self.current().scans.iter().copied().collect();
         self.manifest
             .scans
             .iter()
-            .filter(|s| self.current().scans.contains(&s.id))
+            .filter(move |s| current.contains(&s.id))
+    }
+    /// A scan of the current state.
+    pub fn scan(&self, id: Uuid) -> Option<&Scan> {
+        if !self.current().scans.contains(&id) {
+            return None;
+        }
+        self.manifest.scans.iter().find(|s| s.id == id)
+    }
+    /// Positions in `manifest.scans` of the current state's scans, for
+    /// looking many of them up by id.
+    pub(crate) fn scan_index(&self) -> HashMap<Uuid, usize> {
+        let current: HashSet<Uuid> = self.current().scans.iter().copied().collect();
+        self.manifest
+            .scans
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| current.contains(&s.id))
+            .map(|(i, s)| (s.id, i))
+            .collect()
     }
 }

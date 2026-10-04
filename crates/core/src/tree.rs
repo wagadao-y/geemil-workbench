@@ -8,6 +8,7 @@ use crate::{Group, Pose, Project, Revision, Scan};
 use anyhow::{Result, ensure};
 use glam::DMat4;
 use serde_json::json;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// The folder containing a scan or folder in `state`.
@@ -110,8 +111,27 @@ impl Project {
     /// Scans in `id` and all folders below it; a scan id yields itself.
     pub fn scans_within(&self, id: Uuid) -> Vec<Uuid> {
         let state = self.current();
+        let parents: HashMap<Uuid, Option<Uuid>> =
+            state.groups.iter().map(|g| (g.id, g.parent)).collect();
+        // `is_within` with the folders looked up by id.
+        let within = |scan: Uuid| {
+            let mut current = Some(scan);
+            for _ in 0..=state.groups.len() {
+                match current {
+                    Some(c) if c == id => return true,
+                    Some(c) => {
+                        current = match parents.get(&c) {
+                            Some(parent) => *parent,
+                            None => state.scan_groups.get(&c).copied(),
+                        }
+                    }
+                    None => return false,
+                }
+            }
+            false
+        };
         self.scans()
-            .filter(|s| is_within(state, s.id, id))
+            .filter(|s| within(s.id))
             .map(|s| s.id)
             .collect()
     }

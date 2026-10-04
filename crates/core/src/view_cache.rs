@@ -21,6 +21,12 @@ struct Entry {
     used: u64,
     bytes: usize,
 }
+/// Visible points per display octree node of a scan: in the node itself and
+/// in its subtree. They depend only on the scan and the epoch.
+pub(crate) struct NodeEstimates {
+    pub own: Vec<f64>,
+    pub below: Vec<f64>,
+}
 struct HiddenEntry {
     mask: Option<Arc<Vec<u8>>>,
     used: u64,
@@ -40,6 +46,8 @@ pub struct ViewCache {
     /// Hidden points per chunk for this epoch; none when nothing is hidden.
     /// Display nodes near the root hold points of many chunks.
     hidden: HashMap<(Uuid, u32), HiddenEntry>,
+    /// Per scan for this epoch; small, so not charged to the limit.
+    estimates: HashMap<Uuid, Arc<NodeEstimates>>,
     limit: usize,
     clock: u64,
     stats: ViewCacheStats,
@@ -50,6 +58,7 @@ impl ViewCache {
             epoch: None,
             entries: HashMap::new(),
             hidden: HashMap::new(),
+            estimates: HashMap::new(),
             limit: max_bytes,
             clock: 0,
             stats: ViewCacheStats::default(),
@@ -123,20 +132,47 @@ impl ViewCache {
     }
     pub(crate) fn prepare(&mut self, project: &Project) {
         let state = project.current();
-        let visible = state
-            .layers
-            .iter()
-            .filter(|l| l.visible)
-            .map(|l| l.code)
-            .collect();
-        let epoch = (project.root.clone(), state.labels.clone(), visible);
-        if self.epoch.as_ref() != Some(&epoch) {
+        let visible = || state.layers.iter().filter(|l| l.visible).map(|l| l.code);
+        // Called for every node; compare in place and copy only on a change.
+        let same = self.epoch.as_ref().is_some_and(|(root, labels, codes)| {
+            *root == project.root && *labels == state.labels && codes.iter().copied().eq(visible())
+        });
+        if !same {
             self.entries.clear();
             self.hidden.clear();
+            self.estimates.clear();
             self.stats.resident_bytes = 0;
             self.stats.hidden_bytes = 0;
-            self.epoch = Some(epoch);
+            self.epoch = Some((
+                project.root.clone(),
+                state.labels.clone(),
+                visible().collect(),
+            ));
         }
+    }
+    /// The [`NodeEstimates`] of `scans` for the epoch [`ViewCache::prepare`]
+    /// set, parallel to them. Missing ones are counted together, reading the
+    /// state's label patches once.
+    pub(crate) fn estimates(
+        &mut self,
+        project: &Project,
+        scans: &[&Scan],
+    ) -> Vec<Arc<NodeEstimates>> {
+        let missing: Vec<&Scan> = scans
+            .iter()
+            .filter(|s| !self.estimates.contains_key(&s.id))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            for (scan, hidden) in missing.iter().zip(project.hidden_counts(&missing)) {
+                let estimates = Project::visible_estimates(scan, &hidden);
+                self.estimates.insert(scan.id, Arc::new(estimates));
+            }
+        }
+        scans
+            .iter()
+            .map(|s| self.estimates[&s.id].clone())
+            .collect()
     }
     /// Whether a node's points for the project's current state are cached.
     pub fn contains(&mut self, project: &Project, scan: Uuid, node: u32) -> bool {

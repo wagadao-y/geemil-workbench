@@ -2,9 +2,9 @@
 //! by swapping states, and only visible layers take part in the work.
 use geemil_core::{
     Camera, DEFAULT_LAYER, ImportOptions, JobControl, LayerTarget, Project, Selection,
-    SelectionMode, interchange,
+    SelectionMode, ViewCache, interchange,
 };
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 fn imported(dir: &Path) -> Project {
     let source = dir.join("demo.e57");
@@ -178,4 +178,70 @@ fn hidden_layers_take_no_part_in_filters_or_exports() {
     assert_eq!(p.export_las(&output, &job).unwrap(), total - left);
     p.set_layer_visible(into, false).unwrap();
     assert_eq!(visible(&p), 0);
+}
+
+/// Points a view of everything shows with `cache`, kept across states as the
+/// app's view loader keeps it.
+fn shown(p: &Project, cache: &mut ViewCache) -> u64 {
+    let camera = half(p, true).camera;
+    let job = JobControl::default();
+    let p = Arc::new(p.clone());
+    let picks = p
+        .select_view_cached(&camera, u32::MAX as usize, &ids(&p), &job, cache)
+        .unwrap();
+    let mut points = 0;
+    p.load_view_nodes(&picks, cache, &job, 1, |node| {
+        points += node.samples.len() as u64;
+        Ok(())
+    })
+    .unwrap();
+    points
+}
+
+#[test]
+fn cached_view_estimates_follow_moves_undo_and_layer_visibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    let job = JobControl::default();
+    let mut cache = ViewCache::new(0);
+    cache.set_point_limit(1 << 24);
+    let total = records(&p);
+    assert_eq!(shown(&p, &mut cache), total);
+    let before = p.manifest.draft.clone();
+
+    // Two overlapping moves: the newer patch decides each chunk's labels.
+    let left = p
+        .move_selection(&half(&p, true), &ids(&p), &p.layer_named("Deleted"), &job)
+        .unwrap();
+    assert_eq!(shown(&p, &mut cache), total - left);
+    let deleted = p.current().layers.last().unwrap().code;
+    p.set_layer_visible(deleted, true).unwrap();
+    let back = p
+        .move_selection(
+            &half(&p, true),
+            &ids(&p),
+            &LayerTarget::Existing(DEFAULT_LAYER),
+            &job,
+        )
+        .unwrap();
+    assert_eq!(back, left);
+    p.set_layer_visible(deleted, false).unwrap();
+    assert_eq!(shown(&p, &mut cache), total);
+    let right = p
+        .move_selection(
+            &half(&p, false),
+            &ids(&p),
+            &LayerTarget::Existing(deleted),
+            &job,
+        )
+        .unwrap();
+    assert_eq!(shown(&p, &mut cache), total - right);
+    assert_eq!(shown(&p, &mut cache), visible(&p));
+    p.set_layer_visible(deleted, true).unwrap();
+    assert_eq!(shown(&p, &mut cache), total);
+
+    // Undo returns to an earlier state, which the cache must not mistake
+    // for the current one.
+    p.restore_working_state(before).unwrap();
+    assert_eq!(shown(&p, &mut cache), total);
 }
