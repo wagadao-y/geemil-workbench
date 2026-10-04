@@ -404,7 +404,20 @@ impl Workbench {
                             }
                         });
                 })
-                .body(|ui| self.tree_level(ui, p, Some(group.id), actions, targets, order));
+                .body(|ui| {
+                    // Indent the contents past the folder's checkbox too, not
+                    // just its toggle, so they read as one level deeper.
+                    let indent = ui.spacing().indent;
+                    let vline = ui.visuals().indent_has_left_vline;
+                    let s = ui.spacing_mut();
+                    s.indent = s.icon_width + s.item_spacing.x;
+                    ui.visuals_mut().indent_has_left_vline = false;
+                    ui.indent("contents", |ui| {
+                        ui.spacing_mut().indent = indent;
+                        ui.visuals_mut().indent_has_left_vline = vline;
+                        self.tree_level(ui, p, Some(group.id), actions, targets, order)
+                    })
+                });
             let bottom = body.as_ref().map_or(header.response.rect.bottom(), |body| {
                 body.response.rect.bottom()
             });
