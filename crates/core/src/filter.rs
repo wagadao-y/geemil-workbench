@@ -5,12 +5,14 @@
 //! judge the points of visible layers and move the points they pick to
 //! another layer instead of rewriting points.
 use crate::layers::{LabelWriter, is_set};
-use crate::storage::{position, valid};
+use crate::storage::{TempFile, create_scratch, position, valid};
 use crate::{Bounds, CropBox, JobControl, LayerTarget, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3};
 use std::{
     collections::HashMap,
+    fs::File,
+    io::{BufWriter, Read, Seek, SeekFrom, Write},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -160,16 +162,40 @@ impl<'a> ChunkCache<'a> {
             .map(|c| c.count as u64)
             .sum()
     }
-    fn neighbour_points(
+    /// The chunk's own points followed by the other chunks' points in
+    /// `[lo, hi]`, or `None` once they would exceed `limit` points.
+    fn points_near(
         &self,
-        own: u32,
+        own: &ChunkPoints,
+        chunk: u32,
         lo: DVec3,
         hi: DVec3,
+        limit: usize,
         job: &JobControl,
-    ) -> Result<Vec<DVec3>> {
-        let mut result = Vec::new();
-        self.visit_neighbours(own, lo, hi, job, |p, _, _| result.push(p))?;
-        Ok(result)
+    ) -> Result<Option<Vec<DVec3>>> {
+        if own.positions.len() > limit {
+            return Ok(None);
+        }
+        let bound = (self.neighbour_bound(lo, hi) as usize).min(limit);
+        let mut result = Vec::with_capacity(bound.max(own.positions.len()));
+        result.extend_from_slice(&own.positions);
+        for (id, info) in self.scan.chunks.iter().enumerate() {
+            let id = id as u32;
+            if id == chunk || !overlaps(&info.bounds, lo, hi) {
+                continue;
+            }
+            job.check()?;
+            let points = self.get(id, job)?;
+            for p in &points.positions {
+                if p.cmpge(lo).all() && p.cmple(hi).all() {
+                    if result.len() == limit {
+                        return Ok(None);
+                    }
+                    result.push(*p);
+                }
+            }
+        }
+        Ok(Some(result))
     }
 }
 
@@ -306,11 +332,11 @@ fn mean_neighbour_distances(
     let bounds = &cache.scan.chunks[chunk as usize].bounds;
     let lo = DVec3::from(bounds.min) - radius;
     let hi = DVec3::from(bounds.max) + radius;
-    if cache.neighbour_bound(lo, hi) > (SCRATCH_BYTES / 256) as u64 {
+    // One tree of the points in reach, while they fit the scratch space
+    // (25 bytes a point in the tree).
+    let Some(points) = cache.points_near(&own, chunk, lo, hi, SCRATCH_BYTES / 32, job)? else {
         return mean_neighbour_distances_streamed(cache, chunk, k, radius, job);
-    }
-    let mut points = own.positions.clone();
-    points.extend(cache.neighbour_points(chunk, lo, hi, job)?);
+    };
     let tree = KdTree::new(points);
     // The point itself comes first at distance 0.
     let mut best = vec![0.; k + 1];
@@ -338,8 +364,10 @@ fn mean_neighbour_distances_streamed(
 ) -> Result<(Arc<ChunkPoints>, Vec<Option<f64>>)> {
     let own = cache.get(chunk, job)?;
     let mut result = Vec::with_capacity(own.positions.len());
-    // At most 2 MiB of distance slots, independently of scan size/radius.
-    for batch in own.positions.chunks(1024) {
+    // At most half the scratch space of distance slots, so the trees of the
+    // neighbouring chunks are built once per batch, usually once per chunk.
+    let batch_points = (SCRATCH_BYTES / 2 / ((k + 1) * 8)).max(1024);
+    for batch in own.positions.chunks(batch_points) {
         job.check()?;
         let mut best = vec![f64::INFINITY; batch.len() * (k + 1)];
         let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
@@ -349,18 +377,56 @@ fn mean_neighbour_distances_streamed(
         }
         lo -= DVec3::splat(radius);
         hi += DVec3::splat(radius);
-        for (id, info) in cache.scan.chunks.iter().enumerate() {
-            if !overlaps(&info.bounds, lo, hi) {
+        // Nearer chunks first, so the distances found early rule out most of
+        // the farther chunks' trees.
+        let centre = (lo + hi) / 2.;
+        let mut ids: Vec<(f64, u32)> = cache
+            .scan
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(_, info)| overlaps(&info.bounds, lo, hi))
+            .map(|(id, info)| {
+                let gap = (DVec3::from(info.bounds.min) - centre)
+                    .max(centre - DVec3::from(info.bounds.max))
+                    .max(DVec3::ZERO);
+                (gap.length_squared(), id as u32)
+            })
+            .collect();
+        ids.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        let limit = radius * radius;
+        for (_, id) in ids {
+            job.check()?;
+            let points = cache.get(id, job)?;
+            // Only the points in reach of the batch go into the tree.
+            let near: Vec<DVec3> = points
+                .positions
+                .iter()
+                .filter(|p| p.cmpge(lo).all() && p.cmple(hi).all())
+                .copied()
+                .collect();
+            if near.is_empty() {
                 continue;
             }
-            job.check()?;
-            let points = cache.get(id as u32, job)?;
-            let tree = KdTree::new(points.positions.clone());
+            let (tree_lo, tree_hi) = near
+                .iter()
+                .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), p| {
+                    (lo.min(*p), hi.max(*p))
+                });
+            let tree = KdTree::new(near);
             for (i, p) in batch.iter().enumerate() {
-                if i % 64 == 0 {
+                if i % 1024 == 0 {
                     job.check()?;
                 }
-                tree.nearest_into(*p, radius, &mut best[i * (k + 1)..(i + 1) * (k + 1)]);
+                let best = &mut best[i * (k + 1)..(i + 1) * (k + 1)];
+                // No point of a tree farther than the k-th distance so far
+                // can change the list.
+                let gap = (tree_lo - *p).max(*p - tree_hi).max(DVec3::ZERO);
+                let gap = gap.length_squared();
+                if gap > limit || gap >= best[k] {
+                    continue;
+                }
+                tree.nearest_into(*p, radius, best);
             }
         }
         result.extend(best.chunks_exact(k + 1).map(|b| {
@@ -810,42 +876,23 @@ fn noise_chunk(
     let bounds = &cache.scan.chunks[chunk as usize].bounds;
     let lo = DVec3::from(bounds.min) - radius;
     let hi = DVec3::from(bounds.max) + radius;
-    if cache.neighbour_bound(lo, hi) > (SCRATCH_BYTES / 256) as u64 {
+    // One tree of the points in reach, while they fit the scratch space
+    // (25 bytes a point in the tree).
+    let Some(points) = cache.points_near(&own, chunk, lo, hi, SCRATCH_BYTES / 32, job)? else {
         return noise_chunk_streamed(cache, chunk, radius, min_neighbours, job);
-    }
-    let mut points = own.positions.clone();
-    points.extend(cache.neighbour_points(chunk, lo, hi, job)?);
-    let mut grid: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
-    for (i, p) in points.iter().enumerate() {
-        grid.entry(cell(*p, radius)).or_default().push(i as u32);
-    }
-    let r2 = radius * radius;
+    };
+    let tree = KdTree::new(points);
     let mut mask = vec![0u8; (cache.scan.chunks[chunk as usize].count as usize).div_ceil(8)];
     let mut count = 0;
     for (i, (p, index)) in own.positions.iter().zip(&own.indices).enumerate() {
         if i % 4096 == 0 {
             job.check()?;
         }
-        let [x, y, z] = cell(*p, radius);
-        let mut found = 0;
-        'search: for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    let Some(cell) = grid.get(&[x + dx, y + dy, z + dz]) else {
-                        continue;
-                    };
-                    for &j in cell {
-                        if j as usize != i && points[j as usize].distance_squared(*p) <= r2 {
-                            found += 1;
-                            if found >= min_neighbours {
-                                break 'search;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if found < min_neighbours {
+        // The tree holds the point itself too.
+        let found = tree
+            .count_within(*p, radius, min_neighbours as usize + 1)
+            .saturating_sub(1);
+        if found < min_neighbours as usize {
             mask[*index as usize / 8] |= 1 << (index % 8);
             count += 1;
         }
@@ -865,13 +912,50 @@ fn noise_chunk_streamed(
     let lo = DVec3::from(bounds.min) - radius;
     let hi = DVec3::from(bounds.max) + radius;
     let mut counts = vec![0u32; own.positions.len()];
-    for (id, info) in cache.scan.chunks.iter().enumerate() {
-        if !overlaps(&info.bounds, lo, hi) {
+    let r2 = radius * radius;
+    // The own chunk first, then the others by distance, so most points have
+    // enough neighbours before the farther chunks are read.
+    let centre = (lo + hi) / 2.;
+    let mut ids: Vec<(f64, u32)> = cache
+        .scan
+        .chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, info)| overlaps(&info.bounds, lo, hi))
+        .map(|(id, info)| {
+            let gap = (DVec3::from(info.bounds.min) - centre)
+                .max(centre - DVec3::from(info.bounds.max))
+                .max(DVec3::ZERO);
+            (
+                if id as u32 == chunk {
+                    -1.
+                } else {
+                    gap.length_squared()
+                },
+                id as u32,
+            )
+        })
+        .collect();
+    ids.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (_, id) in ids {
+        job.check()?;
+        let points = cache.get(id, job)?;
+        // Only the points in reach of the chunk go into the tree.
+        let near: Vec<DVec3> = points
+            .positions
+            .iter()
+            .filter(|p| p.cmpge(lo).all() && p.cmple(hi).all())
+            .copied()
+            .collect();
+        if near.is_empty() {
             continue;
         }
-        job.check()?;
-        let points = cache.get(id as u32, job)?;
-        let tree = KdTree::new(points.positions.clone());
+        let (tree_lo, tree_hi) = near
+            .iter()
+            .fold((DVec3::INFINITY, DVec3::NEG_INFINITY), |(lo, hi), p| {
+                (lo.min(*p), hi.max(*p))
+            });
+        let tree = KdTree::new(near);
         for (i, p) in own.positions.iter().enumerate() {
             if i % 1024 == 0 {
                 job.check()?;
@@ -879,7 +963,11 @@ fn noise_chunk_streamed(
             if counts[i] >= min_neighbours {
                 continue;
             }
-            let self_point = usize::from(id as u32 == chunk);
+            let gap = (tree_lo - *p).max(*p - tree_hi).max(DVec3::ZERO);
+            if gap.length_squared() > r2 {
+                continue;
+            }
+            let self_point = usize::from(id == chunk);
             let cap = (min_neighbours - counts[i]) as usize + self_point;
             counts[i] += tree
                 .count_within(*p, radius, cap)
@@ -1141,6 +1229,16 @@ impl Project {
         let mut labels = LabelWriter::new(self, target)?;
         for scan in &scans {
             let cache = ChunkCache::new(self, scan);
+            // The first pass keeps each point's mean distance in a scratch
+            // file (NaN where too few neighbours are in reach), so the second
+            // pass need not search again.
+            let path = self
+                .root
+                .join("staging")
+                .join(format!("{}.sor", Uuid::new_v4()));
+            let _remove = TempFile(path.clone());
+            let mut spill = BufWriter::new(create_scratch(&path)?);
+            let mut offsets = vec![0u64; scan.chunks.len() + 1];
             let (mut n, mut sum, mut squares) = (0u64, 0., 0.);
             each_chunk(
                 &cache,
@@ -1149,18 +1247,27 @@ impl Project {
                 &|cache, chunk, job| {
                     let (_, distances) =
                         mean_neighbour_distances(cache, chunk, k, max_distance, job)?;
-                    Ok(distances
-                        .into_iter()
+                    let stats = distances
+                        .iter()
                         .flatten()
-                        .fold((0u64, 0., 0.), |(n, s, q), d| (n + 1, s + d, q + d * d)))
+                        .fold((0u64, 0., 0.), |(n, s, q), d| (n + 1, s + d, q + d * d));
+                    let bytes: Vec<u8> = distances
+                        .iter()
+                        .flat_map(|d| d.unwrap_or(f64::NAN).to_le_bytes())
+                        .collect();
+                    Ok((stats, bytes))
                 },
-                |_, (a, b, c)| {
+                |chunk, ((a, b, c), bytes)| {
                     n += a;
                     sum += b;
                     squares += c;
+                    spill.write_all(&bytes)?;
+                    offsets[chunk as usize + 1] = offsets[chunk as usize] + bytes.len() as u64;
                     Ok(())
                 },
             )?;
+            spill.flush()?;
+            drop(spill);
             let mean = sum / n.max(1) as f64;
             let sigma = (squares / n.max(1) as f64 - mean * mean).max(0.).sqrt();
             let threshold = mean + deviations * sigma;
@@ -1169,13 +1276,26 @@ impl Project {
                 job,
                 &filtering,
                 &|cache, chunk, job| {
-                    let (own, distances) =
-                        mean_neighbour_distances(cache, chunk, k, max_distance, job)?;
+                    let own = cache.get(chunk, job)?;
+                    let (start, end) = (offsets[chunk as usize], offsets[chunk as usize + 1]);
+                    ensure!(
+                        end - start == own.positions.len() as u64 * 8,
+                        "Outlier distances do not match the points"
+                    );
+                    let mut bytes = vec![0u8; (end - start) as usize];
+                    let mut file = File::open(&path)?;
+                    file.seek(SeekFrom::Start(start))?;
+                    file.read_exact(&mut bytes)?;
+                    let distances = bytes
+                        .as_chunks::<8>()
+                        .0
+                        .iter()
+                        .map(|b| f64::from_le_bytes(*b));
                     let mut mask =
                         vec![0u8; (cache.scan.chunks[chunk as usize].count as usize).div_ceil(8)];
                     let mut count = 0;
                     for (index, d) in own.indices.iter().zip(distances) {
-                        if d.is_none_or(|d| d > threshold) {
+                        if d.is_nan() || d > threshold {
                             mask[*index as usize / 8] |= 1 << (index % 8);
                             count += 1;
                         }

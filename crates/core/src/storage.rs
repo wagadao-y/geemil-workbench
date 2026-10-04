@@ -482,7 +482,7 @@ fn empty_node(bounds: Bounds) -> Node {
 }
 
 /// A spool file, removed once the last region in it is done with.
-pub(crate) struct TempFile(PathBuf);
+pub(crate) struct TempFile(pub(crate) PathBuf);
 impl Drop for TempFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.0);
