@@ -427,20 +427,95 @@ fn subsample_chunk(
     Ok((mask, count))
 }
 
+/// Scans filtered together in the project frame: each one's chunk cache,
+/// world matrix and chunk boxes in the project frame.
+struct Merged<'a> {
+    scans: Vec<&'a Scan>,
+    caches: Vec<ChunkCache<'a>>,
+    worlds: Vec<DMat4>,
+    boxes: Vec<Vec<(DVec3, DVec3)>>,
+}
+impl<'a> Merged<'a> {
+    fn new(project: &'a Project, scan_ids: &[Uuid]) -> Self {
+        let scans: Vec<_> = project
+            .scans()
+            .filter(|s| scan_ids.contains(&s.id))
+            .collect();
+        let limit = project.filter_options.memory_bytes / 4 / scans.len().max(1);
+        let caches = scans
+            .iter()
+            .map(|s| ChunkCache::with_limit(project, s, limit))
+            .collect();
+        let worlds: Vec<_> = scans.iter().map(|s| project.world_matrix(s)).collect();
+        let boxes = scans
+            .iter()
+            .zip(&worlds)
+            .map(|(scan, world)| {
+                scan.chunks
+                    .iter()
+                    .map(|c| {
+                        c.bounds.corners().fold(
+                            (DVec3::INFINITY, DVec3::NEG_INFINITY),
+                            |(lo, hi), p| {
+                                let p = world.transform_point3(p);
+                                (lo.min(p), hi.max(p))
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+        Self {
+            scans,
+            caches,
+            worlds,
+            boxes,
+        }
+    }
+    /// Visible points of every chunk of every scan but `own` that lie in the
+    /// box `[lo, hi]`, in the project frame, with their scan, chunk and index.
+    fn visit(
+        &self,
+        own: (usize, u32),
+        lo: DVec3,
+        hi: DVec3,
+        job: &JobControl,
+        mut visit: impl FnMut(DVec3, usize, u32, u32),
+    ) -> Result<()> {
+        for (sj, cache) in self.caches.iter().enumerate() {
+            for (cj, (a, b)) in self.boxes[sj].iter().enumerate() {
+                let cj = cj as u32;
+                if (sj, cj) == own || a.cmpgt(hi).any() || b.cmplt(lo).any() {
+                    continue;
+                }
+                let points = cache.get(cj, job)?;
+                for (i, (p, index)) in points.positions.iter().zip(&points.indices).enumerate() {
+                    if i % 8192 == 0 {
+                        job.check()?;
+                    }
+                    let p = self.worlds[sj].transform_point3(*p);
+                    if p.cmpge(lo).all() && p.cmple(hi).all() {
+                        visit(p, sj, cj, *index);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Merged voxel subsampling of chunk `chunk` of scan `si`, in the project
 /// frame; see `Project::subsample_merged`.
 fn merged_subsample_chunk(
-    caches: &[ChunkCache],
-    worlds: &[DMat4],
-    boxes: &[Vec<(DVec3, DVec3)>],
+    merged: &Merged,
     si: usize,
     chunk: u32,
     size: f64,
     job: &JobControl,
 ) -> Result<ChunkResult> {
     type Score = (f64, u32, u32, u32);
-    let own = caches[si].get(chunk, job)?;
-    let (lo, hi) = boxes[si][chunk as usize];
+    let own = merged.caches[si].get(chunk, job)?;
+    let (lo, hi) = merged.boxes[si][chunk as usize];
     let lo = (lo / size).floor() * size;
     let hi = ((hi / size).floor() + 1.) * size;
     let rank = |p: DVec3, scan: usize, chunk: u32, index: u32| -> ([i64; 3], Score) {
@@ -453,41 +528,28 @@ fn merged_subsample_chunk(
             .then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
             .is_lt()
     };
-    let world = |scan: usize, p: &DVec3| worlds[scan].transform_point3(*p);
+    let world = |p: &DVec3| merged.worlds[si].transform_point3(*p);
     let mut best: HashMap<[i64; 3], Score> = HashMap::new();
     for (p, index) in own.positions.iter().zip(&own.indices) {
-        let (key, score) = rank(world(si, p), si, chunk, *index);
+        let (key, score) = rank(world(p), si, chunk, *index);
         let entry = best.entry(key).or_insert(score);
         if better(&score, entry) {
             *entry = score;
         }
     }
-    for (sj, cache) in caches.iter().enumerate() {
-        for (cj, (a, b)) in boxes[sj].iter().enumerate() {
-            let cj = cj as u32;
-            if (sj, cj) == (si, chunk) || a.cmpgt(hi).any() || b.cmplt(lo).any() {
-                continue;
-            }
-            let points = cache.get(cj, job)?;
-            for (p, index) in points.positions.iter().zip(&points.indices) {
-                let p = world(sj, p);
-                if !(p.cmpge(lo).all() && p.cmple(hi).all()) {
-                    continue;
-                }
-                let (key, score) = rank(p, sj, cj, *index);
-                if let Some(entry) = best.get_mut(&key)
-                    && better(&score, entry)
-                {
-                    *entry = score;
-                }
-            }
+    merged.visit((si, chunk), lo, hi, job, |p, sj, cj, index| {
+        let (key, score) = rank(p, sj, cj, index);
+        if let Some(entry) = best.get_mut(&key)
+            && better(&score, entry)
+        {
+            *entry = score;
         }
-    }
-    let count_bits = caches[si].scan.chunks[chunk as usize].count as usize;
+    })?;
+    let count_bits = merged.scans[si].chunks[chunk as usize].count as usize;
     let mut mask = vec![0u8; count_bits.div_ceil(8)];
     let mut count = 0;
     for (p, index) in own.positions.iter().zip(&own.indices) {
-        let (key, _) = rank(world(si, p), si, chunk, *index);
+        let (key, _) = rank(world(p), si, chunk, *index);
         let (_, s, c, i) = best[&key];
         if (s as usize, c, i) != (si, chunk, *index) {
             mask[*index as usize / 8] |= 1 << (index % 8);
@@ -495,6 +557,166 @@ fn merged_subsample_chunk(
         }
     }
     Ok((mask, count))
+}
+
+/// The overlap reduction grid in the project frame, with cells packed into
+/// one integer: 21 bits per axis from `origin`.
+struct Grid {
+    origin: DVec3,
+    size: f64,
+}
+impl Grid {
+    const SIDE: u64 = 1 << 21;
+    fn new(merged: &Merged, size: f64) -> Result<Self> {
+        let (lo, hi) = merged.boxes.iter().flatten().fold(
+            (DVec3::INFINITY, DVec3::NEG_INFINITY),
+            |(lo, hi), (a, b)| (lo.min(*a), hi.max(*b)),
+        );
+        // One spare cell on each side keeps neighbours of every cell in range.
+        let origin = ((lo / size).floor() - 1.) * size;
+        ensure!(
+            lo.is_finite() && ((hi - origin) / size).max_element() < (Self::SIDE - 2) as f64,
+            "Cell size too small for the extent of the scans"
+        );
+        Ok(Self { origin, size })
+    }
+    fn key(&self, p: DVec3) -> u64 {
+        let c = ((p - self.origin) / self.size).floor().as_u64vec3();
+        c.x | (c.y << 21) | (c.z << 42)
+    }
+    fn neighbour(key: u64, d: [i64; 3]) -> u64 {
+        let mask = Self::SIDE - 1;
+        let at = |axis: u64, d: i64| (((key >> (21 * axis)) & mask) as i64 + d) as u64;
+        at(0, d[0]) | (at(1, d[1]) << 21) | (at(2, d[2]) << 42)
+    }
+    fn centre(&self, key: u64) -> DVec3 {
+        let mask = Self::SIDE - 1;
+        let c = DVec3::new(
+            (key & mask) as f64,
+            ((key >> 21) & mask) as f64,
+            ((key >> 42) & mask) as f64,
+        );
+        self.origin + (c + 0.5) * self.size
+    }
+}
+
+/// Visible points of chunk `chunk` of scan `si` per grid cell, by cell.
+fn chunk_cells(
+    merged: &Merged,
+    grid: &Grid,
+    si: usize,
+    chunk: u32,
+    job: &JobControl,
+) -> Result<Vec<(u64, u32)>> {
+    let own = merged.caches[si].get(chunk, job)?;
+    let world = merged.worlds[si];
+    let mut keys: Vec<u64> = own
+        .positions
+        .iter()
+        .map(|p| grid.key(world.transform_point3(*p)))
+        .collect();
+    keys.sort_unstable();
+    let mut cells: Vec<(u64, u32)> = vec![];
+    for key in keys {
+        match cells.last_mut() {
+            Some((last, n)) if *last == key => *n += 1,
+            _ => cells.push((key, 1)),
+        }
+    }
+    Ok(cells)
+}
+
+/// Overlap reduction of chunk `chunk` of scan `si`; see
+/// `Project::reduce_overlap`. `cells` are every chunk's cell counts, and
+/// `scanners` the scanner positions in the project frame, where known.
+fn overlap_chunk(
+    merged: &Merged,
+    grid: &Grid,
+    cells: &[Vec<Vec<(u64, u32)>>],
+    scanners: &[Option<DVec3>],
+    si: usize,
+    chunk: u32,
+    job: &JobControl,
+) -> Result<ChunkResult> {
+    const NEIGHBOURS: [[i64; 3]; 27] = {
+        let mut all = [[0; 3]; 27];
+        let mut i = 0;
+        while i < 27 {
+            all[i] = [i as i64 % 3 - 1, i as i64 / 3 % 3 - 1, i as i64 / 9 - 1];
+            i += 1;
+        }
+        all
+    };
+    // Points per scan in the chunk's cells and around them, as (scan, count).
+    let mut counts: HashMap<u64, Vec<(u32, u32)>> = HashMap::new();
+    for &(key, _) in &cells[si][chunk as usize] {
+        for d in NEIGHBOURS {
+            counts.entry(Grid::neighbour(key, d)).or_default();
+        }
+    }
+    let (lo, hi) = merged.boxes[si][chunk as usize];
+    let (lo, hi) = (lo - grid.size, hi + grid.size);
+    for (sj, boxes) in merged.boxes.iter().enumerate() {
+        for (cj, (a, b)) in boxes.iter().enumerate() {
+            if a.cmpgt(hi).any() || b.cmplt(lo).any() {
+                continue;
+            }
+            job.check()?;
+            for &(key, n) in &cells[sj][cj] {
+                if let Some(entry) = counts.get_mut(&key) {
+                    match entry.iter_mut().find(|(s, _)| *s == sj as u32) {
+                        Some((_, total)) => *total += n,
+                        None => entry.push((sj as u32, n)),
+                    }
+                }
+            }
+        }
+    }
+    let own = merged.caches[si].get(chunk, job)?;
+    let world = merged.worlds[si];
+    // The scan each cell of the chunk keeps, decided once per cell.
+    let mut keep: HashMap<u64, u32> = HashMap::new();
+    let count_bits = merged.scans[si].chunks[chunk as usize].count as usize;
+    let mut mask = vec![0u8; count_bits.div_ceil(8)];
+    let mut moved = 0;
+    for (i, (p, index)) in own.positions.iter().zip(&own.indices).enumerate() {
+        if i % 8192 == 0 {
+            job.check()?;
+        }
+        let key = grid.key(world.transform_point3(*p));
+        let winner = *keep.entry(key).or_insert_with(|| {
+            let mut density: Vec<(u32, u32)> = vec![];
+            for d in NEIGHBOURS {
+                for &(scan, n) in &counts[&Grid::neighbour(key, d)] {
+                    match density.iter_mut().find(|(s, _)| *s == scan) {
+                        Some((_, total)) => *total += n,
+                        None => density.push((scan, n)),
+                    }
+                }
+            }
+            let centre = grid.centre(key);
+            let distance = |scan: u32| {
+                scanners[scan as usize].map_or(f64::INFINITY, |s| s.distance_squared(centre))
+            };
+            // Only a scan with points in the cell can keep it, or the cell
+            // would lose all its points.
+            let here = &counts[&key];
+            density
+                .into_iter()
+                .filter(|(scan, _)| here.iter().any(|(s, _)| s == scan))
+                .min_by(|a, b| {
+                    b.1.cmp(&a.1)
+                        .then(distance(a.0).total_cmp(&distance(b.0)))
+                        .then(a.0.cmp(&b.0))
+                })
+                .map_or(si as u32, |(scan, _)| scan)
+        });
+        if winner != si as u32 {
+            mask[*index as usize / 8] |= 1 << (index % 8);
+            moved += 1;
+        }
+    }
+    Ok((mask, moved))
 }
 
 /// Isolated point removal for one chunk: a point with fewer than
@@ -635,42 +857,15 @@ impl Project {
         job: &JobControl,
     ) -> Result<u64> {
         ensure!(size.is_finite() && size > 0., "Invalid voxel size");
-        let scans: Vec<_> = self.scans().filter(|s| scan_ids.contains(&s.id)).collect();
-        let limit = self.filter_options.memory_bytes / 4 / scans.len().max(1);
-        let caches: Vec<_> = scans
-            .iter()
-            .map(|s| ChunkCache::with_limit(self, s, limit))
-            .collect();
-        let worlds: Vec<_> = scans.iter().map(|s| self.world_matrix(s)).collect();
-        // Each chunk's box in the project frame.
-        let boxes: Vec<Vec<(DVec3, DVec3)>> = scans
-            .iter()
-            .zip(&worlds)
-            .map(|(scan, world)| {
-                scan.chunks
-                    .iter()
-                    .map(|c| {
-                        c.bounds.corners().fold(
-                            (DVec3::INFINITY, DVec3::NEG_INFINITY),
-                            |(lo, hi), p| {
-                                let p = world.transform_point3(p);
-                                (lo.min(p), hi.max(p))
-                            },
-                        )
-                    })
-                    .collect()
-            })
-            .collect();
-        let progress = Progress::new(Stage::Subsampling, &scans, 1);
+        let merged = Merged::new(self, scan_ids);
+        let progress = Progress::new(Stage::Subsampling, &merged.scans, 1);
         let mut labels = LabelWriter::new(self, target)?;
-        for (si, scan) in scans.iter().enumerate() {
+        for (si, scan) in merged.scans.iter().enumerate() {
             each_chunk(
-                &caches[si],
+                &merged.caches[si],
                 job,
                 &progress,
-                &|_, chunk, job| {
-                    merged_subsample_chunk(&caches, &worlds, &boxes, si, chunk, size, job)
-                },
+                &|_, chunk, job| merged_subsample_chunk(&merged, si, chunk, size, job),
                 |chunk, (mask, count)| labels.push(self, scan, chunk, &mask, count),
             )?;
         }
@@ -678,6 +873,78 @@ impl Project {
         labels.commit(
             self,
             serde_json::json!({"kind": "subsample", "size": size, "merged": true,
+                "scans": self.scans_record(scan_ids)}),
+            |_| Ok(()),
+            false,
+        )
+    }
+    /// Where scans overlap, keeps each place's points from one scan only, so
+    /// colour and noise do not alternate point by point between scans. On a
+    /// grid of `size` metres in the project frame, each cell keeps the scan
+    /// that samples it most densely, counted over the cell and its 26
+    /// neighbours so the choice does not flicker from cell to cell (only a
+    /// scan with points in the cell itself can keep it); a nearer
+    /// or more face-on scanner samples more densely, so no scanner position is
+    /// needed. Ties go to the nearer known scanner, then to scan order. The
+    /// other scans' points in the cell move to `target`.
+    pub fn reduce_overlap(
+        &mut self,
+        size: f64,
+        scan_ids: &[Uuid],
+        target: &LayerTarget,
+        job: &JobControl,
+    ) -> Result<u64> {
+        ensure!(size.is_finite() && size > 0., "Invalid cell size");
+        let merged = Merged::new(self, scan_ids);
+        let scanners: Vec<_> = merged
+            .scans
+            .iter()
+            .zip(&merged.worlds)
+            .map(|(scan, world)| {
+                self.scanner_position(scan)
+                    .map(|p| world.transform_point3(p))
+            })
+            .collect();
+        let grid = Grid::new(&merged, size)?;
+        // First every chunk's points per cell, then each chunk decides from
+        // those counts without reading its neighbours' points.
+        let progress = Progress::new(Stage::ReducingOverlap, &merged.scans, 2);
+        let budget = self.filter_options.memory_bytes / 2;
+        let mut cells = vec![];
+        let mut entries = 0usize;
+        for si in 0..merged.scans.len() {
+            let mut scan_cells = vec![];
+            each_chunk(
+                &merged.caches[si],
+                job,
+                &progress,
+                &|_, chunk, job| chunk_cells(&merged, &grid, si, chunk, job),
+                |_, chunk_cells| {
+                    entries += chunk_cells.len();
+                    ensure!(
+                        entries * std::mem::size_of::<(u64, u32)>() <= budget,
+                        crate::CoreError::FilterMemoryBudgetTooSmall
+                    );
+                    scan_cells.push(chunk_cells);
+                    Ok(())
+                },
+            )?;
+            cells.push(scan_cells);
+        }
+        let mut labels = LabelWriter::new(self, target)?;
+        for (si, scan) in merged.scans.iter().enumerate() {
+            each_chunk(
+                &merged.caches[si],
+                job,
+                &progress,
+                &|_, chunk, job| overlap_chunk(&merged, &grid, &cells, &scanners, si, chunk, job),
+                |chunk, (mask, count)| labels.push(self, scan, chunk, &mask, count),
+            )?;
+        }
+        job.check()?;
+        labels.commit(
+            self,
+            serde_json::json!({"kind": "reduce_overlap", "size": size,
                 "scans": self.scans_record(scan_ids)}),
             |_| Ok(()),
             false,

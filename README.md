@@ -47,6 +47,7 @@ WindowsではDirectX 12を既定とする。`WGPU_BACKEND`環境変数でバッ�
    - ボクセル間引き: 指定した大きさのボクセルごとに、中心に最も近い元の点を1つ残す。「表示中のスキャンをまとめて間引く」を選ぶと、共通座標の1つのグリッドで全スキャンをまとめて扱い、スキャンの重なる部分でも1ボクセルに1点だけ残す（位置合わせ後、書き出し前の仕上げ用）。Trimbleの5cmでは、スキャンごとの44.6万点に対し、まとめると87.2万点を間引いた（約0.7秒）。
    - ノイズ除去: 探索半径の中にある他の点が最小近傍点数より少ない孤立点を移す。
    - 統計的外れ値除去（SOR）: 近い順に指定数の点までの平均距離を各点で求め、スキャン全体の平均より標準偏差の指定倍以上離れた点を移す（既定はCloudCompareと同じ6点・1σ）。探索範囲（既定0.5m）に指定数の点がない点も移す。全体の統計を求める1回目と判定する2回目で点群を2回読み、点ごとの値はメモリに残さない。
+   - スキャンの重なりを整理（「ツール → スキャンの重なりを整理」）: 位置合わせ後、スキャンの重なる場所で点が交互に混ざり、スキャンごとの露出や色味の違いでざらついて見えるのを防ぐ。共通座標の格子（既定10cm）ごとに、最も密に点を取っているスキャンの点だけを残し、ほかのスキャンの点を「重複」レイヤーへ移す。近いスキャンや面を正面から撮ったスキャンほど密なので、スキャン位置がなくても（LAS/LAZ・姿勢のないE57でも）判定できる。密度は周囲の格子と合わせて数え、残すスキャンが格子ごとにばらつかないようにする（残せるのはその格子に点があるスキャンだけ）。同じ密度ならスキャン位置が近いほう、次にスキャンの順で決める。表示中のスキャンをまとめて判定する。各チャンクの格子ごとの点数を先に数え、判定では隣のチャンクの点を読まない。
    - いずれもチャンクの境界をまたいで隣のチャンクの点も見るため、結果はチャンクの分け方に左右されない。非表示のレイヤーの点は判定に使わない。パラメーターは次回も引き継ぐ。
 11. すべての点はいずれか1つのレイヤーに属する。取り込んだ点は「点群」に入り、上の操作は点を消さずに別のレイヤーへ移す。操作が新しく作るレイヤーは非表示で始まる。左の「レイヤー」でチェックを外したレイヤーの点は、表示・選択・処理・書き出しのどれにも使わない。右クリックで名前の変更、「すべての点を移動」（例: 「ノイズ」の点を全部「点群」へ戻す）、レイヤーの削除（点は「点群」へ戻る）ができる。一部だけ戻すときは、移した先のレイヤーを表示し、範囲選択で移動先に「点群」を選んで移す。「新しいレイヤー」で自分用のレイヤー（地面・建物など）も作れる。
 12. 編集は元に戻す（Ctrl+Z）・やり直す（Ctrl+Y / Ctrl+Shift+Z）ができる。編集のたびに未保存の作業状態をプロジェクトへ書き込むため、終了や異常終了の後も続きから再開できる。
@@ -98,6 +99,7 @@ cargo run -p geemil-core --release -- subsample work-data/trimble-copy 0.05
 cargo run -p geemil-core --release -- noise work-data/trimble-copy 0.1 4
 cargo run -p geemil-core --release -- sor work-data/trimble-copy 6 1 0.5
 cargo run -p geemil-core --release -- subsample-merged work-data/trimble-copy 0.05
+cargo run -p geemil-core --release -- reduce-overlap work-data/trimble-copy 0.1
 cargo run -p geemil-core --release -- export work-data/trimble work-data/trimble-roundtrip.e57
 cargo run -p geemil-core --release -- export-las work-data/trimble work-data/trimble.laz
 cargo run -p geemil-core --release --example verify_e57 -- Trimble_StSulpice-Cloud-50mm.e57 work-data/trimble-roundtrip.e57

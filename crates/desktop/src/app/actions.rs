@@ -47,6 +47,7 @@ pub(super) enum Action {
     Subsample,
     RemoveNoise,
     RemoveOutliers,
+    ReduceOverlap,
     Tool(Tool),
     Shortcuts,
     About,
@@ -78,6 +79,7 @@ impl Action {
             Self::Subsample => icon::DOTS_NINE,
             Self::RemoveNoise => icon::FUNNEL,
             Self::RemoveOutliers => icon::CHART_SCATTER,
+            Self::ReduceOverlap => icon::INTERSECT,
             Self::Tool(Tool::Navigate) => icon::HAND,
             Self::Tool(Tool::Rect) => icon::SELECTION,
             Self::Tool(Tool::Polygon) => icon::POLYGON,
@@ -116,6 +118,7 @@ impl Action {
             Self::Subsample => t.subsample.into(),
             Self::RemoveNoise => t.remove_noise.into(),
             Self::RemoveOutliers => t.remove_outliers.into(),
+            Self::ReduceOverlap => t.reduce_overlap.into(),
             Self::Tool(Tool::Navigate) => t.navigate.into(),
             Self::Tool(Tool::Rect) => t.tool_rect.into(),
             Self::Tool(Tool::Polygon) => t.tool_polygon.into(),
@@ -213,6 +216,7 @@ impl Workbench {
             Action::Subsample | Action::RemoveNoise | Action::RemoveOutliers => {
                 idle && !self.visible.is_empty()
             }
+            Action::ReduceOverlap => idle && self.visible.len() > 1,
             Action::FitView | Action::View(_) => project.is_some(),
             Action::Quit
             | Action::ClearSelection
@@ -352,6 +356,14 @@ impl Workbench {
                     None,
                 ))
             }
+            Action::ReduceOverlap => {
+                self.dialog = Some(Dialog::Filter(
+                    Filter::Overlap {
+                        size: self.settings.overlap_size,
+                    },
+                    None,
+                ))
+            }
             Action::RemoveOutliers => {
                 self.dialog = Some(Dialog::Filter(
                     Filter::Statistical {
@@ -428,6 +440,7 @@ impl Workbench {
                 self.settings.subsample_size = size;
                 self.settings.subsample_merged = merged;
             }
+            Filter::Overlap { size } => self.settings.overlap_size = size,
             Filter::Noise {
                 radius,
                 min_neighbours,
@@ -456,6 +469,7 @@ impl Workbench {
                 Filter::Subsample { size, merged: true } => {
                     project.subsample_merged(size, &ids, &target, &job)?
                 }
+                Filter::Overlap { size } => project.reduce_overlap(size, &ids, &target, &job)?,
                 Filter::Noise {
                     radius,
                     min_neighbours,

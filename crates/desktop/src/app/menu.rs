@@ -104,6 +104,8 @@ impl Workbench {
                     self.menu_item(ui, Action::Subsample, &mut chosen);
                     self.menu_item(ui, Action::RemoveNoise, &mut chosen);
                     self.menu_item(ui, Action::RemoveOutliers, &mut chosen);
+                    ui.separator();
+                    self.menu_item(ui, Action::ReduceOverlap, &mut chosen);
                 });
                 ui.menu_button(t.menu_help, |ui| {
                     self.menu_item(ui, Action::Shortcuts, &mut chosen);

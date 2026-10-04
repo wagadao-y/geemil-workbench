@@ -76,6 +76,10 @@ pub(super) enum Filter {
         size: f64,
         merged: bool,
     },
+    /// Overlap reduction over the visible scans together.
+    Overlap {
+        size: f64,
+    },
     Noise {
         radius: f64,
         min_neighbours: u32,
@@ -91,6 +95,7 @@ impl Filter {
     pub(super) fn default_layer(&self, t: &'static Strings) -> &'static str {
         match self {
             Filter::Subsample { .. } => t.layer_subsampled,
+            Filter::Overlap { .. } => t.layer_overlap,
             Filter::Noise { .. } | Filter::Statistical { .. } => t.layer_noise,
         }
     }
@@ -341,6 +346,10 @@ impl Workbench {
                             format!("{} {}", icon::DOTS_NINE, t.subsample),
                             t.subsample_message,
                         ),
+                        Filter::Overlap { .. } => (
+                            format!("{} {}", icon::INTERSECT, t.reduce_overlap),
+                            t.overlap_message,
+                        ),
                         Filter::Noise { .. } => (
                             format!("{} {}", icon::FUNNEL, t.remove_noise),
                             t.noise_message,
@@ -363,6 +372,11 @@ impl Workbench {
                                 ui.label("");
                                 ui.checkbox(merged, t.subsample_merged)
                                     .on_hover_text(t.subsample_merged_hint);
+                                ui.end_row();
+                            }
+                            Filter::Overlap { size } => {
+                                ui.label(t.overlap_cell);
+                                ui.add(metres(size)).on_hover_text(t.overlap_cell_hint);
                                 ui.end_row();
                             }
                             Filter::Noise {

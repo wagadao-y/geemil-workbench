@@ -79,6 +79,14 @@ fn main() -> Result<()> {
             let removed = p.subsample_merged(args[2].parse()?, &scans, &target, &job)?;
             println!("{removed} points moved in {:.2?}", started.elapsed());
         }
+        Some("reduce-overlap") if args.len() == 3 => {
+            let mut p = Project::load(Path::new(&args[1]))?;
+            let scans: Vec<_> = p.scans().map(|s| s.id).collect();
+            let started = std::time::Instant::now();
+            let target = p.layer_named("Overlap");
+            let moved = p.reduce_overlap(args[2].parse()?, &scans, &target, &job)?;
+            println!("{moved} points moved in {:.2?}", started.elapsed());
+        }
         Some("noise") if args.len() == 4 => {
             let mut p = Project::load(Path::new(&args[1]))?;
             let scans: Vec<_> = p.scans().map(|s| s.id).collect();
@@ -104,7 +112,7 @@ fn main() -> Result<()> {
             println!("{removed} points moved in {:.2?}", started.elapsed());
         }
         _ => bail!(
-            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | export-las PROJECT FILE.las|laz | subsample PROJECT VOXEL_M | subsample-merged PROJECT VOXEL_M | noise PROJECT RADIUS_M MIN_NEIGHBOURS | sor PROJECT NEIGHBOURS SIGMAS REACH_M"
+            "Usage: geemil demo FILE.e57 | import PROJECT FILE... | inspect PROJECT | export PROJECT FILE.e57 | export-las PROJECT FILE.las|laz | subsample PROJECT VOXEL_M | subsample-merged PROJECT VOXEL_M | reduce-overlap PROJECT CELL_M | noise PROJECT RADIUS_M MIN_NEIGHBOURS | sor PROJECT NEIGHBOURS SIGMAS REACH_M"
         ),
     }
     Ok(())

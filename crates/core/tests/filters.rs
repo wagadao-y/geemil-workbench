@@ -508,3 +508,69 @@ fn merged_subsampling_keeps_one_point_per_voxel_over_overlapping_scans() {
     }
     assert_eq!(results[0], results[1]);
 }
+
+#[test]
+fn overlap_reduction_keeps_the_denser_scan_where_scans_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    // A dense scan over x in [0, 2) and a sparse one over x in [1, 3), on
+    // one plane: where they overlap, only the dense scan's points stay.
+    let write = |name: &str, from: f64, to: f64, spacing: f64| {
+        let path = dir.path().join(name);
+        let mut writer = las::Writer::from_path(&path, las::Header::default()).unwrap();
+        let n = ((to - from) / spacing).round() as usize;
+        for i in 0..n {
+            for j in 0..(1. / spacing).round() as usize {
+                writer
+                    .write_point(las::Point {
+                        x: from + (i as f64 + 0.5) * spacing,
+                        y: (j as f64 + 0.5) * spacing,
+                        ..Default::default()
+                    })
+                    .unwrap();
+            }
+        }
+        writer.close().unwrap();
+        path
+    };
+    let dense = write("dense.las", 0., 2., 0.01);
+    let sparse = write("sparse.las", 1., 3., 0.03);
+    let mut results = vec![];
+    for (name, chunk_points) in [("small", 512), ("large", 65_536)] {
+        let mut p = Project::create(&dir.path().join(name), name).unwrap();
+        let options = ImportOptions {
+            chunk_points,
+            view_grid: 4,
+            view_leaf_points: 32,
+            ..Default::default()
+        };
+        for file in [&dense, &sparse] {
+            p.import_file(file, options, &JobControl::default())
+                .unwrap();
+        }
+        let scans = ids(&p);
+        let count = |p: &Project, scan: uuid::Uuid| -> Vec<[f64; 3]> {
+            let scan = p.scan(scan).unwrap();
+            (0..scan.chunks.len())
+                .flat_map(|c| p.points(scan, c as u32).unwrap())
+                .map(|s| s.position)
+                .collect()
+        };
+        let dense_before = count(&p, scans[0]).len();
+        let moved = p
+            .reduce_overlap(
+                0.1,
+                &scans,
+                &p.layer_named("Overlap"),
+                &JobControl::default(),
+            )
+            .unwrap();
+        assert_eq!(count(&p, scans[0]).len(), dense_before);
+        let kept = count(&p, scans[1]);
+        // The sparse scan keeps exactly what lies beyond the dense one.
+        assert!(kept.iter().all(|q| q[0] >= 2.));
+        assert_eq!(kept.len(), 34 * 33);
+        assert_eq!(moved as usize, 67 * 33 - kept.len());
+        results.push(sorted_bits(&kept));
+    }
+    assert_eq!(results[0], results[1]);
+}
