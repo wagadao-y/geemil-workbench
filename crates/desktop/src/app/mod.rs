@@ -113,6 +113,9 @@ pub struct Workbench {
     visible: BTreeSet<Uuid>,
     /// The scan or folder selected in the tree.
     selected: Option<Uuid>,
+    /// An item selected outside the tree, which the tree opens its folders
+    /// for and scrolls to once.
+    reveal: Option<Uuid>,
     tree_selection: tree::TreeSelection,
     folder_summary: tree::FolderSummary,
     layer_counts: layers::LayerCounts,
@@ -184,6 +187,7 @@ impl Workbench {
             camera: Camera::default(),
             visible: BTreeSet::new(),
             selected: None,
+            reveal: None,
             tree_selection: tree::TreeSelection::default(),
             folder_summary: Default::default(),
             layer_counts: None,

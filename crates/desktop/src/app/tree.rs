@@ -331,6 +331,7 @@ impl Workbench {
                         }
                     });
                 self.tree_selection.order = order;
+                self.reveal = None;
                 for action in actions {
                     self.tree_action(action);
                 }
@@ -355,12 +356,15 @@ impl Workbench {
         for group in groups {
             order.push(group.id);
             let id = ui.make_persistent_id(group.id);
-            let (_, header, body) =
-                egui::collapsing_header::CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    id,
-                    true,
-                )
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(),
+                id,
+                true,
+            );
+            if self.reveals(p, group.id) {
+                state.set_open(true);
+            }
+            let (_, header, body) = state
                 .show_header(ui, |ui| {
                     let (inside, points) = self.folder_summary.get(group.id);
                     let shown = inside.iter().filter(|s| self.visible.contains(s)).count();
@@ -527,7 +531,21 @@ impl Workbench {
         if row.dragged() {
             row.dnd_set_drag_payload(TreeDrag(self.context_items(p, id)));
         }
+        if self.reveal == Some(id) {
+            row.scroll_to_me(Some(egui::Align::Center));
+        }
         row
+    }
+    /// Whether `group` holds the item to reveal, so it opens to show it.
+    fn reveals(&self, p: &Project, group: Uuid) -> bool {
+        let mut at = self.reveal.and_then(|id| p.parent_of(id));
+        while let Some(g) = at {
+            if g == group {
+                return true;
+            }
+            at = p.parent_of(g);
+        }
+        false
     }
     fn move_menu(&self, ui: &mut egui::Ui, p: &Project, item: Uuid, actions: &mut Vec<TreeAction>) {
         let t = self.t;

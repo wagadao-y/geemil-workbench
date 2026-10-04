@@ -92,6 +92,7 @@ impl Workbench {
             && let Some((scan, _)) = self.pick_shown(response)
         {
             self.select_tree_item(Some(scan));
+            self.reveal = Some(scan);
         }
         if ((navigating && response.double_clicked()) || response.double_clicked_by(middle))
             && let Some((_, target)) = self.pick_shown(response)
