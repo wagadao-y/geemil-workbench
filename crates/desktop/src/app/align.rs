@@ -1,7 +1,7 @@
 //! The registration tool: pick point pairs between the scan or folder being
 //! moved and the visible reference scans, fit them, refine by ICP, and see each
 //! proposal live before applying it as the item's transform.
-use super::{Workbench, selection::Tool};
+use super::{Workbench, dialogs::Dialog, selection::Tool};
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::{IcpOptions, IcpResult, Pose, Project, rigid_fit};
@@ -151,7 +151,9 @@ impl Workbench {
             None => [0.; 4],
         }
     }
-    /// Follows the tree selection and collects a finished ICP run.
+    /// Follows the tree selection and collects a finished ICP run. An
+    /// unapplied result is not dropped silently: selecting something else
+    /// asks first, and outside the tool the result waits for its return.
     pub(super) fn align_update(&mut self) {
         let Some(p) = self.project.clone() else {
             self.align.item = None;
@@ -161,8 +163,17 @@ impl Workbench {
             .single_tree_item()
             .filter(|id| !p.scans_within(*id).is_empty());
         if item != self.align.item {
-            self.align.clear();
-            self.align.item = item;
+            let pending = self.align.preview.is_some()
+                && self
+                    .align
+                    .item
+                    .is_some_and(|i| !p.scans_within(i).is_empty());
+            if !pending {
+                self.align_switch(item);
+            } else if self.aligning() && self.dialog.is_none() {
+                self.select_tree_item(self.align.item);
+                self.dialog = Some(Dialog::AlignPending { next: item });
+            }
         }
         if let Some(rx) = &self.align.icp
             && let Ok(result) = rx.try_recv()
@@ -313,6 +324,23 @@ impl Workbench {
             let _ = tx.send(result);
             Ok(project)
         });
+    }
+    /// Starts over on `item`, dropping the picks and any unapplied result.
+    pub(super) fn align_switch(&mut self, item: Option<Uuid>) {
+        self.align.clear();
+        self.align.item = item;
+    }
+    /// The name of the item being aligned, for messages.
+    pub(super) fn align_item_name(&self) -> String {
+        let (Some(p), Some(id)) = (&self.project, self.align.item) else {
+            return String::new();
+        };
+        p.groups()
+            .iter()
+            .find(|g| g.id == id)
+            .map(|g| g.name.clone())
+            .or_else(|| p.scan(id).map(|s| s.name.clone()))
+            .unwrap_or_default()
     }
     pub(super) fn align_apply(&mut self) {
         if let Some((item, pose)) = self.align_preview() {

@@ -494,6 +494,23 @@ impl Workbench {
                 self.smoke_pairs();
                 eprintln!("Smoke align: {}", self.align_summary());
             }
+            "align-switch" => {
+                let last = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.scans().last().map(|s| s.id));
+                self.select_tree_item(last);
+                self.align_update();
+                eprintln!(
+                    "Smoke align switch: asked {}, kept {}, {}",
+                    matches!(
+                        self.dialog,
+                        Some(super::dialogs::Dialog::AlignPending { .. })
+                    ),
+                    self.single_tree_item() != last,
+                    self.align_summary()
+                );
+            }
             "align-apply" => {
                 eprintln!("Smoke align: {}", self.align_summary());
                 self.align_apply();

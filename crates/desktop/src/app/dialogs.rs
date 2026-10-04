@@ -28,6 +28,11 @@ pub(super) enum Dialog {
         return_to_revisions: Option<RevisionsState>,
     },
     Cleanup,
+    /// Asks what to do with an unapplied alignment result before the tool
+    /// moves on to `next`, which the tree selected.
+    AlignPending {
+        next: Option<Uuid>,
+    },
     RenameGroup {
         id: Uuid,
         name: String,
@@ -126,6 +131,11 @@ enum Outcome {
     CreateProject(PathBuf, Vec<PathBuf>),
     Save(String),
     Discard(AfterDiscard),
+    /// Leave the alignment result for `next`, applying it first if asked.
+    AlignSwitch {
+        apply: bool,
+        next: Option<Uuid>,
+    },
     Cleanup,
     RenameGroup(Uuid, String),
     RenameLayer(Option<u8>, String),
@@ -153,6 +163,10 @@ fn buttons(ui: &mut egui::Ui, cancel: &str, add: impl FnOnce(&mut egui::Ui)) -> 
 impl Workbench {
     pub(super) fn dialogs(&mut self, ctx: &egui::Context) {
         let t = self.t;
+        let align_name = match self.dialog {
+            Some(Dialog::AlignPending { .. }) => self.align_item_name(),
+            _ => String::new(),
+        };
         let Some(dialog) = &mut self.dialog else {
             return;
         };
@@ -243,6 +257,26 @@ impl Workbench {
                     if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.discard_and_continue).clicked() {
                             outcome = Outcome::Discard(*then);
+                        }
+                    }) {
+                        outcome = Outcome::Close;
+                    }
+                }
+                Dialog::AlignPending { next } => {
+                    ui.heading(format!("{} {}", icon::WARNING, t.align_pending_title));
+                    ui.label((t.align_pending_message)(&align_name));
+                    if buttons(ui, t.cancel, |ui| {
+                        if ui.button(t.align_pending_apply).clicked() {
+                            outcome = Outcome::AlignSwitch {
+                                apply: true,
+                                next: *next,
+                            };
+                        }
+                        if ui.button(t.align_pending_discard).clicked() {
+                            outcome = Outcome::AlignSwitch {
+                                apply: false,
+                                next: *next,
+                            };
                         }
                     }) {
                         outcome = Outcome::Close;
@@ -557,6 +591,14 @@ impl Workbench {
                     }
                     AfterDiscard::Switch(id) => self.switch_revision(id),
                 }
+            }
+            Outcome::AlignSwitch { apply, next } => {
+                self.dialog = None;
+                if apply {
+                    self.align_apply();
+                }
+                self.select_tree_item(next);
+                self.align_switch(next);
             }
             Outcome::Cleanup => {
                 self.dialog = None;

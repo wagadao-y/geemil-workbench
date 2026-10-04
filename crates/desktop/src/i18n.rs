@@ -202,6 +202,10 @@ pub struct Strings {
     pub name: &'static str,
     pub save_button: &'static str,
     pub cancel: &'static str,
+    pub align_pending_title: &'static str,
+    pub align_pending_message: fn(name: &str) -> String,
+    pub align_pending_apply: &'static str,
+    pub align_pending_discard: &'static str,
     pub discard_title: &'static str,
     pub discard_message: &'static str,
     pub discard_and_continue: &'static str,
@@ -490,6 +494,14 @@ pub static JA: Strings = Strings {
     name: "名前",
     save_button: "保存",
     cancel: "キャンセル",
+    align_pending_title: "未適用の位置合わせがあります",
+    align_pending_message: |name| {
+        format!(
+            "「{name}」の位置合わせの結果がまだ適用されていません。別の項目に切り替える前に、適用するか破棄するか選んでください。"
+        )
+    },
+    align_pending_apply: "適用して切り替え",
+    align_pending_discard: "破棄して切り替え",
     discard_title: "未保存の変更があります",
     discard_message: "未保存の変更を破棄します。元に戻すことはできません。",
     discard_and_continue: "破棄して続ける",
