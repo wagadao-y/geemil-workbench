@@ -598,7 +598,42 @@ impl Workbench {
         let (p, item) = self.boxed_item()?;
         item_pivot(&p, item, None, self.gizmo.placed(item))
     }
-    /// The selected item's box, and the handles while the tool is active.
+    /// The edges of the selected item's box, which the renderer draws behind
+    /// points in front of them, with a dark outline, in physical pixels.
+    pub(super) fn box_lines(&self, pixels: f32) -> Vec<crate::render::Line> {
+        let Some((p, item)) = self.boxed_item() else {
+            return vec![];
+        };
+        let pose = self
+            .transform_preview()
+            .filter(|(id, _)| *id == item)
+            .map(|(_, pose)| pose);
+        let Some((frame, bounds)) = item_box(&p, item, pose) else {
+            return vec![];
+        };
+        let corners: Vec<DVec3> = bounds
+            .corners()
+            .map(|c| frame.transform_point3(c))
+            .collect();
+        let mut lines = vec![];
+        for (color, width) in [([0, 0, 0, 255], 3.), (BOX.to_array(), 1.5)] {
+            for a in 0..8usize {
+                for bit in [1, 2, 4] {
+                    if a & bit == 0 {
+                        lines.push(crate::render::Line {
+                            a: corners[a],
+                            b: corners[a | bit],
+                            color,
+                            width: width * pixels,
+                        });
+                    }
+                }
+            }
+        }
+        lines
+    }
+    /// The handles while the tool is active; the selected item's box is
+    /// drawn by the renderer (see `box_lines`).
     pub(super) fn draw_gizmo(&self, ui: &egui::Ui, rect: egui::Rect) {
         let Some((p, item)) = self.boxed_item() else {
             return;
@@ -607,15 +642,7 @@ impl Workbench {
             .transform_preview()
             .filter(|(id, _)| *id == item)
             .map(|(_, pose)| pose);
-        let Some((frame, bounds)) = item_box(&p, item, pose) else {
-            return;
-        };
         let painter = ui.painter_at(rect);
-        let corners: [DVec3; 8] = std::array::from_fn(|i| {
-            let c = bounds.corners().nth(i).unwrap();
-            frame.transform_point3(c)
-        });
-        draw_box_edges(&painter, &self.camera, rect, &corners, BOX);
         if !self.transforming() {
             return;
         }

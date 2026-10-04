@@ -76,7 +76,7 @@ impl Camera {
         self.projection() * self.relative_view()
     }
     /// Right-handed with a 0..1 depth range, as wgpu expects.
-    fn projection(&self) -> DMat4 {
+    pub fn projection(&self) -> DMat4 {
         if self.ortho {
             let h = self.half_height();
             let w = h * self.aspect;
@@ -97,7 +97,7 @@ impl Camera {
         self.distance * (self.fov * 0.5).tan()
     }
     /// The view transform for coordinates relative to `target`.
-    fn relative_view(&self) -> DMat4 {
+    pub fn relative_view(&self) -> DMat4 {
         glam::dcamera::rh::view::look_at_mat4(
             self.eye() - DVec3::from(self.target),
             DVec3::ZERO,

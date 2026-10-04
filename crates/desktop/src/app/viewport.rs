@@ -20,6 +20,7 @@ impl Workbench {
             let mut renderer = self.renderer.take().expect("renderer");
             renderer.set_point_limit(self.settings.point_budget.saturating_mul(2));
             let nodes = self.draw_nodes();
+            let lines = self.box_lines(pixels);
             let marks_revision = self.selection.marks().map_or(0, |(_, revision)| revision);
             let rs = frame.wgpu_render_state().unwrap();
             let settings = &self.settings;
@@ -42,6 +43,7 @@ impl Workbench {
                     },
                     marks_revision,
                     nodes: &nodes,
+                    lines: &lines,
                     highlight_box: self.display_highlight_box().map(|c| c.unit_matrix()),
                     height_ramp: (self.settings.color_mode == ColorMode::Height)
                         .then_some(self.height_range)

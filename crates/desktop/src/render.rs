@@ -50,6 +50,35 @@ struct Uniform {
     /// Height scaled to 0..1 over the ramp as `dot(ramp, (position, 1))`.
     ramp: [f32; 4],
 }
+/// A line drawn behind points in front of it, `width` physical pixels wide.
+#[derive(Clone, Copy)]
+pub struct Line {
+    pub a: DVec3,
+    pub b: DVec3,
+    /// sRGB code values.
+    pub color: [u8; 4],
+    pub width: f32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LineVertex {
+    /// Relative to the camera target.
+    a: [f32; 3],
+    b: [f32; 3],
+    color: [u8; 4],
+    width: f32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LineUniform {
+    view: [[f32; 4]; 4],
+    projection: [[f32; 4]; 4],
+    viewport: [f32; 2],
+    pixels_per_metre: f32,
+    ortho: f32,
+    depth_offset: f32,
+    padding: [f32; 3],
+}
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct EdlUniform {
@@ -90,6 +119,8 @@ pub struct DrawOptions<'a> {
     /// Changes whenever the nodes' marks do.
     pub marks_revision: u64,
     pub nodes: &'a [DrawNode<'a>],
+    /// Lines that points in front of them hide, in the project frame.
+    pub lines: &'a [Line],
 }
 /// A display octree node to draw: its points in scan coordinates, placed in
 /// the project frame by `world`.
@@ -139,6 +170,9 @@ pub struct PointRenderer {
     limit: usize,
     /// Whether nodes were left for later frames to upload.
     pending: bool,
+    line_pipeline: wgpu::RenderPipeline,
+    line_uniform: wgpu::Buffer,
+    line_bind: wgpu::BindGroup,
     edl_pipeline: wgpu::RenderPipeline,
     edl_layout: wgpu::BindGroupLayout,
     edl_uniform: wgpu::Buffer,
@@ -215,6 +249,7 @@ impl PointRenderer {
             multiview_mask: None,
             cache: None,
         });
+        let (line_pipeline, line_uniform, line_bind) = line_pipeline(&device);
         let (edl_pipeline, edl_layout) = edl_pipeline(&device);
         let edl_uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("edl"),
@@ -236,6 +271,9 @@ impl PointRenderer {
             resident: 0,
             limit: 0,
             pending: false,
+            line_pipeline,
+            line_uniform,
+            line_bind,
             edl_pipeline,
             edl_layout,
             edl_uniform,
@@ -356,6 +394,7 @@ impl PointRenderer {
             height_ramp,
             marks_revision,
             nodes,
+            lines,
         } = *options;
         let limit = self.device.limits().max_texture_dimension_2d;
         let size = size.map(|v| v.clamp(1, limit));
@@ -455,6 +494,66 @@ impl PointRenderer {
         if !uniforms.is_empty() {
             self.queue.write_buffer(&self.uniform, 0, &uniforms);
         }
+        // Lines relative to the target, cut just in front of the eye so their
+        // parts behind it do not wrap around.
+        let target = DVec3::from(camera.target);
+        let near = if camera.ortho {
+            f64::NEG_INFINITY
+        } else {
+            camera.distance * 1e-3
+        };
+        let line_vertices: Vec<LineVertex> = lines
+            .iter()
+            .filter_map(|line| {
+                let (da, db) = (
+                    depth_row.dot(line.a.extend(1.)),
+                    depth_row.dot(line.b.extend(1.)),
+                );
+                let (a, b) = match (da >= near, db >= near) {
+                    (true, true) => (line.a, line.b),
+                    (false, false) => return None,
+                    (true, false) => (
+                        line.a,
+                        line.a + (line.b - line.a) * ((da - near) / (da - db)),
+                    ),
+                    (false, true) => (
+                        line.b + (line.a - line.b) * ((db - near) / (db - da)),
+                        line.b,
+                    ),
+                };
+                Some(LineVertex {
+                    a: (a - target).as_vec3().to_array(),
+                    b: (b - target).as_vec3().to_array(),
+                    color: line.color,
+                    width: line.width,
+                })
+            })
+            .collect();
+        let line_buffer = (!line_vertices.is_empty()).then(|| {
+            self.queue.write_buffer(
+                &self.line_uniform,
+                0,
+                bytemuck::bytes_of(&LineUniform {
+                    view: camera.relative_view().as_mat4().to_cols_array_2d(),
+                    projection: camera.projection().as_mat4().to_cols_array_2d(),
+                    viewport: [size[0] as f32, size[1] as f32],
+                    pixels_per_metre,
+                    ortho: camera.ortho as u32 as f32,
+                    depth_offset: if camera.ortho {
+                        camera.distance as f32
+                    } else {
+                        0.
+                    },
+                    padding: [0.; 3],
+                }),
+            );
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("lines"),
+                    contents: bytemuck::cast_slice(&line_vertices),
+                    usage: wgpu::BufferUsages::VERTEX,
+                })
+        });
         let edl = EdlUniform {
             radius: edl.radius,
             strength: edl.strength,
@@ -511,6 +610,12 @@ impl PointRenderer {
                 pass.set_vertex_buffer(1, node.flags.slice(..));
                 pass.set_vertex_buffer(2, node.spacings.slice(..));
                 pass.draw(0..6, 0..node.count);
+            }
+            if let Some(buffer) = &line_buffer {
+                pass.set_pipeline(&self.line_pipeline);
+                pass.set_bind_group(0, &self.line_bind, &[]);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..6, 0..line_vertices.len() as u32);
             }
         }
         {
@@ -625,6 +730,80 @@ fn uniform_slots(
         }],
     });
     (buffer, bind)
+}
+
+/// The pipeline for depth-tested lines, its uniform and bind group.
+fn line_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("lines"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("lines.wgsl").into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("lines"),
+        size: std::mem::size_of::<LineUniform>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("lines"),
+        layout: &layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform.as_entire_binding(),
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("lines"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vertex"),
+            compilation_options: Default::default(),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<LineVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &wgpu::vertex_attr_array![
+                    0=>Float32x3, 1=>Float32x3, 2=>Unorm8x4, 3=>Float32
+                ],
+            })],
+        },
+        primitive: Default::default(),
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Less),
+            stencil: Default::default(),
+            bias: Default::default(),
+        }),
+        multisample: Default::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fragment"),
+            compilation_options: Default::default(),
+            targets: &[Some(SCENE_FORMAT.into()), Some(VIEW_DEPTH_FORMAT.into())],
+        }),
+        multiview_mask: None,
+        cache: None,
+    });
+    (pipeline, uniform, bind)
 }
 
 fn edl_pipeline(device: &wgpu::Device) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout) {
