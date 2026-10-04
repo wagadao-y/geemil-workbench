@@ -812,6 +812,7 @@ dependencies = [
  "rfd",
  "serde",
  "serde_json",
+ "tempfile",
  "uuid",
  "wgpu",
 ]

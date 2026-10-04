@@ -2,8 +2,10 @@
 //! and rotate tool: like Potree's transformation tool, dragging an arrow moves
 //! the item along a world axis, dragging the square between X and Y moves it
 //! in the horizontal plane, and dragging a ring turns it about an axis, around
-//! the scanner position, or the centre of the box where there is none. A drag
-//! is previewed live and becomes one edit, which can be undone, when released.
+//! the scanner position, or the centre of the box where there is none.
+//! Double-clicking a displayed point puts the handles there instead, to turn
+//! about a feature that already matches. A drag is previewed live and becomes
+//! one edit, which can be undone, when released.
 use super::{Workbench, selection::Tool};
 use eframe::egui;
 use geemil_core::{Bounds, Camera, Pose, Project};
@@ -67,6 +69,9 @@ pub(super) fn plane_offset(start: Option<DVec3>, now: Option<DVec3>) -> Option<D
 pub(super) struct Gizmo {
     hover: Option<Handle>,
     drag: Option<Drag>,
+    /// Where the user put the handles of an item, in its own frame
+    /// ([`item_frame`]), so they move with it through edits and undo.
+    placed: Option<(Uuid, DVec3)>,
 }
 struct Drag {
     item: Uuid,
@@ -92,6 +97,10 @@ struct Drag {
 impl Gizmo {
     pub(super) fn dragging(&self) -> bool {
         self.drag.is_some()
+    }
+    /// Where the user put `item`'s handles, in its own frame.
+    fn placed(&self, item: Uuid) -> Option<DVec3> {
+        self.placed.filter(|(id, _)| *id == item).map(|(_, p)| p)
     }
     pub(super) fn cancel(&mut self) {
         self.drag = None;
@@ -136,7 +145,16 @@ pub(super) fn item_box(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<(D
 /// ([`Project::scanner_position`]), so a levelled scan turns about its
 /// instrument; else the centre of the item's box, for scans without one
 /// (LAS/LAZ keep no scanner position) and for folders.
-pub(super) fn item_pivot(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<DVec3> {
+/// `placed`, in the item's own frame, overrides both.
+pub(super) fn item_pivot(
+    p: &Project,
+    item: Uuid,
+    pose: Option<Pose>,
+    placed: Option<DVec3>,
+) -> Option<DVec3> {
+    if let Some(local) = placed {
+        return Some(item_frame(p, item, pose)?.transform_point3(local));
+    }
     if let Some(scan) = p.scan(item)
         && let Some(position) = p.scanner_position(scan)
     {
@@ -148,6 +166,21 @@ pub(super) fn item_pivot(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<
     }
     let (frame, bounds) = item_box(p, item, pose)?;
     Some(frame.transform_point3(bounds.center()))
+}
+
+/// An item's own frame in the project: a scan's world matrix, a folder's
+/// transform with the folders above. `pose` replaces the item's own transform.
+fn item_frame(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<DMat4> {
+    if let Some(scan) = p.scan(item) {
+        return Some(match pose {
+            Some(pose) => p.world_matrix_with(scan, item, pose),
+            None => p.world_matrix(scan),
+        });
+    }
+    p.groups().iter().any(|g| g.id == item).then(|| match pose {
+        Some(pose) => p.correction_with(item, item, pose),
+        None => p.correction(item),
+    })
 }
 
 /// Projects world points to the screen within `rect`.
@@ -436,6 +469,10 @@ impl Workbench {
         {
             self.gizmo.drag = None;
         }
+        // Handles put elsewhere belong to the item they were put for.
+        if self.gizmo.placed.is_some_and(|(id, _)| id != item) {
+            self.gizmo.placed = None;
+        }
         let rect = response.rect;
         let camera = self.camera;
         if let Some(drag) = &mut self.gizmo.drag {
@@ -481,7 +518,17 @@ impl Workbench {
             }
             return;
         }
-        let Some(center) = item_pivot(&p, item, None) else {
+        if response.double_clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+        {
+            let click = [
+                ((pos.x - rect.left()) / rect.width()) as f64,
+                ((pos.y - rect.top()) / rect.height()) as f64,
+            ];
+            self.place_handles(&p, item, click, [rect.width() as f64, rect.height() as f64]);
+            return;
+        }
+        let Some(center) = item_pivot(&p, item, None, self.gizmo.placed(item)) else {
             return;
         };
         let handles = Handles::new(&camera, rect, center);
@@ -528,6 +575,29 @@ impl Workbench {
             preview: None,
         });
     }
+    /// Puts the handles on the displayed point of any scan double-clicked at
+    /// `click` (normalized viewport coordinates); a double-click on no point
+    /// returns them to their default. `viewport` is in screen points.
+    pub(super) fn place_handles(
+        &mut self,
+        p: &Project,
+        item: Uuid,
+        click: [f64; 2],
+        viewport: [f64; 2],
+    ) {
+        let radius = self.settings.point_size as f64 / 2.;
+        let points = self.shown_points(true).map(|(.., p)| p);
+        let picked = super::navigation::pick(points, &self.camera, click, viewport, radius);
+        self.gizmo.placed = picked
+            .zip(item_frame(p, item, None))
+            .map(|(world, frame)| (item, frame.inverse().transform_point3(world)));
+        self.gizmo.hover = None;
+    }
+    /// For smoke tests: the handles of the selected item, in the project frame.
+    pub(super) fn smoke_handles(&self) -> Option<DVec3> {
+        let (p, item) = self.boxed_item()?;
+        item_pivot(&p, item, None, self.gizmo.placed(item))
+    }
     /// The selected item's box, and the handles while the tool is active.
     pub(super) fn draw_gizmo(&self, ui: &egui::Ui, rect: egui::Rect) {
         let Some((p, item)) = self.boxed_item() else {
@@ -549,8 +619,8 @@ impl Workbench {
         if !self.transforming() {
             return;
         }
-        let Some(handles) =
-            item_pivot(&p, item, pose).and_then(|center| Handles::new(&self.camera, rect, center))
+        let Some(handles) = item_pivot(&p, item, pose, self.gizmo.placed(item))
+            .and_then(|center| Handles::new(&self.camera, rect, center))
         else {
             return;
         };
@@ -578,9 +648,59 @@ impl Workbench {
 
 #[cfg(test)]
 mod tests {
-    use super::{Camera, Handle, Handles, plane_hit, plane_offset, ray, screen};
+    use super::{
+        Camera, Handle, Handles, item_frame, item_pivot, plane_hit, plane_offset, ray, screen,
+    };
     use eframe::egui;
-    use glam::DVec3;
+    use geemil_core::{ImportOptions, JobControl, Pose, Project, interchange};
+    use glam::{DMat4, DVec3};
+
+    #[test]
+    fn turning_about_placed_handles_keeps_that_point_and_they_follow_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("demo.e57");
+        interchange::create_demo(&source).unwrap();
+        let mut p = Project::create(&dir.path().join("p"), "Test").unwrap();
+        p.import_file(&source, ImportOptions::default(), &JobControl::default())
+            .unwrap();
+        let scan = p.scans().next().unwrap().id;
+        let folder = p.groups()[0].id;
+        for item in [scan, folder] {
+            // A point away from the default pivot, kept in the item's frame.
+            let point = DVec3::new(1.5, -0.8, 0.2);
+            let local = item_frame(&p, item, None)
+                .unwrap()
+                .inverse()
+                .transform_point3(point);
+            let own = p
+                .current()
+                .transforms
+                .get(&item)
+                .copied()
+                .unwrap_or_default();
+            let turn = DMat4::from_translation(point)
+                * DMat4::from_rotation_z(0.4)
+                * DMat4::from_translation(-point);
+            let turned = p.moved_pose(item, own, turn);
+            let pivot = item_pivot(&p, item, Some(turned), Some(local)).unwrap();
+            assert!(pivot.distance(point) < 1e-9, "{pivot:?}");
+            assert!(
+                item_pivot(&p, item, Some(turned), None)
+                    .unwrap()
+                    .distance(point)
+                    > 0.1
+            );
+
+            let shift = DVec3::new(2., 1., 0.);
+            let moved = p.moved_pose(item, own, DMat4::from_translation(shift));
+            let pivot = item_pivot(&p, item, Some(moved), Some(local)).unwrap();
+            assert!(pivot.distance(point + shift) < 1e-9);
+            p.set_transform(item, moved).unwrap();
+            let pivot = item_pivot(&p, item, None, Some(local)).unwrap();
+            assert!(pivot.distance(point + shift) < 1e-9);
+            p.set_transform(item, Pose::default()).unwrap();
+        }
+    }
 
     fn rect() -> egui::Rect {
         egui::Rect::from_min_size(egui::pos2(40., 30.), egui::vec2(1200., 800.))

@@ -18,3 +18,6 @@ serde_json.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 egui-phosphor = "0.14.0"
 image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[dev-dependencies]
+tempfile.workspace = true

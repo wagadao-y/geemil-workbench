@@ -531,6 +531,21 @@ impl Workbench {
                 });
                 self.select_tree_item(selected);
             }
+            "place-handles" => {
+                // Double-click the middle of the view with the move and rotate tool.
+                let before = self.smoke_handles();
+                if let Some(p) = self.project.clone()
+                    && let Some(item) = self.single_tree_item()
+                {
+                    let viewport = [self.camera.aspect * 1000., 1000.];
+                    self.place_handles(&p, item, [0.5, 0.5], viewport);
+                }
+                println!(
+                    "Smoke handles: before {:?} after {:?}",
+                    before.map(|v| v.to_array()),
+                    self.smoke_handles().map(|v| v.to_array())
+                );
+            }
             "show-layers" => {
                 let codes: Vec<_> = self
                     .project
