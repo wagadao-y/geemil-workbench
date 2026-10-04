@@ -9,6 +9,7 @@ pub struct ViewCacheStats {
     pub hits: u64,
     pub misses: u64,
     pub resident_bytes: usize,
+    pub hidden_bytes: usize,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
@@ -17,6 +18,11 @@ struct Key {
 }
 struct Entry {
     samples: Arc<[Sample]>,
+    used: u64,
+    bytes: usize,
+}
+struct HiddenEntry {
+    mask: Option<Arc<Vec<u8>>>,
     used: u64,
     bytes: usize,
 }
@@ -33,7 +39,7 @@ pub struct ViewCache {
     entries: HashMap<Key, Entry>,
     /// Hidden points per chunk for this epoch; none when nothing is hidden.
     /// Display nodes near the root hold points of many chunks.
-    hidden: HashMap<(Uuid, u32), Option<Arc<Vec<u8>>>>,
+    hidden: HashMap<(Uuid, u32), HiddenEntry>,
     limit: usize,
     clock: u64,
     stats: ViewCacheStats,
@@ -61,17 +67,59 @@ impl ViewCache {
     /// Evicts least recently used entries until `incoming` more bytes fit.
     fn evict(&mut self, incoming: usize) {
         while self.stats.resident_bytes + incoming > self.limit {
-            let Some(key) = self
+            let node = self
                 .entries
                 .iter()
                 .min_by_key(|(_, e)| e.used)
-                .map(|(key, _)| *key)
-            else {
+                .map(|(key, e)| (*key, e.used));
+            let hidden = self
+                .hidden
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(key, e)| (*key, e.used));
+            if let Some((key, used)) = hidden
+                && node.is_none_or(|(_, node_used)| used <= node_used)
+            {
+                let entry = self.hidden.remove(&key).unwrap();
+                self.stats.resident_bytes -= entry.bytes;
+                self.stats.hidden_bytes -= entry.bytes;
+            } else if let Some((key, _)) = node {
+                let entry = self.entries.remove(&key).unwrap();
+                self.stats.resident_bytes -= entry.bytes;
+            } else {
                 break;
-            };
-            let entry = self.entries.remove(&key).unwrap();
-            self.stats.resident_bytes -= entry.bytes;
+            }
         }
+    }
+    fn hidden_mask(
+        &mut self,
+        project: &Project,
+        scan: &Scan,
+        chunk: u32,
+    ) -> Result<Option<Arc<Vec<u8>>>> {
+        self.clock += 1;
+        if let Some(entry) = self.hidden.get_mut(&(scan.id, chunk)) {
+            entry.used = self.clock;
+            return Ok(entry.mask.clone());
+        }
+        let mask = (project.hidden_count(scan, chunk) > 0)
+            .then(|| project.hidden_mask(scan, chunk).map(Arc::new))
+            .transpose()?;
+        let bytes = mask.as_ref().map_or(0, |m| m.capacity()) + 128;
+        if bytes <= self.limit {
+            self.evict(bytes);
+            self.hidden.insert(
+                (scan.id, chunk),
+                HiddenEntry {
+                    mask: mask.clone(),
+                    used: self.clock,
+                    bytes,
+                },
+            );
+            self.stats.resident_bytes += bytes;
+            self.stats.hidden_bytes += bytes;
+        }
+        Ok(mask)
     }
     pub(crate) fn prepare(&mut self, project: &Project) {
         let state = project.current();
@@ -86,6 +134,7 @@ impl ViewCache {
             self.entries.clear();
             self.hidden.clear();
             self.stats.resident_bytes = 0;
+            self.stats.hidden_bytes = 0;
             self.epoch = Some(epoch);
         }
     }
@@ -136,21 +185,23 @@ impl ViewCache {
             samples.into()
         } else {
             let mut result = Vec::with_capacity(samples.len());
+            // Keep the last mask locally even when it cannot fit in the cache.
+            let mut last: Option<(u32, Option<Arc<Vec<u8>>>)> = None;
             for (i, sample) in samples.into_iter().enumerate() {
                 if i % 8192 == 0 {
                     job.check()?;
                 }
-                let hidden = match self.hidden.entry((scan.id, sample.chunk)) {
-                    std::collections::hash_map::Entry::Occupied(e) => e.get().clone(),
-                    std::collections::hash_map::Entry::Vacant(e) => e
-                        .insert(
-                            (project.hidden_count(scan, sample.chunk) > 0)
-                                .then(|| project.hidden_mask(scan, sample.chunk).map(Arc::new))
-                                .transpose()?,
-                        )
-                        .clone(),
-                };
-                if hidden.is_some_and(|hidden| is_set(&hidden, sample.index as usize)) {
+                if last
+                    .as_ref()
+                    .is_none_or(|(chunk, _)| *chunk != sample.chunk)
+                {
+                    last = Some((sample.chunk, self.hidden_mask(project, scan, sample.chunk)?));
+                }
+                let hidden = &last.as_ref().unwrap().1;
+                if hidden
+                    .as_ref()
+                    .is_some_and(|hidden| is_set(hidden, sample.index as usize))
+                {
                     continue;
                 }
                 result.push(sample);

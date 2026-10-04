@@ -470,6 +470,7 @@ fn import_e57(
             records: pc.records,
             valid_points: 0,
             omitted_attributes: vec![],
+            las: None,
             points_file: format!("{id}.points"),
             view_file: format!("{id}.view"),
             chunks: vec![],
@@ -574,14 +575,13 @@ fn import_las(
     let mut reader = las::Reader::from_path(source)?;
     let header = reader.header().clone();
     let id = Uuid::new_v4();
-    let mut omitted = vec![];
-    if header.point_format().has_gps_time {
-        omitted.push("GPS time".into());
-    }
-    if header.point_format().extra_bytes > 0 {
-        omitted.push("Extra Bytes".into());
-    }
-    omitted.push("Classification, return and other LAS attributes (prototype scope)".into());
+    ensure!(
+        !header.point_format().has_waveform,
+        CoreError::UnsupportedLasWaveform
+    );
+    let source_builder = las::Builder::from(header.clone());
+    let mut source_format = *header.point_format();
+    source_format.is_compressed = false;
     let mut schema = vec![
         Record {
             name: RecordName::CartesianX,
@@ -616,6 +616,7 @@ fn import_las(
     if let Some(vlr) = header
         .vlrs()
         .iter()
+        .chain(header.evlrs())
         .find(|v| v.user_id == "LASF_Projection" && v.record_id == 2112)
     {
         writer.set_coordinate_metadata(Some(
@@ -646,10 +647,28 @@ fn import_las(
         template: "metadata.e57".into(),
         template_index: 0,
         original_pose: None,
-        stride: 32 + raw_size(&schema),
+        stride: 32 + raw_size(&schema) + source_format.len() as usize,
         records: header.number_of_points(),
         valid_points: 0,
-        omitted_attributes: omitted,
+        omitted_attributes: vec![],
+        las: Some(crate::LasMetadata {
+            point_format: source_format.to_u8()?,
+            extra_bytes: source_format.extra_bytes,
+            record_offset: 32 + raw_size(&schema),
+            version: (source_builder.version.major, source_builder.version.minor),
+            gps_standard: source_builder.gps_time_type.is_standard(),
+            has_wkt_crs: source_builder.has_wkt_crs,
+            file_source_id: source_builder.file_source_id,
+            system_identifier: source_builder.system_identifier,
+            synthetic_returns: source_builder.has_synthetic_return_numbers,
+            vlrs: header
+                .vlrs()
+                .iter()
+                .filter(|v| v.user_id != "laszip encoded")
+                .map(crate::LasVlr::from)
+                .collect(),
+            evlrs: header.evlrs().iter().map(crate::LasVlr::from).collect(),
+        }),
         points_file: format!("{id}.points"),
         view_file: format!("{id}.view"),
         chunks: vec![],
@@ -696,7 +715,11 @@ fn import_las(
                     255,
                 ];
             }
-            out.write_all(&make_record(p, color, true, &encode(&raw)))?;
+            let mut record = make_record(p, color, true, &encode(&raw));
+            point
+                .into_raw(header.transforms())?
+                .write_to(&mut record, &source_format)?;
+            out.write_all(&record)?;
             match &mut bounds {
                 Some(b) => b.include(p),
                 None => bounds = Some(Bounds::at(p)),
@@ -842,7 +865,10 @@ impl Project {
                             job.check()?;
                         }
                         if !crate::layers::is_set(&hidden, i) {
-                            out.add_point(decode(&record[32..], &pc.prototype)?)?;
+                            out.add_point(decode(
+                                &record[32..32 + raw_size(&pc.prototype)],
+                                &pc.prototype,
+                            )?)?;
                         }
                     }
                 }

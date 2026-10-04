@@ -9,7 +9,7 @@ use super::{
 use crate::i18n::Strings;
 use eframe::egui::{self, Key, KeyboardShortcut, Modifiers};
 use egui_phosphor::regular as icon;
-use geemil_core::{ImportOptions, Project};
+use geemil_core::{ImportOptions, LasExportPolicy, Project};
 use std::{f64::consts::FRAC_PI_2, path::PathBuf};
 
 /// The steepest camera pitch; exactly vertical has no defined screen "up".
@@ -281,6 +281,8 @@ impl Workbench {
                 self.dialog = Some(Dialog::Export {
                     format: ExportFormat::E57,
                     per_scan: false,
+                    policy: LasExportPolicy::Preserve,
+                    compatibility: None,
                 })
             }
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
@@ -373,7 +375,13 @@ impl Workbench {
     }
 
     /// Asks where to write and exports the current state in the selected format.
-    pub(super) fn export(&mut self, ctx: &egui::Context, format: ExportFormat, per_scan: bool) {
+    pub(super) fn export(
+        &mut self,
+        ctx: &egui::Context,
+        format: ExportFormat,
+        per_scan: bool,
+        policy: LasExportPolicy,
+    ) {
         let Some(project) = self.project.as_ref() else {
             return;
         };
@@ -396,7 +404,7 @@ impl Workbench {
                 match format {
                     ExportFormat::E57 => project.export_e57(&path, &job)?,
                     ExportFormat::Las | ExportFormat::Laz => {
-                        project.export_las(&path, &job)?;
+                        project.export_las_with_policy(&path, policy, &job)?;
                     }
                 }
                 Ok(project)
@@ -437,6 +445,8 @@ impl Workbench {
                 self.settings.outlier_reach = reach;
             }
         }
+        project.filter_options.memory_bytes =
+            self.settings.filter_memory_mib.clamp(128, 4096) * 1024 * 1024;
         self.start(ctx, true, move |job| {
             match filter {
                 Filter::Subsample {

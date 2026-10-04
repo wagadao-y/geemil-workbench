@@ -44,6 +44,12 @@ fn main() -> eframe::Result<()> {
             .and_then(|i| args.get(i + 1))
             .map(std::path::PathBuf::from),
         orbit: args.iter().any(|a| a == "--smoke-orbit"),
+        orbit_seconds: args
+            .iter()
+            .position(|a| a == "--smoke-orbit-seconds")
+            .and_then(|i| args.get(i + 1))
+            .and_then(|v| v.to_str()?.parse::<f64>().ok())
+            .filter(|v| v.is_finite()),
         budget: args
             .iter()
             .position(|a| a == "--smoke-budget")

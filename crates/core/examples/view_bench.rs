@@ -1,4 +1,6 @@
 //! Repeatable CPU-side view loading measurement; excludes GPU upload/rendering.
+#[path = "support/metrics.rs"]
+mod metrics;
 use anyhow::{Result, ensure};
 use geemil_core::{Camera, JobControl, Project, ViewCache};
 use std::{path::Path, sync::Arc, time::Instant};
@@ -6,9 +8,25 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     ensure!(
         !args.is_empty(),
-        "Usage: view_bench PROJECT [BUDGET] [WORKERS]"
+        "Usage: view_bench PROJECT [BUDGET] [WORKERS] [REVISION_NAME]"
     );
-    let project = Arc::new(Project::load(Path::new(&args[0]))?);
+    metrics::phase("cpu_view", Path::new(&args[0]), || run(&args))
+}
+fn run(args: &[String]) -> Result<()> {
+    let mut project = Project::load(Path::new(&args[0]))?;
+    if let Some(name) = args.get(3) {
+        let revision = project
+            .manifest
+            .revisions
+            .iter()
+            .find(|r| &r.name == name)
+            .ok_or_else(|| anyhow::anyhow!("Revision name not found"))?
+            .id;
+        // Benchmark a saved state without writing or switching the project on disk.
+        project.manifest.current = revision;
+        project.manifest.draft = None;
+    }
+    let project = Arc::new(project);
     let budget = args
         .get(1)
         .map(|s| s.parse())

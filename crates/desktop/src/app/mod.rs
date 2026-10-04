@@ -71,6 +71,7 @@ pub(super) struct Settings {
     outlier_neighbours: u32,
     outlier_deviations: f64,
     outlier_reach: f64,
+    filter_memory_mib: usize,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -92,6 +93,7 @@ impl Default for Settings {
             outlier_neighbours: 6,
             outlier_deviations: 1.0,
             outlier_reach: 0.5,
+            filter_memory_mib: 768,
         }
     }
 }

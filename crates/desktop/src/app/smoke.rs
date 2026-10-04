@@ -16,6 +16,8 @@ pub struct SmokeOptions {
     pub budget: Option<usize>,
     /// Orbit for the first two seconds; at least one view must load while moving.
     pub orbit: bool,
+    /// Longer orbit runs, with UI callback interval percentiles in the log.
+    pub orbit_seconds: Option<f64>,
     /// Replace the view with fixed colour probes and check them in the capture.
     pub colors: bool,
     /// Select the centre of the view after one second and preview this move
@@ -46,6 +48,9 @@ pub struct SmokeOptions {
 pub(super) struct SmokeTest {
     screenshot: Option<PathBuf>,
     orbit: bool,
+    orbit_duration: Duration,
+    last_frame: Option<Instant>,
+    frame_intervals_ms: Vec<f64>,
     budget: Option<usize>,
     pub(super) colors: bool,
     select: Option<(SelectionMode, bool)>,
@@ -64,6 +69,11 @@ impl SmokeTest {
         Self {
             screenshot: options.screenshot,
             orbit: options.orbit,
+            orbit_duration: Duration::from_secs_f64(
+                options.orbit_seconds.unwrap_or(2.).clamp(2., 3600.),
+            ),
+            last_frame: None,
+            frame_intervals_ms: vec![],
             budget: options.budget,
             colors: options.colors,
             select: options.select,
@@ -92,7 +102,7 @@ impl SmokeTest {
         if !partial {
             self.cpu_finished = self.view_started.map(|start| start.elapsed());
         }
-        if interactive && points > 0 && self.started.elapsed() < Duration::from_secs(2) {
+        if interactive && points > 0 && self.started.elapsed() < self.orbit_duration {
             self.moving_updates += 1;
         }
     }
@@ -175,10 +185,14 @@ impl Workbench {
                 "export-las" => Some(Dialog::Export {
                     format: super::dialogs::ExportFormat::Laz,
                     per_scan: false,
+                    policy: geemil_core::LasExportPolicy::Preserve,
+                    compatibility: None,
                 }),
                 "export" | "export-e57" => Some(Dialog::Export {
                     format: super::dialogs::ExportFormat::E57,
                     per_scan: false,
+                    policy: geemil_core::LasExportPolicy::Preserve,
+                    compatibility: None,
                 }),
                 "subsample" => Some(Dialog::Filter(
                     super::dialogs::Filter::Subsample {
@@ -208,10 +222,19 @@ impl Workbench {
         };
         let path = &path;
         let smoke = &mut self.smoke;
-        if smoke.orbit && smoke.started.elapsed() < Duration::from_secs(2) {
+        if smoke.orbit && smoke.started.elapsed() < smoke.orbit_duration {
+            let now = Instant::now();
+            if let Some(last) = smoke.last_frame.replace(now)
+                && smoke.started.elapsed() > Duration::from_secs(1)
+            {
+                smoke
+                    .frame_intervals_ms
+                    .push(now.duration_since(last).as_secs_f64() * 1000.);
+            }
             let t = smoke.started.elapsed().as_secs_f64();
             self.camera.yaw = smoke.camera.yaw + t * 0.3;
-            self.camera.target[0] = smoke.camera.target[0] + t * smoke.camera.distance * 0.01;
+            self.camera.target[0] =
+                smoke.camera.target[0] + (t * 0.7).sin() * smoke.camera.distance * 0.02;
             self.dirty = true;
             ctx.request_repaint();
         }
@@ -264,6 +287,22 @@ impl Workbench {
                     "Smoke test: {} updates during motion, {} final points, {:.1} ms view load",
                     smoke.moving_updates, shown, self.view_ms
                 );
+                if !smoke.frame_intervals_ms.is_empty() {
+                    smoke.frame_intervals_ms.sort_by(f64::total_cmp);
+                    let frames = &smoke.frame_intervals_ms;
+                    let percentile = |p: f64| {
+                        frames[((frames.len() as f64 * p).ceil() as usize)
+                            .saturating_sub(1)
+                            .min(frames.len() - 1)]
+                    };
+                    eprintln!(
+                        "Smoke UI frame intervals: samples {}, p50 {:.2} ms, p95 {:.2} ms, p99 {:.2} ms (UI callbacks; excludes GPU fence/presentation measurement)",
+                        frames.len(),
+                        percentile(0.5),
+                        percentile(0.95),
+                        percentile(0.99)
+                    );
+                }
                 if let Some(error) = &self.error {
                     eprintln!("Smoke test error: {} {:?}", error.message, error.detail);
                 }
@@ -294,12 +333,12 @@ impl Workbench {
             && self.job.is_none()
             && (!self.nodes.is_empty() || empty)
             && !self.renderer.as_ref().is_some_and(|r| r.pending())
-            && smoke.started.elapsed() > Duration::from_secs(3)
+            && smoke.started.elapsed() > smoke.orbit_duration + Duration::from_secs(1)
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             smoke.requested = true;
         }
-        if smoke.started.elapsed() > Duration::from_secs(20) {
+        if smoke.started.elapsed() > smoke.orbit_duration + Duration::from_secs(120) {
             eprintln!("Smoke test timed out: {:?}", self.error);
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }

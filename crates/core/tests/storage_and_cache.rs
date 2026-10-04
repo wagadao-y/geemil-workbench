@@ -302,6 +302,21 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
             .points()
             .is_empty()
     );
+    // Hidden masks and empty node overhead share the same tiny budget.
+    let mut tiny = ViewCache::new(128);
+    for _ in 0..3 {
+        assert!(
+            p.load_view_cached(&camera, 100_000, &[id], &JobControl::default(), &mut tiny)
+                .unwrap()
+                .points()
+                .is_empty()
+        );
+        assert!(tiny.stats().resident_bytes <= 128);
+        assert!(tiny.stats().hidden_bytes <= tiny.stats().resident_bytes);
+    }
+    tiny.set_point_limit(0);
+    assert_eq!(tiny.stats().resident_bytes, 0);
+    assert_eq!(tiny.stats().hidden_bytes, 0);
     p.switch(base).unwrap();
     assert_eq!(
         a,
@@ -317,6 +332,54 @@ fn camera_reuses_cache_and_revision_changes_invalidate_it() {
             .points()
     );
     assert!(small.stats().resident_bytes <= 128);
+}
+
+#[test]
+fn partially_hidden_masks_share_the_view_cache_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = fixture(dir.path());
+    let id = p.scans().next().unwrap().id;
+    let camera = Camera {
+        target: p.bounds().center().to_array(),
+        distance: 30.,
+        ..Camera::default()
+    };
+    let job = JobControl::default();
+    p.move_selection(
+        &Selection {
+            camera,
+            polygon: vec![[0., 0.], [0.5, 0.], [0.5, 1.], [0., 1.]],
+            depth_meters: None,
+            mode: SelectionMode::ExcludeInside,
+        },
+        &[id],
+        &p.layer_named("Hidden"),
+        &job,
+    )
+    .unwrap();
+    let mut cache = ViewCache::new(8 * 1024 * 1024);
+    let reference = p
+        .load_view_cached(&camera, 100_000, &[id], &job, &mut cache)
+        .unwrap()
+        .points();
+    assert!(!reference.is_empty());
+    assert!(cache.stats().hidden_bytes > 0);
+    for limit in [0, 128, 512, 8192] {
+        let mut tiny = ViewCache::new(limit);
+        for _ in 0..3 {
+            assert_eq!(
+                reference,
+                p.load_view_cached(&camera, 100_000, &[id], &job, &mut tiny)
+                    .unwrap()
+                    .points()
+            );
+            assert!(tiny.stats().resident_bytes <= limit);
+            assert!(tiny.stats().hidden_bytes <= tiny.stats().resident_bytes);
+        }
+        tiny.set_point_limit(0);
+        assert_eq!(tiny.stats().resident_bytes, 0);
+        assert_eq!(tiny.stats().hidden_bytes, 0);
+    }
 }
 
 /// The display octree is additive like Potree 2's: every valid original point

@@ -222,6 +222,43 @@ fn filters_reject_invalid_parameters_and_cancel_without_a_layer() {
 }
 
 #[test]
+fn filter_memory_budget_limits_workers_and_rejects_impossible_allocations() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut single = project(dir.path(), "one", 64);
+    let mut bounded = project(dir.path(), "bounded", 64);
+    single.filter_options.worker_threads = 1;
+    bounded.filter_options.memory_bytes = 64 * 1024 * 1024;
+    bounded.filter_options.worker_threads = 16;
+    for p in [&mut single, &mut bounded] {
+        p.remove_noise(
+            0.15,
+            3,
+            &ids(p),
+            &p.layer_named("Noise"),
+            &JobControl::default(),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        sorted_bits(&surviving(&single)),
+        sorted_bits(&surviving(&bounded))
+    );
+    bounded.filter_options.memory_bytes = 1;
+    let before = bounded.current().id;
+    assert!(
+        bounded
+            .subsample(
+                0.05,
+                &ids(&bounded),
+                &bounded.layer_named("Thinned"),
+                &JobControl::default()
+            )
+            .is_err()
+    );
+    assert_eq!(bounded.current().id, before);
+}
+
+#[test]
 fn tilted_box_uses_its_local_axes_for_clipping() {
     use geemil_core::CropBox;
     use glam::{DQuat, DVec3};

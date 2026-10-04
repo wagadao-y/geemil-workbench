@@ -3,7 +3,7 @@ use super::{Settings, Workbench, layers::destination_combo, revisions::Revisions
 use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
-use geemil_core::Project;
+use geemil_core::{LasExportCompatibility, LasExportPolicy, Project};
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -42,6 +42,8 @@ pub(super) enum Dialog {
     Export {
         format: ExportFormat,
         per_scan: bool,
+        policy: LasExportPolicy,
+        compatibility: Option<Result<LasExportCompatibility, String>>,
     },
     Shortcuts,
     About,
@@ -131,6 +133,7 @@ enum Outcome {
     Export {
         format: ExportFormat,
         per_scan: bool,
+        policy: LasExportPolicy,
     },
 }
 
@@ -355,6 +358,16 @@ impl Workbench {
                         });
                     }
                     ui.small((t.filter_targets)(visible));
+                    ui.horizontal(|ui| {
+                        ui.label(t.filter_memory);
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.filter_memory_mib)
+                                .range(128..=4096)
+                                .speed(64)
+                                .suffix(" MiB"),
+                        )
+                        .on_hover_text(t.filter_memory_hint);
+                    });
                     if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.run).clicked() {
                             outcome = Outcome::Filter(*filter, *destination);
@@ -363,7 +376,12 @@ impl Workbench {
                         outcome = Outcome::Close;
                     }
                 }
-                Dialog::Export { format, per_scan } => {
+                Dialog::Export {
+                    format,
+                    per_scan,
+                    policy,
+                    compatibility,
+                } => {
                     ui.heading(format!(
                         "{} {}",
                         icon::EXPORT,
@@ -380,16 +398,84 @@ impl Workbench {
                     ui.add_space(6.);
                     if *format == ExportFormat::E57 {
                         ui.label(t.export_e57_message);
+                        if project
+                            .as_ref()
+                            .is_some_and(|p| p.scans().any(|s| s.las.is_some()))
+                        {
+                            ui.colored_label(
+                                ui.visuals().warn_fg_color,
+                                t.export_las_to_e57_notice,
+                            );
+                        }
                     } else {
                         ui.label(t.export_las_message);
                         ui.radio_value(per_scan, false, t.export_merged);
                         ui.radio_value(per_scan, true, t.export_per_scan);
+                        if !*per_scan {
+                            let report = compatibility.get_or_insert_with(|| {
+                                project.as_ref().map_or_else(
+                                    || Ok(LasExportCompatibility::default()),
+                                    |p| p.las_export_compatibility().map_err(|e| format!("{e:#}")),
+                                )
+                            });
+                            ui.radio_value(
+                                policy,
+                                LasExportPolicy::Preserve,
+                                t.export_preserve_attributes,
+                            );
+                            ui.radio_value(
+                                policy,
+                                LasExportPolicy::OmitIncompatible,
+                                t.export_omit_incompatible,
+                            );
+                            match report {
+                                Ok(report) if report.has_conflicts() => {
+                                    ui.colored_label(
+                                        ui.visuals().warn_fg_color,
+                                        t.export_conflicts,
+                                    );
+                                    egui::ScrollArea::vertical()
+                                        .max_height(150.)
+                                        .show(ui, |ui| {
+                                            if report.omit_extra_bytes {
+                                                ui.label(t.export_omit_extra);
+                                            }
+                                            if report.omit_gps_time {
+                                                ui.label(t.export_omit_gps);
+                                            }
+                                            if report.omit_crs {
+                                                ui.label(t.export_omit_crs);
+                                            }
+                                            for (user, id) in &report.omitted_metadata {
+                                                ui.label(format!("VLR/EVLR: {user} / {id}"));
+                                            }
+                                        });
+                                }
+                                Ok(_) => {
+                                    ui.small(t.export_no_conflicts);
+                                }
+                                Err(error) => {
+                                    ui.colored_label(ui.visuals().error_fg_color, error.as_str());
+                                }
+                            }
+                        }
                     }
+                    let allowed = *format == ExportFormat::E57
+                        || *per_scan
+                        || compatibility.as_ref().is_some_and(|r| {
+                            r.as_ref().is_ok_and(|r| {
+                                *policy == LasExportPolicy::OmitIncompatible || !r.has_conflicts()
+                            })
+                        });
                     if buttons(ui, t.cancel, |ui| {
-                        if ui.button(t.export_button).clicked() {
+                        if ui
+                            .add_enabled(allowed, egui::Button::new(t.export_button))
+                            .clicked()
+                        {
                             outcome = Outcome::Export {
                                 format: *format,
                                 per_scan: *per_scan,
+                                policy: *policy,
                             };
                         }
                     }) {
@@ -479,9 +565,13 @@ impl Workbench {
                 self.dialog = None;
                 self.run_filter(ctx, filter, destination);
             }
-            Outcome::Export { format, per_scan } => {
+            Outcome::Export {
+                format,
+                per_scan,
+                policy,
+            } => {
                 self.dialog = None;
-                self.export(ctx, format, per_scan);
+                self.export(ctx, format, per_scan, policy);
             }
         }
     }

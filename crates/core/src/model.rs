@@ -140,6 +140,9 @@ pub struct Scan {
     pub records: u64,
     pub valid_points: u64,
     pub omitted_attributes: Vec<String>,
+    /// LAS-only source attributes appended after the E57 numeric record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub las: Option<LasMetadata>,
     pub points_file: String,
     /// The display octree's points.
     pub view_file: String,
@@ -148,6 +151,68 @@ pub struct Scan {
     pub chunks: Vec<Chunk>,
     /// The display octree.
     pub nodes: Vec<Node>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LasVlr {
+    pub user_id: String,
+    pub record_id: u16,
+    pub description: String,
+    pub data: Vec<u8>,
+}
+impl LasVlr {
+    /// File offsets/chunk layout must be regenerated after editing. Ordinary
+    /// LAS/LAZ output is not COPC, so it cannot reuse COPC's hierarchy pointers.
+    pub fn is_output_metadata(&self) -> bool {
+        self.user_id != "copc" && self.user_id != "laszip encoded"
+    }
+}
+impl From<&las::Vlr> for LasVlr {
+    fn from(v: &las::Vlr) -> Self {
+        Self {
+            user_id: v.user_id.clone(),
+            record_id: v.record_id,
+            description: v.description.clone(),
+            data: v.data.clone(),
+        }
+    }
+}
+impl From<&LasVlr> for las::Vlr {
+    fn from(v: &LasVlr) -> Self {
+        Self {
+            user_id: v.user_id.clone(),
+            record_id: v.record_id,
+            description: v.description.clone(),
+            data: v.data.clone(),
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct LasMetadata {
+    pub point_format: u8,
+    pub extra_bytes: u16,
+    pub record_offset: usize,
+    pub version: (u8, u8),
+    pub gps_standard: bool,
+    pub has_wkt_crs: bool,
+    pub file_source_id: u16,
+    pub system_identifier: String,
+    pub synthetic_returns: bool,
+    pub vlrs: Vec<LasVlr>,
+    pub evlrs: Vec<LasVlr>,
+}
+impl LasMetadata {
+    pub fn format(&self) -> Result<las::point::Format> {
+        ensure!(self.point_format <= 10, "Invalid LAS point format");
+        let mut format = las::point::Format::new(self.point_format)?;
+        ensure!(
+            format.len().checked_add(self.extra_bytes).is_some(),
+            "LAS record length exceeds u16"
+        );
+        format.is_compressed = false;
+        format.extra_bytes = self.extra_bytes;
+        Ok(format)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ImageInfo {
@@ -317,6 +382,9 @@ pub(crate) fn patch_metadata_path(patch: &LabelPatch) -> String {
 pub struct Project {
     pub root: PathBuf,
     pub manifest: Manifest,
+    pub filter_options: crate::FilterOptions,
+    // Kept alive by UI, worker and undo-state clones, including during reload.
+    pub(crate) _lock: std::sync::Arc<fs::File>,
 }
 impl Project {
     pub fn create(root: &Path, name: &str) -> Result<Self> {
@@ -328,6 +396,8 @@ impl Project {
         let id = Uuid::new_v4();
         let p = Self {
             root: fs::canonicalize(root)?,
+            _lock: crate::project_lock::acquire(&fs::canonicalize(root)?)?,
+            filter_options: crate::FilterOptions::default(),
             manifest: Manifest {
                 format_version: FORMAT_VERSION,
                 name: name.into(),
@@ -364,6 +434,7 @@ impl Project {
             CoreError::NotAProject(root.to_owned())
         );
         let root = fs::canonicalize(root)?;
+        let lock = crate::project_lock::acquire(&root)?;
         let value: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join("project.json"))?)
                 .context("Invalid project metadata")?;
@@ -430,9 +501,23 @@ impl Project {
         for state in manifest.revisions.iter().chain(&manifest.draft) {
             crate::history::validate_state(&manifest, state)?;
         }
-        let p = Self { root, manifest };
+        let p = Self {
+            root,
+            manifest,
+            _lock: lock,
+            filter_options: crate::FilterOptions::default(),
+        };
         for s in &p.manifest.scans {
             ensure!((32..=1_048_576).contains(&s.stride), "Invalid point stride");
+            if let Some(las) = &s.las {
+                let format = las.format()?;
+                ensure!(
+                    !format.has_waveform
+                        && las.record_offset >= 32
+                        && las.record_offset.checked_add(format.len() as usize) == Some(s.stride),
+                    "Invalid LAS record layout"
+                );
+            }
             p.path(&s.template)?;
             p.path(&s.points_file)?;
             p.path(&s.view_file)?;

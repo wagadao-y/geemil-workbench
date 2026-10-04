@@ -58,6 +58,10 @@ pub enum CoreError {
     UnsupportedFormat,
     OutputExists(PathBuf),
     ProjectExists(PathBuf),
+    ProjectLocked(PathBuf),
+    LasMetadataMismatch,
+    UnsupportedLasWaveform,
+    FilterMemoryBudgetTooSmall,
     NotAProject(PathBuf),
     UnsupportedProjectFormat(u32),
     CoordinateSystemMismatch,
@@ -79,6 +83,19 @@ impl fmt::Display for CoreError {
             Self::OutputExists(p) => write!(f, "Output already exists: {}", p.display()),
             Self::ProjectExists(p) => {
                 write!(f, "Project directory already exists: {}", p.display())
+            }
+            Self::ProjectLocked(p) => {
+                write!(f, "Project is open in another process: {}", p.display())
+            }
+            Self::LasMetadataMismatch => write!(
+                f,
+                "LAS attribute definitions or GPS time types differ; export per scan"
+            ),
+            Self::UnsupportedLasWaveform => {
+                write!(f, "LAS waveform packet data cannot be preserved yet")
+            }
+            Self::FilterMemoryBudgetTooSmall => {
+                write!(f, "Filter memory budget too small for one chunk")
             }
             Self::NotAProject(p) => write!(f, "Not a project directory: {}", p.display()),
             Self::UnsupportedProjectFormat(v) => write!(f, "Unsupported project format {v}"),
