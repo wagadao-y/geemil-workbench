@@ -484,9 +484,10 @@ impl Project {
             }
         }
         job.check()?;
+        let scans = self.scans_record(scan_ids);
         labels.commit(
             self,
-            serde_json::json!({"kind": "selection", "selection": selection, "scans": scan_ids,
+            serde_json::json!({"kind": "selection", "selection": selection, "scans": scans,
                 "nearest": nearest}),
             |_| Ok(()),
             false,

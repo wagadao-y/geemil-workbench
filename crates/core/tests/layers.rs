@@ -75,6 +75,8 @@ fn moved_points_belong_to_one_layer_and_come_back_in_part_or_whole() {
         (op["moved"].as_u64(), op["target"].as_u64()),
         (Some(left), Some(deleted.code as u64))
     );
+    // Applied to every scan of the state, the record does not list them.
+    assert_eq!(op["scans"], "all");
 
     // A second move to the same layer reuses it; nothing is in two layers.
     let right = p
@@ -244,4 +246,36 @@ fn cached_view_estimates_follow_moves_undo_and_layer_visibility() {
     // for the current one.
     p.restore_working_state(before).unwrap();
     assert_eq!(shown(&p, &mut cache), total);
+}
+
+#[test]
+fn edit_records_name_the_shorter_of_the_scans_used_or_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    p.import_file(
+        &dir.path().join("demo.e57"),
+        ImportOptions::default(),
+        &JobControl::default(),
+    )
+    .unwrap();
+    let all = ids(&p);
+    assert_eq!(all.len(), 4);
+    // Each move takes points not moved yet, so it records an edit.
+    let record = |p: &mut Project, scans: &[uuid::Uuid], left: bool| {
+        let target = p.layer_named("Deleted");
+        p.move_selection(&half(p, left), scans, &target, &JobControl::default())
+            .unwrap();
+        p.current().operation["operations"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["scans"]
+            .clone()
+    };
+    assert_eq!(record(&mut p, &all[3..], true), serde_json::json!([all[3]]));
+    assert_eq!(
+        record(&mut p, &all[..3], true),
+        serde_json::json!({ "except": [all[3]] })
+    );
+    assert_eq!(record(&mut p, &all, false), "all");
 }

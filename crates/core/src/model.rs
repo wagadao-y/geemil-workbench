@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::Write,
+    io::{BufWriter, Write},
     path::{Component, Path, PathBuf},
 };
 use uuid::Uuid;
@@ -581,15 +581,21 @@ impl Project {
     fn write_atomic(
         &self,
         path: &Path,
-        write: impl FnOnce(&mut fs::File) -> Result<()>,
+        write: impl FnOnce(&mut BufWriter<fs::File>) -> Result<()>,
     ) -> Result<()> {
         let tmp = self.root.join(format!("project-{}.tmp", Uuid::new_v4()));
-        let mut f = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)?;
-        let written = write(&mut f).and_then(|_| Ok(f.sync_all()?));
-        drop(f);
+        // serde_json writes token by token; unbuffered, a history of a few
+        // MB took over a second in small system calls.
+        let mut f = BufWriter::with_capacity(1 << 20, file);
+        let written = write(&mut f).and_then(|_| {
+            let file = f.into_inner().map_err(|e| e.into_error())?;
+            file.sync_all()?;
+            Ok(())
+        });
         if let Err(e) = written {
             let _ = fs::remove_file(&tmp);
             return Err(e);

@@ -616,7 +616,7 @@ impl Project {
             scan_ids,
             Stage::Subsampling,
             target,
-            serde_json::json!({"kind": "subsample", "size": size, "scans": scan_ids}),
+            serde_json::json!({"kind": "subsample", "size": size, "scans": self.scans_record(scan_ids)}),
             job,
             |cache, chunk, job| subsample_chunk(cache, chunk, size, job),
         )
@@ -678,7 +678,7 @@ impl Project {
         labels.commit(
             self,
             serde_json::json!({"kind": "subsample", "size": size, "merged": true,
-                "scans": scan_ids}),
+                "scans": self.scans_record(scan_ids)}),
             |_| Ok(()),
             false,
         )
@@ -700,7 +700,7 @@ impl Project {
             Stage::NoiseFilter,
             target,
             serde_json::json!({"kind": "noise_filter", "radius": radius,
-                "min_neighbours": min_neighbours, "scans": scan_ids}),
+                "min_neighbours": min_neighbours, "scans": self.scans_record(scan_ids)}),
             job,
             |cache, chunk, job| noise_chunk(cache, chunk, radius, min_neighbours, job),
         )
@@ -731,7 +731,7 @@ impl Project {
             scan_ids,
             Stage::BoxCrop,
             target,
-            serde_json::json!({"kind": "box", "box": crop, "inside": inside, "scans": scan_ids}),
+            serde_json::json!({"kind": "box", "box": crop, "inside": inside, "scans": self.scans_record(scan_ids)}),
             job,
             |cache, chunk, job| {
                 let to_box = unit * cache.project.world_matrix(cache.scan);
@@ -840,7 +840,7 @@ impl Project {
         labels.commit(
             self,
             serde_json::json!({"kind": "outlier_filter", "neighbours": neighbours,
-                "deviations": deviations, "max_distance": max_distance, "scans": scan_ids}),
+                "deviations": deviations, "max_distance": max_distance, "scans": self.scans_record(scan_ids)}),
             |_| Ok(()),
             false,
         )

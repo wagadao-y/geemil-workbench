@@ -8,7 +8,7 @@ use crate::{DEFAULT_LAYER, FORMAT_VERSION, Manifest, Project, Revision};
 use anyhow::{Result, ensure};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     fs,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -103,6 +103,24 @@ impl Project {
         next.save()?;
         *self = next;
         Ok(())
+    }
+    /// How an operation records the scans of the current state it applied
+    /// to: `"all"`, `{"except": [...]}` naming the ones left out, or the list,
+    /// whichever is shortest. Every edit keeps its record in the working
+    /// state and its undo snapshots, so a list of hundreds of scans per edit
+    /// made the history grow with edits times scans.
+    pub(crate) fn scans_record(&self, ids: &[Uuid]) -> Value {
+        let state = &self.current().scans;
+        let wanted: HashSet<&Uuid> = ids.iter().collect();
+        let applied: Vec<&Uuid> = state.iter().filter(|id| wanted.contains(id)).collect();
+        let skipped: Vec<&Uuid> = state.iter().filter(|id| !wanted.contains(id)).collect();
+        if skipped.is_empty() {
+            json!("all")
+        } else if skipped.len() < applied.len() {
+            json!({ "except": skipped })
+        } else {
+            json!(applied)
+        }
     }
     pub fn has_unsaved_changes(&self) -> bool {
         self.manifest.draft.is_some()
