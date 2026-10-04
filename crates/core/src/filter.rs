@@ -51,56 +51,68 @@ impl ChunkPoints {
     }
 }
 
-/// A small LRU of decoded chunks shared by the workers filtering one scan.
+/// A scan's view of the decoded chunks one filter keeps: a small LRU shared
+/// by the workers and by the caches of every scan the filter reads, within
+/// one budget, so a filter over many scans keeps as much as one over few.
 struct ChunkCache<'a> {
     project: &'a Project,
     scan: &'a Scan,
+    shared: Arc<SharedChunks>,
+    /// Whether to drop the scan's chunks once they are done, for filters
+    /// that read only the scan they judge.
+    release: bool,
+}
+struct SharedChunks {
     state: Mutex<CacheState>,
     limit: usize,
-    /// Whether to empty the cache once its scan's chunks are done, for
-    /// filters that read only the scan they judge.
-    release: bool,
 }
 #[derive(Default)]
 struct CacheState {
-    entries: HashMap<u32, (Arc<ChunkPoints>, u64)>,
+    entries: HashMap<(Uuid, u32), (Arc<ChunkPoints>, u64)>,
     clock: u64,
     bytes: usize,
 }
 impl<'a> ChunkCache<'a> {
     #[cfg(test)]
     fn new(project: &'a Project, scan: &'a Scan) -> Self {
-        Self::with_limit(project, scan, project.filter_options.memory_bytes / 4)
+        Self::for_scans(project, &[scan], false).remove(0)
     }
-    fn with_limit(project: &'a Project, scan: &'a Scan, limit: usize) -> Self {
-        Self {
-            project,
-            scan,
+    /// One cache per scan over a quarter of the filter memory together;
+    /// with `release`, each scan's chunks leave once that scan is done.
+    fn for_scans(project: &'a Project, scans: &[&'a Scan], release: bool) -> Vec<Self> {
+        let shared = Arc::new(SharedChunks {
             state: Mutex::default(),
-            limit,
-            release: false,
-        }
-    }
-    /// One cache per scan, each read only for its own scan and emptied once
-    /// that scan is done. Workers stay a few chunks ahead, so besides scans
-    /// with fewer chunks than that, at most two scans (one finishing, one
-    /// starting) hold points at a time: each gets half the usual share.
-    fn for_scans(project: &'a Project, scans: &[&'a Scan]) -> Vec<Self> {
-        let limit = project.filter_options.memory_bytes / 8;
+            limit: project.filter_options.memory_bytes / 4,
+        });
         scans
             .iter()
             .map(|scan| Self {
-                release: true,
-                ..Self::with_limit(project, scan, limit)
+                project,
+                scan,
+                shared: shared.clone(),
+                release,
             })
             .collect()
     }
+    /// Drops the scan's chunks from the shared cache.
+    fn release(&self) {
+        let mut state = self.shared.state.lock().unwrap();
+        let mut freed = 0;
+        state.entries.retain(|(scan, _), (points, _)| {
+            let keep = *scan != self.scan.id;
+            if !keep {
+                freed += points.bytes();
+            }
+            keep
+        });
+        state.bytes -= freed;
+    }
     fn get(&self, chunk: u32, job: &JobControl) -> Result<Arc<ChunkPoints>> {
         {
-            let mut state = self.state.lock().unwrap();
+            let mut state = self.shared.state.lock().unwrap();
             state.clock += 1;
             let clock = state.clock;
-            if let Some((points, used)) = state.entries.get_mut(&chunk) {
+            if let Some((points, used)) = state.entries.get_mut(&(self.scan.id, chunk)) {
                 *used = clock;
                 return Ok(points.clone());
             }
@@ -126,8 +138,9 @@ impl<'a> ChunkCache<'a> {
         drop(hidden);
         let points = Arc::new(points);
         let bytes = points.bytes();
-        let mut state = self.state.lock().unwrap();
-        while state.bytes + bytes > self.limit {
+        let limit = self.shared.limit;
+        let mut state = self.shared.state.lock().unwrap();
+        while state.bytes + bytes > limit {
             let Some(oldest) = state
                 .entries
                 .iter()
@@ -140,8 +153,11 @@ impl<'a> ChunkCache<'a> {
             state.bytes -= old.bytes();
         }
         let clock = state.clock;
-        if bytes <= self.limit {
-            if let Some((old, _)) = state.entries.insert(chunk, (points.clone(), clock)) {
+        if bytes <= limit {
+            if let Some((old, _)) = state
+                .entries
+                .insert((self.scan.id, chunk), (points.clone(), clock))
+            {
                 state.bytes -= old.bytes();
             }
             state.bytes += bytes;
@@ -527,11 +543,8 @@ impl<'a> Merged<'a> {
             .scans()
             .filter(|s| scan_ids.contains(&s.id))
             .collect();
-        let limit = project.filter_options.memory_bytes / 4 / scans.len().max(1);
-        let caches = scans
-            .iter()
-            .map(|s| ChunkCache::with_limit(project, s, limit))
-            .collect();
+        // Any scan's chunks may be a neighbour, so none leave early.
+        let caches = ChunkCache::for_scans(project, &scans, false);
         let worlds: Vec<_> = scans.iter().map(|s| project.world_matrix(s)).collect();
         let boxes = scans
             .iter()
@@ -1274,7 +1287,7 @@ impl Project {
         let filtering = Progress::new(Stage::OutlierFilter, &scans, 1);
         let mut labels = LabelWriter::new(self, target)?;
         let moving = labels.target();
-        let caches = ChunkCache::for_scans(self, &scans);
+        let caches = ChunkCache::for_scans(self, &scans, true);
         // The first pass keeps each point's mean distance in a scratch file
         // (NaN where too few neighbours are in reach), so the second pass
         // need not search again. Statistics and thresholds are per scan.
@@ -1389,7 +1402,7 @@ impl Project {
         let progress = Progress::new(stage, &scans, 1);
         let mut labels = LabelWriter::new(self, target)?;
         let moving = labels.target();
-        let caches = ChunkCache::for_scans(self, &scans);
+        let caches = ChunkCache::for_scans(self, &scans, true);
         each_chunk(
             &caches,
             job,
@@ -1480,7 +1493,8 @@ fn relabelled(
 /// Runs `work` on every chunk of the caches' scans, scan after scan, on
 /// worker threads started once, and consumes the results in that order;
 /// the first error stops the rest. A scan's cache from
-/// [`ChunkCache::for_scans`] is emptied once its last chunk is consumed.
+/// [`ChunkCache::for_scans`] with `release` drops its chunks once its last
+/// chunk is consumed.
 fn each_chunk<R: Send>(
     caches: &[ChunkCache],
     job: &JobControl,
@@ -1510,7 +1524,7 @@ fn each_chunk<R: Send>(
             consume(si, chunk, result)?;
             let cache = &caches[si];
             if cache.release && chunk as usize + 1 == cache.scan.chunks.len() {
-                *cache.state.lock().unwrap() = CacheState::default();
+                cache.release();
             }
             Ok(())
         },
