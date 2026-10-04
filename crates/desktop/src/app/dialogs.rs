@@ -1,5 +1,7 @@
 //! Modal dialogs. At most one is open; `Workbench::dialog` holds its state.
-use super::{Settings, Workbench, layers::destination_combo, revisions::RevisionsState};
+use super::{
+    Settings, Workbench, layers::destination_combo, revisions::RevisionsState, selection::Tool,
+};
 use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
@@ -30,10 +32,10 @@ pub(super) enum Dialog {
     Cleanup,
     /// Confirms scattering the scans for registration practice.
     Scatter,
-    /// Asks what to do with an unapplied alignment result before the tool
-    /// moves on to `next`, which the tree selected.
+    /// Asks what to do with an unapplied alignment result before moving on
+    /// to `next`.
     AlignPending {
-        next: Option<Uuid>,
+        next: AlignNext,
     },
     RenameGroup {
         id: Uuid,
@@ -102,6 +104,14 @@ impl Filter {
         }
     }
 }
+/// Where the registration tool goes once its unapplied result is settled.
+#[derive(Clone, Copy)]
+pub(super) enum AlignNext {
+    /// The item the tree selected.
+    Item(Option<Uuid>),
+    /// Another tool.
+    Tool(Tool),
+}
 #[derive(Clone, Copy)]
 pub(super) enum AfterDiscard {
     Nothing,
@@ -141,7 +151,7 @@ enum Outcome {
     /// Leave the alignment result for `next`, applying it first if asked.
     AlignSwitch {
         apply: bool,
-        next: Option<Uuid>,
+        next: AlignNext,
     },
     Cleanup,
     Scatter,
@@ -625,8 +635,17 @@ impl Workbench {
                 if apply {
                     self.align_apply();
                 }
-                self.select_tree_item(next);
-                self.align_switch(next);
+                match next {
+                    AlignNext::Item(item) => {
+                        self.select_tree_item(item);
+                        self.align_switch(item);
+                    }
+                    AlignNext::Tool(tool) => {
+                        // The picked pairs stay for a return to the tool.
+                        self.align.drop_result();
+                        self.set_tool(tool);
+                    }
+                }
             }
             Outcome::Cleanup => {
                 self.dialog = None;

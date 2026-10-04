@@ -1,7 +1,11 @@
 //! The registration tool: pick point pairs between the scan or folder being
 //! moved and the visible reference scans, fit them, refine by ICP, and see each
 //! proposal live before applying it as the item's transform.
-use super::{Workbench, dialogs::Dialog, selection::Tool};
+use super::{
+    Workbench,
+    dialogs::{AlignNext, Dialog},
+    selection::Tool,
+};
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::{IcpOptions, IcpResult, Pose, Project, rigid_fit};
@@ -69,6 +73,10 @@ impl Default for Align {
 impl Align {
     pub(super) fn clear(&mut self) {
         self.pairs.clear();
+        self.drop_result();
+    }
+    /// Drops the proposed transform but keeps the picked pairs.
+    pub(super) fn drop_result(&mut self) {
         self.preview = None;
         self.report = None;
     }
@@ -151,9 +159,19 @@ impl Workbench {
             None => [0.; 4],
         }
     }
+    /// Whether an alignment result waits to be applied or dropped.
+    pub(super) fn align_pending(&self) -> bool {
+        self.align.preview.is_some()
+            && self.align.item.is_some_and(|i| {
+                self.project
+                    .as_ref()
+                    .is_some_and(|p| !p.scans_within(i).is_empty())
+            })
+    }
     /// Follows the tree selection and collects a finished ICP run. An
-    /// unapplied result is not dropped silently: selecting something else
-    /// asks first, and outside the tool the result waits for its return.
+    /// unapplied result is not dropped silently: selecting something else or
+    /// leaving the tool asks first, and a result that arrives outside the
+    /// tool waits for its return.
     pub(super) fn align_update(&mut self) {
         let Some(p) = self.project.clone() else {
             self.align.item = None;
@@ -163,16 +181,13 @@ impl Workbench {
             .single_tree_item()
             .filter(|id| !p.scans_within(*id).is_empty());
         if item != self.align.item {
-            let pending = self.align.preview.is_some()
-                && self
-                    .align
-                    .item
-                    .is_some_and(|i| !p.scans_within(i).is_empty());
-            if !pending {
+            if !self.align_pending() {
                 self.align_switch(item);
             } else if self.aligning() && self.dialog.is_none() {
                 self.select_tree_item(self.align.item);
-                self.dialog = Some(Dialog::AlignPending { next: item });
+                self.dialog = Some(Dialog::AlignPending {
+                    next: AlignNext::Item(item),
+                });
             }
         }
         if let Some(rx) = &self.align.icp

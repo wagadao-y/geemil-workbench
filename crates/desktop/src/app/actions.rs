@@ -1,7 +1,7 @@
 //! Everything the menus, the toolbar and the keyboard can do, in one place.
 use super::{
     Workbench,
-    dialogs::{AfterDiscard, Dialog, ExportFormat, Filter},
+    dialogs::{AfterDiscard, AlignNext, Dialog, ExportFormat, Filter},
     jobs::Notice,
     revisions::listed_revision,
     selection::Tool,
@@ -378,15 +378,25 @@ impl Workbench {
                 ))
             }
             Action::Tool(tool) => {
-                self.crop.cancel();
-                self.selection.tool = tool;
-                if tool != Tool::Measure {
-                    self.measure.clear();
+                if self.selection.tool == Tool::Align && tool != Tool::Align && self.align_pending()
+                {
+                    self.dialog = Some(Dialog::AlignPending {
+                        next: AlignNext::Tool(tool),
+                    });
+                } else {
+                    self.set_tool(tool);
                 }
             }
             Action::Scatter => self.dialog = Some(Dialog::Scatter),
             Action::Shortcuts => self.dialog = Some(Dialog::Shortcuts),
             Action::About => self.dialog = Some(Dialog::About),
+        }
+    }
+    pub(super) fn set_tool(&mut self, tool: Tool) {
+        self.crop.cancel();
+        self.selection.tool = tool;
+        if tool != Tool::Measure {
+            self.measure.clear();
         }
     }
 

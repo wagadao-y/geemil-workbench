@@ -521,6 +521,19 @@ impl Workbench {
                     self.align_summary()
                 );
             }
+            "align-leave" => {
+                let tool = super::selection::Tool::Navigate;
+                self.perform(ctx, super::actions::Action::Tool(tool));
+                eprintln!(
+                    "Smoke align leave: asked {}, kept {}, {}",
+                    matches!(
+                        self.dialog,
+                        Some(super::dialogs::Dialog::AlignPending { .. })
+                    ),
+                    self.selection.tool != tool,
+                    self.align_summary()
+                );
+            }
             "align-apply" => {
                 eprintln!("Smoke align: {}", self.align_summary());
                 self.align_apply();

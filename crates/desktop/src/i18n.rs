@@ -522,7 +522,7 @@ pub static JA: Strings = Strings {
     align_pending_title: "未適用の位置合わせがあります",
     align_pending_message: |name| {
         format!(
-            "「{name}」の位置合わせの結果がまだ適用されていません。別の項目に切り替える前に、適用するか破棄するか選んでください。"
+            "「{name}」の位置合わせの結果がまだ適用されていません。別の項目やツールに切り替える前に、適用するか破棄するか選んでください。"
         )
     },
     align_pending_apply: "適用して切り替え",
