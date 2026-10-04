@@ -14,16 +14,15 @@ fn main() -> Result<()> {
         args.len() >= 2,
         "Usage: import_bench SOURCE NEW_PROJECT [WORKERS] [MEMORY_MIB] [COMPARE_PROJECT]"
     );
+    let defaults = ImportOptions::default();
     let options = ImportOptions {
         worker_threads: args.get(2).map(|v| v.parse()).transpose()?.unwrap_or(0),
         worker_memory_bytes: args
             .get(3)
             .map(|v| v.parse::<usize>())
             .transpose()?
-            .unwrap_or(256)
-            * 1024
-            * 1024,
-        ..Default::default()
+            .map_or(defaults.worker_memory_bytes, |mib| mib * 1024 * 1024),
+        ..defaults
     };
     let start = Instant::now();
     let timing = Arc::new(Mutex::new((

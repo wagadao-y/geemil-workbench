@@ -1,7 +1,7 @@
 //! Numeric E57 point attributes stay in their original types. A small E57 template
 //! stores scan metadata and image blobs, without a second copy of the point cloud.
 use crate::parallel::OrderedPool;
-use crate::storage::{index, make_record};
+use crate::storage::{SpoolWriter, index, make_record};
 use crate::{Bounds, CoreError, ImageInfo, ImportOptions, JobControl, Pose, Project, Scan, Stage};
 use anyhow::{Context, Result, ensure};
 use e57::{
@@ -10,7 +10,7 @@ use e57::{
 };
 use std::{
     fs::{self, File},
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, Read, Write},
     path::Path,
 };
 use uuid::Uuid;
@@ -481,7 +481,7 @@ fn import_e57(
             "Point attributes exceed record budget"
         );
         let spool = stage.join(format!("{id}.spool"));
-        let mut file = BufWriter::new(File::create(&spool)?);
+        let mut file = SpoolWriter::new(&spool, scan.records * scan.stride as u64, options)?;
         let mut bounds: Option<Bounds> = None;
         let mut count = 0;
         job.report(Stage::ReadingE57, 0, pc.records);
@@ -536,11 +536,9 @@ fn import_e57(
         drop(pool);
         ensure!(read_count == pc.records, "E57 decoded point count mismatch");
         ensure!(count == pc.records, "E57 point count mismatch");
-        file.flush()?;
-        drop(file);
         index(
             &mut scan,
-            &spool,
+            file.finish()?,
             stage,
             bounds.unwrap_or_default(),
             options,
@@ -675,7 +673,7 @@ fn import_las(
         nodes: vec![],
     };
     let spool = stage.join(format!("{id}.spool"));
-    let mut out = BufWriter::new(File::create(&spool)?);
+    let mut out = SpoolWriter::new(&spool, scan.records * scan.stride as u64, options)?;
     let mut bounds: Option<Bounds> = None;
     let mut count = 0;
     let mut batch = las::PointDataBuilder::new()
@@ -729,11 +727,9 @@ fn import_las(
     }
     ensure!(count == scan.records, "LAS point count mismatch");
     scan.valid_points = count;
-    out.flush()?;
-    drop(out);
     index(
         &mut scan,
-        &spool,
+        out.finish()?,
         stage,
         bounds.unwrap_or_default(),
         options,
