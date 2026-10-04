@@ -1,8 +1,8 @@
 //! The bounding box of the scan or folder selected in the tree, and the move
 //! and rotate tool: like Potree's transformation tool, dragging an arrow moves
 //! the item along a world axis and dragging a ring turns it about one, around
-//! the centre of its box. A drag is previewed live and becomes one edit, which
-//! can be undone, when released.
+//! the scanner position, or the centre of the box where there is none. A drag
+//! is previewed live and becomes one edit, which can be undone, when released.
 use super::{Workbench, selection::Tool};
 use eframe::egui;
 use geemil_core::{Bounds, Camera, Pose, Project};
@@ -42,7 +42,7 @@ struct Drag {
     state: Uuid,
     /// The item's own transform when the drag started.
     own: Pose,
-    /// The pivot: the centre of the item's box when the drag started.
+    /// The pivot ([`item_pivot`]) when the drag started.
     center: DVec3,
     start: egui::Pos2,
     /// Moves: where one metre along the axis goes on screen.
@@ -94,6 +94,24 @@ pub(super) fn item_box(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<(D
     }
     let frame = pose.map_or(frame, |pose| p.correction_with(item, item, pose));
     Some((frame, bounds?))
+}
+
+/// Where the handles sit and the item turns about: a scan's scanner position
+/// ([`Project::scanner_position`]), so a levelled scan turns about its
+/// instrument; else the centre of the item's box, for scans without one
+/// (LAS/LAZ keep no scanner position) and for folders.
+pub(super) fn item_pivot(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<DVec3> {
+    if let Some(scan) = p.scan(item)
+        && let Some(position) = p.scanner_position(scan)
+    {
+        let world = match pose {
+            Some(pose) => p.world_matrix_with(scan, item, pose),
+            None => p.world_matrix(scan),
+        };
+        return Some(world.transform_point3(position));
+    }
+    let (frame, bounds) = item_box(p, item, pose)?;
+    Some(frame.transform_point3(bounds.center()))
 }
 
 /// Projects world points to the screen within `rect`.
@@ -359,10 +377,9 @@ impl Workbench {
             }
             return;
         }
-        let Some((frame, bounds)) = item_box(&p, item, None) else {
+        let Some(center) = item_pivot(&p, item, None) else {
             return;
         };
-        let center = frame.transform_point3(bounds.center());
         let handles = Handles::new(&camera, rect, center);
         let pointer = response.hover_pos();
         self.gizmo.hover = handles
@@ -429,8 +446,9 @@ impl Workbench {
         if !self.transforming() {
             return;
         }
-        let center = frame.transform_point3(bounds.center());
-        let Some(handles) = Handles::new(&self.camera, rect, center) else {
+        let Some(handles) =
+            item_pivot(&p, item, pose).and_then(|center| Handles::new(&self.camera, rect, center))
+        else {
             return;
         };
         let active = self

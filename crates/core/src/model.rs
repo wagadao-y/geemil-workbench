@@ -673,6 +673,22 @@ impl Project {
     }
     /// Local scan coordinates to the common project frame: folder transforms
     /// (outermost first), the scan's own additional transform, then its pose.
+    /// Where the scanner stood, in the scan's own coordinates, when its pose
+    /// says so. E57 places each scan's scanner-centred coordinates with a
+    /// pose, but some exporters give every scan of a registered file one
+    /// shared pose, or a pose far from all points; then the origin is no
+    /// scanner position. LAS/LAZ keep none.
+    pub fn scanner_position(&self, scan: &Scan) -> Option<DVec3> {
+        let pose = scan.original_pose?;
+        let shared = self
+            .scans()
+            .any(|other| other.id != scan.id && other.original_pose == Some(pose));
+        let bounds = scan.nodes.first()?.bounds;
+        let (min, max) = (DVec3::from(bounds.min), DVec3::from(bounds.max));
+        // A scan cropped afterwards may leave its scanner outside, but near.
+        let far = DVec3::ZERO.clamp(min, max).length() > (max - min).length();
+        (!shared && !far).then_some(DVec3::ZERO)
+    }
     pub fn world_matrix(&self, scan: &Scan) -> DMat4 {
         self.correction(scan.id) * scan.original_pose.unwrap_or_default().matrix()
     }

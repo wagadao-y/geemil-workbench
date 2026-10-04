@@ -348,3 +348,42 @@ fn saved_revisions_live_in_their_own_files_and_old_lists_still_open() {
         serde_json::to_value(&p.manifest).unwrap()
     );
 }
+
+#[test]
+fn scanner_positions_come_only_from_poses_of_their_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    let ids: Vec<_> = p.scans().map(|s| s.id).collect();
+    let position = |p: &Project, i: usize| {
+        let scan = p.scan(ids[i]).unwrap();
+        p.scanner_position(scan)
+            .map(|local| p.world_matrix(scan).transform_point3(local))
+    };
+    // The demo's scanners stand 3 m apart, each at its own pose.
+    assert_eq!(position(&p, 0), Some(DVec3::ZERO));
+    assert_eq!(position(&p, 1), Some(DVec3::new(3., 0., 0.)));
+    // Additional transforms carry the scanner along.
+    p.set_transform(ids[1], shift(1.)).unwrap();
+    assert_eq!(position(&p, 1), Some(DVec3::new(4., 0., 0.)));
+
+    let edited = |change: &dyn Fn(&mut geemil_core::Scan)| {
+        let mut q = p.clone();
+        for scan in &mut q.manifest.scans {
+            change(scan);
+        }
+        q
+    };
+    // One pose shared by every scan of a registered export is an offset.
+    let shared = edited(&|s| s.original_pose = Some(shift(7.)));
+    assert_eq!((position(&shared, 0), position(&shared, 1)), (None, None));
+    // So is a pose putting the origin far from all points.
+    let far = edited(&|s| {
+        let b = &mut s.nodes[0].bounds;
+        b.min[0] += 1000.;
+        b.max[0] += 1000.;
+    });
+    assert_eq!(position(&far, 0), None);
+    // Scans without a pose, as from LAS/LAZ, have no scanner position.
+    let none = edited(&|s| s.original_pose = None);
+    assert_eq!(position(&none, 0), None);
+}
