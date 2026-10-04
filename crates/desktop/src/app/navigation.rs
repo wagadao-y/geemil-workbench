@@ -1,4 +1,5 @@
-//! Camera input: orbit, pan, zoom, and double-click to orbit around a point.
+//! Camera input: orbit, pan, zoom, double-click to orbit around a point, and
+//! click to select a point's scan.
 use super::{Workbench, actions::MAX_PITCH, selection::Tool};
 use eframe::egui;
 use geemil_core::Camera;
@@ -41,18 +42,17 @@ impl Workbench {
         self.dirty = true;
     }
 
-    /// Orbit (left, in tools that pick by clicking), pan (right), zoom (wheel)
-    /// and double-click picking. Any camera change drops the selection, which is
+    /// Orbit (middle in every tool, left in tools that pick by clicking), pan
+    /// (right), zoom (wheel), double-click picking of the orbit centre (middle
+    /// in every tool, left in camera mode), and clicking a point to select its
+    /// scan (camera mode). Any camera change drops the selection, which is
     /// tied to the camera it was drawn with.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
         if self.crop.dragging() {
             return;
         }
         let mut moved = false;
-        if self.selection.tool.orbits()
-            && !self.gizmo.dragging()
-            && response.dragged_by(egui::PointerButton::Primary)
-        {
+        if self.orbiting(response) {
             let delta = ctx.input(|i| i.pointer.delta());
             self.camera.yaw -= delta.x as f64 * 0.007;
             self.camera.pitch =
@@ -83,29 +83,49 @@ impl Workbench {
             self.dirty = true;
             self.selection.clear();
         }
-        if self.selection.tool == Tool::Navigate
-            && response.double_clicked()
-            && let Some(pos) = response.interact_pointer_pos()
+        let navigating = self.selection.tool == Tool::Navigate;
+        let middle = egui::PointerButton::Middle;
+        // Selecting a scan elsewhere would change what the tool works on, so
+        // only camera mode selects by clicking.
+        if navigating
+            && (response.clicked() || response.clicked_by(middle))
+            && let Some((scan, _)) = self.pick_shown(response)
         {
-            let rect = response.rect;
-            let click = [
-                ((pos.x - rect.left()) / rect.width()) as f64,
-                ((pos.y - rect.top()) / rect.height()) as f64,
-            ];
-            let viewport = [rect.width() as f64, rect.height() as f64];
-            // Splat radius in logical pixels, like `viewport`.
-            let radius = self.settings.point_size as f64 / 2.;
-            let points = self.shown_points(true).map(|(.., p)| p);
-            if let Some(target) = pick(points, &self.camera, click, viewport, radius) {
-                self.flight = Some(Flight {
-                    from: self.camera,
-                    to: target,
-                    fit_distance: None,
-                    start: Instant::now(),
-                });
-                self.selection.clear();
-            }
+            self.select_tree_item(Some(scan));
         }
+        if ((navigating && response.double_clicked()) || response.double_clicked_by(middle))
+            && let Some((_, target)) = self.pick_shown(response)
+        {
+            self.flight = Some(Flight {
+                from: self.camera,
+                to: target,
+                fit_distance: None,
+                start: Instant::now(),
+            });
+            self.selection.clear();
+        }
+    }
+    /// Whether the pointer drag orbits the camera now.
+    fn orbiting(&self, response: &egui::Response) -> bool {
+        !self.crop.dragging()
+            && (response.dragged_by(egui::PointerButton::Middle)
+                || (self.selection.tool.orbits()
+                    && !self.gizmo.dragging()
+                    && response.dragged_by(egui::PointerButton::Primary)))
+    }
+    /// The shown point under the pointer, with its scan.
+    fn pick_shown(&self, response: &egui::Response) -> Option<(uuid::Uuid, DVec3)> {
+        let pos = response.interact_pointer_pos()?;
+        let rect = response.rect;
+        let click = [
+            ((pos.x - rect.left()) / rect.width()) as f64,
+            ((pos.y - rect.top()) / rect.height()) as f64,
+        ];
+        let viewport = [rect.width() as f64, rect.height() as f64];
+        // Splat radius in logical pixels, like `viewport`.
+        let radius = self.settings.point_size as f64 / 2.;
+        let points = self.shown_points(true).map(|(scan, _, p)| (scan, p));
+        pick_tagged(points, &self.camera, click, viewport, radius)
     }
     /// Advances the retarget animation; call once per frame before drawing.
     pub(super) fn advance_flight(&mut self, ctx: &egui::Context) {
@@ -134,11 +154,7 @@ impl Workbench {
     }
     /// Marks the orbit centre, which is always the viewport centre, while it matters.
     pub(super) fn draw_pivot(&self, ui: &egui::Ui, response: &egui::Response) {
-        let orbiting = self.selection.tool.orbits()
-            && !self.gizmo.dragging()
-            && !self.crop.dragging()
-            && response.dragged_by(egui::PointerButton::Primary);
-        if !(orbiting || self.flight.is_some()) {
+        if !(self.orbiting(response) || self.flight.is_some()) {
             return;
         }
         let center = response.rect.center();
@@ -233,11 +249,23 @@ pub(super) fn pick(
     viewport: [f64; 2],
     radius: f64,
 ) -> Option<DVec3> {
+    let points = points.into_iter().map(|p| ((), p));
+    pick_tagged(points, camera, click, viewport, radius).map(|(_, p)| p)
+}
+
+/// [`pick`] for points that carry a tag, such as their scan.
+fn pick_tagged<T>(
+    points: impl IntoIterator<Item = (T, DVec3)>,
+    camera: &Camera,
+    click: [f64; 2],
+    viewport: [f64; 2],
+    radius: f64,
+) -> Option<(T, DVec3)> {
     let near = radius + 6.;
     let projector = camera.projector();
-    let mut covering: Option<(f64, DVec3)> = None;
-    let mut closest: Option<(f64, DVec3)> = None;
-    for position in points {
+    let mut covering: Option<(f64, (T, DVec3))> = None;
+    let mut closest: Option<(f64, (T, DVec3))> = None;
+    for (tag, position) in points {
         let Some((uv, depth)) = projector.project(position) else {
             continue;
         };
@@ -245,19 +273,19 @@ pub(super) fn pick(
         let dy = (uv[1] - click[1]) * viewport[1];
         let d2 = dx * dx + dy * dy;
         if d2 <= radius * radius {
-            if covering.is_none_or(|(best, _)| depth < best) {
-                covering = Some((depth, position));
+            if covering.as_ref().is_none_or(|(best, _)| depth < *best) {
+                covering = Some((depth, (tag, position)));
             }
-        } else if d2 <= near * near && closest.is_none_or(|(best, _)| d2 < best) {
-            closest = Some((d2, position));
+        } else if d2 <= near * near && closest.as_ref().is_none_or(|(best, _)| d2 < *best) {
+            closest = Some((d2, (tag, position)));
         }
     }
-    covering.or(closest).map(|(_, position)| position)
+    covering.or(closest).map(|(_, picked)| picked)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{framed_camera, pick, view_basis};
+    use super::{framed_camera, pick, pick_tagged, view_basis};
     use geemil_core::{Bounds, Camera, Sample};
     use glam::{DMat4, DVec3};
 
@@ -347,6 +375,7 @@ mod tests {
         let behind = sample([0., 5., 0.]);
         let front = sample([0., -5., 0.]);
         let aside = sample([3., 0., 0.]);
+        let (behind_at, front_at) = (DVec3::from(behind.position), DVec3::from(front.position));
         let points = [behind, front, aside.clone()].map(|s| DVec3::from(s.position));
         let viewport = [1000., 1000.];
         assert_eq!(
@@ -367,5 +396,11 @@ mod tests {
         );
         let aside = [DVec3::from(aside.position)];
         assert_eq!(pick(aside, &camera, [0.1, 0.1], viewport, 2.), None);
+        // The front point's tag, such as its scan, comes with it.
+        let tagged = [("behind", behind_at), ("front", front_at)];
+        assert_eq!(
+            pick_tagged(tagged, &camera, [0.5, 0.5], viewport, 2.),
+            Some(("front", front_at))
+        );
     }
 }
