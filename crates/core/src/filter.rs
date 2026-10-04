@@ -5,13 +5,13 @@
 //! judge the points of visible layers and move the points they pick to
 //! another layer instead of rewriting points.
 use crate::layers::{ChunkLabels, LabelWriter, is_set, relabel};
-use crate::parallel::for_each_ordered;
+use crate::parallel::{for_each_ordered, for_each_unordered};
 use crate::storage::{TempFile, create_scratch, position, valid};
 use crate::{Bounds, CropBox, JobControl, LayerTarget, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::File,
     io::{BufWriter, Read, Seek, SeekFrom, Write},
     sync::{
@@ -571,91 +571,112 @@ impl<'a> Merged<'a> {
             boxes,
         }
     }
-    /// Visible points of every chunk of every scan but `own` that lie in the
-    /// box `[lo, hi]`, in the project frame, with their scan, chunk and index.
-    fn visit(
-        &self,
-        own: (usize, u32),
-        lo: DVec3,
-        hi: DVec3,
-        job: &JobControl,
-        mut visit: impl FnMut(DVec3, usize, u32, u32),
-    ) -> Result<()> {
-        for (sj, cache) in self.caches.iter().enumerate() {
-            for (cj, (a, b)) in self.boxes[sj].iter().enumerate() {
-                let cj = cj as u32;
-                if (sj, cj) == own || a.cmpgt(hi).any() || b.cmplt(lo).any() {
-                    continue;
-                }
-                let points = cache.get(cj, job)?;
-                for (i, (p, index)) in points.positions.iter().zip(&points.indices).enumerate() {
-                    if i % 8192 == 0 {
-                        job.check()?;
-                    }
-                    let p = self.worlds[sj].transform_point3(*p);
-                    if p.cmpge(lo).all() && p.cmple(hi).all() {
-                        visit(p, sj, cj, *index);
-                    }
-                }
-            }
-        }
-        Ok(())
+}
+
+/// Merged subsampling works on tiles of whole voxels about this long, so
+/// each tile decides alone and every point is judged once, however many
+/// scans overlap it.
+const TILE_METRES: f64 = 0.5;
+
+/// A point in merged subsampling: its voxel, its squared distance to the
+/// voxel's centre, and its scan, chunk and index. The least wins its voxel.
+type Candidate = ([i64; 3], f64, u32, u32, u32);
+
+/// The voxel tiles of merged subsampling over `merged`, numbered in Morton
+/// order so that nearby tiles have nearby numbers.
+struct Tiles {
+    size: f64,
+    /// Voxels along a tile's side.
+    voxels: i64,
+    /// The lowest tile, numbered 0 on every axis.
+    origin: [i64; 3],
+}
+impl Tiles {
+    fn new(merged: &Merged, size: f64) -> Result<Self> {
+        let (lo, hi) = merged.boxes.iter().flatten().fold(
+            (DVec3::INFINITY, DVec3::NEG_INFINITY),
+            |(lo, hi), (a, b)| (lo.min(*a), hi.max(*b)),
+        );
+        let voxels = ((TILE_METRES / size).round() as i64).max(1);
+        // A spare tile on each side for points rounded across a box's edge.
+        let tile = |p: DVec3| cell(p, size).map(|v| v.div_euclid(voxels));
+        let origin = tile(lo).map(|v| v - 1);
+        let top = tile(hi);
+        ensure!(
+            lo.is_finite() && (0..3).all(|k| top[k] + 1 - origin[k] < 1 << 21),
+            "Voxel size too small for the extent of the scans"
+        );
+        Ok(Self {
+            size,
+            voxels,
+            origin,
+        })
+    }
+    /// The tile of the point at `p` and the point as a candidate.
+    fn candidate(&self, p: DVec3, scan: usize, chunk: u32, index: u32) -> (u64, Candidate) {
+        let key = cell(p, self.size);
+        let centre = (DVec3::from(key.map(|v| v as f64)) + 0.5) * self.size;
+        let tile = (0..3).fold(0, |code, k| {
+            let v = (key[k].div_euclid(self.voxels) - self.origin[k]) as u64;
+            code | spread(v) << k
+        });
+        (
+            tile,
+            (key, p.distance_squared(centre), scan as u32, chunk, index),
+        )
     }
 }
 
-/// Merged voxel subsampling of chunk `chunk` of scan `si`, in the project
-/// frame; see `Project::subsample_merged`.
-fn merged_subsample_chunk(
+/// The low 21 bits of `v` moved to every third bit, for Morton numbers.
+fn spread(v: u64) -> u64 {
+    let mut v = v & 0x1f_ffff;
+    v = (v | v << 32) & 0x001f_0000_0000_ffff;
+    v = (v | v << 16) & 0x001f_0000_ff00_00ff;
+    v = (v | v << 8) & 0x100f_00f0_0f00_f00f;
+    v = (v | v << 4) & 0x10c3_0c30_c30c_30c3;
+    (v | v << 2) & 0x1249_2492_4924_9249
+}
+
+/// Tiles `from..=to` and the chunks with points in them.
+struct TileRun {
+    from: u64,
+    to: u64,
+    chunks: Vec<(usize, u32)>,
+}
+
+/// The points in the tiles of `run` that lose their voxel, by scan, chunk
+/// and index: every chunk with points there is read and its points in those
+/// tiles compared.
+fn tile_losers(
     merged: &Merged,
-    si: usize,
-    chunk: u32,
-    size: f64,
+    tiles: &Tiles,
+    run: &TileRun,
     job: &JobControl,
-) -> Result<ChunkResult> {
-    type Score = (f64, u32, u32, u32);
-    let own = merged.caches[si].get(chunk, job)?;
-    let (lo, hi) = merged.boxes[si][chunk as usize];
-    let lo = (lo / size).floor() * size;
-    let hi = ((hi / size).floor() + 1.) * size;
-    let rank = |p: DVec3, scan: usize, chunk: u32, index: u32| -> ([i64; 3], Score) {
-        let key = cell(p, size);
-        let centre = (DVec3::from(key.map(|v| v as f64)) + 0.5) * size;
-        (key, (p.distance_squared(centre), scan as u32, chunk, index))
-    };
-    let better = |a: &Score, b: &Score| {
-        a.0.total_cmp(&b.0)
-            .then((a.1, a.2, a.3).cmp(&(b.1, b.2, b.3)))
-            .is_lt()
-    };
-    let world = |p: &DVec3| merged.worlds[si].transform_point3(*p);
-    let mut best: HashMap<[i64; 3], Score> = HashMap::new();
-    for (p, index) in own.positions.iter().zip(&own.indices) {
-        let (key, score) = rank(world(p), si, chunk, *index);
-        let entry = best.entry(key).or_insert(score);
-        if better(&score, entry) {
-            *entry = score;
+) -> Result<Vec<(u32, u32, u32)>> {
+    let mut candidates: Vec<Candidate> = vec![];
+    for &(si, chunk) in &run.chunks {
+        let own = merged.caches[si].get(chunk, job)?;
+        let world = merged.worlds[si];
+        for (i, (p, index)) in own.positions.iter().zip(&own.indices).enumerate() {
+            if i % 8192 == 0 {
+                job.check()?;
+            }
+            let (tile, candidate) = tiles.candidate(world.transform_point3(*p), si, chunk, *index);
+            if (run.from..=run.to).contains(&tile) {
+                candidates.push(candidate);
+            }
         }
     }
-    merged.visit((si, chunk), lo, hi, job, |p, sj, cj, index| {
-        let (key, score) = rank(p, sj, cj, index);
-        if let Some(entry) = best.get_mut(&key)
-            && better(&score, entry)
-        {
-            *entry = score;
-        }
-    })?;
-    let count_bits = merged.scans[si].chunks[chunk as usize].count as usize;
-    let mut mask = vec![0u8; count_bits.div_ceil(8)];
-    let mut count = 0;
-    for (p, index) in own.positions.iter().zip(&own.indices) {
-        let (key, _) = rank(world(p), si, chunk, *index);
-        let (_, s, c, i) = best[&key];
-        if (s as usize, c, i) != (si, chunk, *index) {
-            mask[*index as usize / 8] |= 1 << (index % 8);
-            count += 1;
-        }
-    }
-    Ok((mask, count))
+    candidates.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.total_cmp(&b.1))
+            .then((a.2, a.3, a.4).cmp(&(b.2, b.3, b.4)))
+    });
+    Ok(candidates
+        .windows(2)
+        .filter(|w| w[0].0 == w[1].0)
+        .map(|w| (w[1].2, w[1].3, w[1].4))
+        .collect())
 }
 
 /// The overlap reduction grid in the project frame, with cells packed into
@@ -1057,19 +1078,112 @@ impl Project {
     ) -> Result<u64> {
         ensure!(size.is_finite() && size > 0., "Invalid voxel size");
         let merged = Merged::new(self, scan_ids);
-        let progress = Progress::new(Stage::Subsampling, &merged.scans, 1);
-        let mut labels = LabelWriter::new(self, target)?;
-        let moving = labels.target();
-        each_chunk(
-            &merged.caches,
+        let tiles = Tiles::new(&merged, size)?;
+        let chunks: Vec<(usize, u32)> = merged
+            .scans
+            .iter()
+            .enumerate()
+            .flat_map(|(si, s)| (0..s.chunks.len() as u32).map(move |chunk| (si, chunk)))
+            .collect();
+        let workers = filter_workers(self)?;
+        // Progress: counting the chunks' tiles, then judging the tiles,
+        // weighted as much again.
+        let total = chunks.len() as u64 * 2;
+        let mut done = 0;
+        let mut occupied: BTreeMap<u64, (u64, Vec<(usize, u32)>)> = BTreeMap::new();
+        for_each_unordered(
+            &chunks,
+            workers,
             job,
-            &progress,
-            &|si, chunk, job| {
-                let picked = merged_subsample_chunk(&merged, si, chunk, size, job)?;
-                relabelled(self, moving, merged.scans[si], chunk, picked)
+            |&(si, chunk)| {
+                let own = merged.caches[si].get(chunk, job)?;
+                let world = merged.worlds[si];
+                let mut counts: HashMap<u64, u64> = HashMap::new();
+                for p in &own.positions {
+                    let (tile, _) = tiles.candidate(world.transform_point3(*p), si, chunk, 0);
+                    *counts.entry(tile).or_default() += 1;
+                }
+                Ok((si, chunk, counts))
             },
-            |_, _, moved| moved.map_or(Ok(()), |moved| labels.add(moved)),
+            |(si, chunk, counts)| {
+                done += 1;
+                job.report(Stage::Subsampling, done, total);
+                for (tile, n) in counts {
+                    let (points, chunks) = occupied.entry(tile).or_default();
+                    *points += n;
+                    chunks.push((si, chunk));
+                }
+                Ok(())
+            },
         )?;
+        // Runs of tiles in Morton order, each as many points as a worker may
+        // sort (a candidate and its share of the sort, 64 bytes); a tile over
+        // that is a run of its own.
+        let options = self.filter_options;
+        let budget = ((options.memory_bytes - options.memory_bytes / 4) / workers / 64) as u64;
+        let mut runs: Vec<TileRun> = vec![];
+        let mut points = 0;
+        for (tile, (n, chunks)) in occupied {
+            match runs.last_mut() {
+                Some(run) if points + n <= budget => {
+                    run.to = tile;
+                    run.chunks.extend(chunks);
+                    points += n;
+                }
+                _ => {
+                    runs.push(TileRun {
+                        from: tile,
+                        to: tile,
+                        chunks,
+                    });
+                    points = n;
+                }
+            }
+        }
+        for run in &mut runs {
+            run.chunks.sort_unstable();
+            run.chunks.dedup();
+        }
+        let mut masks: HashMap<(usize, u32), (Vec<u8>, u64)> = HashMap::new();
+        let mut judged = 0;
+        for_each_unordered(
+            &runs,
+            workers,
+            job,
+            |run| tile_losers(&merged, &tiles, run, job),
+            |losers| {
+                judged += 1;
+                let share = judged * chunks.len() / runs.len();
+                job.report(Stage::Subsampling, done + share as u64, total);
+                for (si, chunk, index) in losers {
+                    let key = (si as usize, chunk);
+                    let (mask, count) = masks.entry(key).or_insert_with(|| {
+                        let points = merged.scans[key.0].chunks[chunk as usize].count;
+                        (vec![0; (points as usize).div_ceil(8)], 0)
+                    });
+                    mask[index as usize / 8] |= 1 << (index % 8);
+                    *count += 1;
+                }
+                Ok(())
+            },
+        )?;
+        // Last the losers move, chunk by chunk.
+        let mut moving: Vec<_> = masks.keys().copied().collect();
+        moving.sort_unstable();
+        let moving: Vec<_> = moving
+            .into_iter()
+            .map(|(si, chunk)| (merged.scans[si], chunk))
+            .collect();
+        let position: HashMap<Uuid, usize> = merged
+            .scans
+            .iter()
+            .enumerate()
+            .map(|(si, s)| (s.id, si))
+            .collect();
+        let mut labels = LabelWriter::new(self, target)?;
+        labels.push_parallel(self, &moving, Stage::Subsampling, job, |scan, chunk| {
+            Ok(masks[&(position[&scan.id], chunk)].clone())
+        })?;
         drop(merged);
         job.check()?;
         labels.commit(
@@ -1534,6 +1648,85 @@ fn each_chunk<R: Send>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merged_tiles_judged_one_by_one_lose_the_same_points_as_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("points.las");
+        let mut writer = las::Writer::from_path(&input, las::Header::default()).unwrap();
+        for i in 0..3000u64 {
+            // Scattered over 2.4 m x 0.6 m, so several tiles of 0.5 m.
+            let r = i.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            writer
+                .write_point(las::Point {
+                    x: (r % 2400) as f64 * 0.001,
+                    y: (r / 2400 % 600) as f64 * 0.001,
+                    z: (r / 1_440_000 % 50) as f64 * 0.001,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        writer.close().unwrap();
+        let mut p = Project::create(&dir.path().join("p"), "Tiles").unwrap();
+        let job = JobControl::default();
+        let options = crate::ImportOptions {
+            chunk_points: 64,
+            ..Default::default()
+        };
+        p.import_file(&input, options, &job).unwrap();
+        p.import_file(&input, options, &job).unwrap();
+        let ids: Vec<_> = p.scans().map(|s| s.id).collect();
+        let pose = crate::Pose {
+            translation: [0.013, -0.007, 0.002],
+            ..Default::default()
+        };
+        p.set_transform(ids[1], pose).unwrap();
+        let merged = Merged::new(&p, &ids);
+        let tiles = Tiles::new(&merged, 0.05).unwrap();
+        let mut occupied: BTreeMap<u64, Vec<(usize, u32)>> = BTreeMap::new();
+        for (si, scan) in merged.scans.iter().enumerate() {
+            for chunk in 0..scan.chunks.len() as u32 {
+                let own = merged.caches[si].get(chunk, &job).unwrap();
+                for p in &own.positions {
+                    let p = merged.worlds[si].transform_point3(*p);
+                    let chunks = occupied.entry(tiles.candidate(p, si, chunk, 0).0);
+                    let chunks = chunks.or_default();
+                    if !chunks.contains(&(si, chunk)) {
+                        chunks.push((si, chunk));
+                    }
+                }
+            }
+        }
+        assert!(occupied.len() > 4, "{} tiles", occupied.len());
+        let judge = |runs: Vec<TileRun>| {
+            let mut losers: Vec<_> = runs
+                .iter()
+                .flat_map(|run| tile_losers(&merged, &tiles, run, &job).unwrap())
+                .collect();
+            losers.sort_unstable();
+            losers
+        };
+        let alone = judge(
+            occupied
+                .iter()
+                .map(|(tile, chunks)| TileRun {
+                    from: *tile,
+                    to: *tile,
+                    chunks: chunks.clone(),
+                })
+                .collect(),
+        );
+        let mut all: Vec<_> = occupied.values().flatten().copied().collect();
+        all.sort_unstable();
+        all.dedup();
+        let together = judge(vec![TileRun {
+            from: *occupied.keys().next().unwrap(),
+            to: *occupied.keys().last().unwrap(),
+            chunks: all,
+        }]);
+        assert!(!alone.is_empty());
+        assert_eq!(alone, together);
+    }
 
     #[test]
     fn streamed_search_matches_combined_search_with_duplicates_and_hidden_points() {
