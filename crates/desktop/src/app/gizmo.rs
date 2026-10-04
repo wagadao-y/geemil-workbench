@@ -105,6 +105,10 @@ impl Gizmo {
     pub(super) fn cancel(&mut self) {
         self.drag = None;
     }
+    /// Whether the pointer is on a handle or holds one.
+    pub(super) fn on_handle(&self) -> bool {
+        self.hover.is_some() || self.drag.is_some()
+    }
 }
 
 /// A scan's bounds in its own coordinates: of its points in visible layers,

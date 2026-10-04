@@ -84,15 +84,25 @@ impl Workbench {
             self.selection.clear();
         }
         let navigating = self.selection.tool == Tool::Navigate;
+        let transforming = self.selection.tool == Tool::Transform && !self.gizmo.on_handle();
         let middle = egui::PointerButton::Middle;
         // Selecting a scan elsewhere would change what the tool works on, so
-        // only camera mode selects by clicking.
-        if navigating
+        // only camera mode and the transform tool, off its handles, select by
+        // clicking. The transform tool keeps a selected folder holding the
+        // scan, so a double-click can still put the folder's handles on it.
+        if (navigating || transforming)
             && (response.clicked() || response.clicked_by(middle))
             && let Some((scan, _)) = self.pick_shown(response)
         {
-            self.select_tree_item(Some(scan));
-            self.reveal = Some(scan);
+            let held = transforming
+                && self
+                    .single_tree_item()
+                    .zip(self.project.as_ref())
+                    .is_some_and(|(item, p)| p.scans_within(item).contains(&scan));
+            if !held {
+                self.select_tree_item(Some(scan));
+                self.reveal = Some(scan);
+            }
         }
         if ((navigating && response.double_clicked()) || response.double_clicked_by(middle))
             && let Some((_, target)) = self.pick_shown(response)
