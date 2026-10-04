@@ -132,6 +132,11 @@ impl Project {
             anyhow::bail!("No unsaved changes");
         };
         let mut revision = draft.clone();
+        // A saved revision's file is written once; never let another state
+        // take its id.
+        if self.manifest.revisions.iter().any(|r| r.id == revision.id) {
+            revision.id = Uuid::new_v4();
+        }
         revision.name = name;
         revision.saved_at = Some(now());
         let id = revision.id;
@@ -291,6 +296,23 @@ impl Project {
             let name = entry.file_name().to_string_lossy().into_owned();
             if !referenced.contains(&format!("labels/{name}")) {
                 remove(&entry.path(), &mut report)?;
+            }
+        }
+        // Files of deleted revisions.
+        let saved: BTreeSet<_> = self
+            .manifest
+            .revisions
+            .iter()
+            .map(|r| crate::model::revision_path(r.id))
+            .collect();
+        let history = self.root.join("history");
+        if history.is_dir() {
+            for entry in fs::read_dir(history)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !saved.contains(&format!("history/{name}")) {
+                    remove(&entry.path(), &mut report)?;
+                }
             }
         }
         for entry in fs::read_dir(self.root.join("staging"))? {

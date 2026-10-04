@@ -349,9 +349,9 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft: Option<Revision>,
 }
-/// `project.json`: scans and label patches, which never change once written,
-/// are referenced by the project-relative paths of their metadata files, so
-/// an edit rewrites only the small history.
+/// `project.json`: scans, label patches and saved revisions, which never
+/// change once written, are referenced by the project-relative paths of their
+/// files, so an edit rewrites only the working state and a list of names.
 #[derive(Serialize, Deserialize)]
 struct ManifestFile {
     format_version: u32,
@@ -359,10 +359,32 @@ struct ManifestFile {
     scans: Vec<String>,
     images: Vec<ImageInfo>,
     labels: Vec<String>,
-    revisions: Vec<Revision>,
+    revisions: Vec<StoredRevision>,
     current: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     draft: Option<Revision>,
+}
+/// A saved revision in `project.json`: what may change after saving, its name
+/// and (when a revision before it is deleted) its parent, and the file holding
+/// the rest. The values here win over those in the file.
+#[derive(Serialize, Deserialize)]
+struct RevisionRef {
+    id: Uuid,
+    parent: Option<Uuid>,
+    name: String,
+    file: String,
+}
+/// Projects saved before revisions had files of their own list them whole;
+/// they move to files on the next save.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredRevision {
+    File(RevisionRef),
+    Inline(Revision),
+}
+/// Where a saved revision lives.
+pub(crate) fn revision_path(id: Uuid) -> String {
+    format!("history/{id}.json")
 }
 /// Where a scan's metadata lives: next to its points.
 pub(crate) fn scan_metadata_path(scan: &Scan) -> String {
@@ -484,13 +506,31 @@ impl Project {
             );
             patches.push(patch);
         }
+        let mut revisions = vec![];
+        for stored in file.revisions {
+            let revision = match stored {
+                StoredRevision::Inline(revision) => revision,
+                StoredRevision::File(r) => {
+                    ensure!(r.file == revision_path(r.id), "Misplaced revision");
+                    let saved: Revision = serde_json::from_slice(&read(&r.file)?)
+                        .with_context(|| format!("Invalid revision {}", r.file))?;
+                    ensure!(saved.id == r.id, "Misplaced revision");
+                    Revision {
+                        parent: r.parent,
+                        name: r.name,
+                        ..saved
+                    }
+                }
+            };
+            revisions.push(revision);
+        }
         let manifest = Manifest {
             format_version: version,
             name: file.name,
             scans,
             images: file.images,
             patches,
-            revisions: file.revisions,
+            revisions,
             current: file.current,
             draft: file.draft,
         };
@@ -539,9 +579,9 @@ impl Project {
         }
         Ok(result)
     }
-    /// Writes `project.json`, after the metadata of any scan or label patch
-    /// that has no file yet. Those never change once written, so an edit writes only
-    /// the history.
+    /// Writes `project.json`, after the metadata of any scan, label patch or
+    /// saved revision that has no file yet. Those never change once written,
+    /// so an edit writes only the working state and the list of revisions.
     pub fn save(&self) -> Result<()> {
         let m = &self.manifest;
         let scans: Vec<_> = m.scans.iter().map(scan_metadata_path).collect();
@@ -552,13 +592,29 @@ impl Project {
         for (patch, path) in m.patches.iter().zip(&labels) {
             self.write_once(path, patch)?;
         }
+        // Saved revisions only change name and parent, which stay below.
+        fs::create_dir_all(self.root.join("history"))?;
+        let revisions = m
+            .revisions
+            .iter()
+            .map(|r| {
+                let file = revision_path(r.id);
+                self.write_once(&file, r)?;
+                Ok(StoredRevision::File(RevisionRef {
+                    id: r.id,
+                    parent: r.parent,
+                    name: r.name.clone(),
+                    file,
+                }))
+            })
+            .collect::<Result<_>>()?;
         let file = ManifestFile {
             format_version: FORMAT_VERSION,
             name: m.name.clone(),
             scans,
             images: m.images.clone(),
             labels,
-            revisions: m.revisions.clone(),
+            revisions,
             current: m.current,
             draft: m.draft.clone(),
         };

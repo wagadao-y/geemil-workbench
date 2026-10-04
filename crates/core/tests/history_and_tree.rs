@@ -280,3 +280,71 @@ fn edits_rewrite_only_the_history_and_other_formats_are_refused() {
         Some(&CoreError::UnsupportedProjectFormat(2))
     );
 }
+
+#[test]
+fn saved_revisions_live_in_their_own_files_and_old_lists_still_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    let root = p.root.clone();
+    let scan = p.scans().next().unwrap().id;
+    p.set_transform(scan, shift(1.)).unwrap();
+    let a = p.save_revision("A".into()).unwrap();
+    p.set_transform(scan, shift(2.)).unwrap();
+    let b = p.save_revision("B".into()).unwrap();
+    let file = |id: uuid::Uuid| root.join(format!("history/{id}.json"));
+    assert!(file(a).is_file() && file(b).is_file());
+
+    // Edits after saving rewrite project.json without the saved states.
+    let stamp = std::fs::metadata(file(a)).unwrap().modified().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    p.set_transform(scan, shift(3.)).unwrap();
+    let manifest = std::fs::read_to_string(root.join("project.json")).unwrap();
+    // Only the working state's own edit is listed, not those of A and B.
+    assert_eq!(manifest.matches("\"transform\"").count(), 1);
+    assert_eq!(
+        std::fs::metadata(file(a)).unwrap().modified().unwrap(),
+        stamp
+    );
+
+    // Names and parents change in project.json and win over the files.
+    p.rename_revision(a, "Renamed".into()).unwrap();
+    p.delete_revision(a).unwrap();
+    let reopened = Project::load(&root).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reopened.manifest).unwrap(),
+        serde_json::to_value(&p.manifest).unwrap()
+    );
+    let saved = |p: &Project, id| p.manifest.revisions.iter().find(|r| r.id == id).cloned();
+    assert!(saved(&reopened, a).is_none());
+    assert_eq!(
+        saved(&reopened, b).unwrap().parent,
+        saved(&p, b).unwrap().parent
+    );
+    p.rename_revision(b, "Kept".into()).unwrap();
+    assert_eq!(
+        saved(&Project::load(&root).unwrap(), b).unwrap().name,
+        "Kept"
+    );
+
+    // Cleanup removes the files of deleted revisions.
+    p.cleanup().unwrap();
+    assert!(!file(a).exists() && file(b).is_file());
+
+    // A project listing its revisions whole opens, and the next save moves
+    // them to files.
+    let mut old: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(root.join("project.json")).unwrap()).unwrap();
+    old["revisions"] = serde_json::to_value(&p.manifest.revisions).unwrap();
+    std::fs::write(root.join("project.json"), old.to_string()).unwrap();
+    std::fs::remove_dir_all(root.join("history")).unwrap();
+    drop(p);
+    let mut p = Project::load(&root).unwrap();
+    assert_eq!(saved(&p, b).unwrap().name, "Kept");
+    p.set_transform(scan, shift(4.)).unwrap();
+    assert!(file(b).is_file());
+    let reopened = Project::load(&root).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reopened.manifest).unwrap(),
+        serde_json::to_value(&p.manifest).unwrap()
+    );
+}
