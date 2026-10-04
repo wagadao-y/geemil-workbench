@@ -409,6 +409,8 @@ pub struct Project {
     pub(crate) _lock: std::sync::Arc<fs::File>,
     /// Where each chunk's labels are in the current state, shared by clones.
     pub(crate) label_index: crate::layers::LabelIndexCache,
+    /// Bounds of the scans' visible points in the current state, shared by clones.
+    pub(crate) visible_bounds: crate::layers::VisibleBoundsCache,
 }
 impl Project {
     pub fn create(root: &Path, name: &str) -> Result<Self> {
@@ -422,6 +424,7 @@ impl Project {
             root: fs::canonicalize(root)?,
             _lock: crate::project_lock::acquire(&fs::canonicalize(root)?)?,
             label_index: Default::default(),
+            visible_bounds: Default::default(),
             filter_options: crate::FilterOptions::default(),
             manifest: Manifest {
                 format_version: FORMAT_VERSION,
@@ -549,6 +552,7 @@ impl Project {
             manifest,
             _lock: lock,
             label_index: Default::default(),
+            visible_bounds: Default::default(),
             filter_options: crate::FilterOptions::default(),
         };
         for s in &p.manifest.scans {

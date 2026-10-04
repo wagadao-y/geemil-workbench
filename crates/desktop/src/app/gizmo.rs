@@ -8,7 +8,7 @@
 //! one edit, which can be undone, when released.
 use super::{Workbench, selection::Tool};
 use eframe::egui;
-use geemil_core::{Bounds, Camera, Pose, Project};
+use geemil_core::{Bounds, Camera, Pose, Project, Scan};
 use glam::{DMat4, DVec3};
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -107,13 +107,22 @@ impl Gizmo {
     }
 }
 
+/// A scan's bounds in its own coordinates: of its points in visible layers,
+/// so points moved out of the work (distant noise, say) do not stretch its
+/// box; of all its points while none is visible.
+fn scan_bounds(p: &Project, scan: &Scan) -> Option<Bounds> {
+    let all = scan.nodes.first()?.bounds;
+    Some(p.visible_bounds(scan).ok().flatten().unwrap_or(all))
+}
+
 /// The box of a scan or folder: a frame and bounds in it. A scan's frame is its
-/// world matrix and its bounds its own; a folder's frame is its transform with
-/// the folders above, and its bounds enclose its scans in that frame, so the
-/// box turns with the folder. `pose` replaces the item's own transform.
+/// world matrix and its bounds those of [`scan_bounds`]; a folder's frame is
+/// its transform with the folders above, and its bounds enclose its scans in
+/// that frame, so the box turns with the folder. `pose` replaces the item's
+/// own transform.
 pub(super) fn item_box(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<(DMat4, Bounds)> {
     if let Some(scan) = p.scans().find(|s| s.id == item) {
-        let bounds = scan.nodes.first()?.bounds;
+        let bounds = scan_bounds(p, scan)?;
         let world = match pose {
             Some(pose) => p.world_matrix_with(scan, item, pose),
             None => p.world_matrix(scan),
@@ -125,11 +134,11 @@ pub(super) fn item_box(p: &Project, item: Uuid, pose: Option<Pose>) -> Option<(D
     let inside: HashSet<Uuid> = p.scans_within(item).into_iter().collect();
     let mut bounds: Option<Bounds> = None;
     for scan in p.scans().filter(|s| inside.contains(&s.id)) {
-        let Some(root) = scan.nodes.first() else {
+        let Some(scan_bounds) = scan_bounds(p, scan) else {
             continue;
         };
         let to = to_frame * p.world_matrix(scan);
-        for corner in root.bounds.corners() {
+        for corner in scan_bounds.corners() {
             let q = to.transform_point3(corner).to_array();
             match &mut bounds {
                 Some(b) => b.include(q),

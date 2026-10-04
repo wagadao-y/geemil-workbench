@@ -279,3 +279,101 @@ fn edit_records_name_the_shorter_of_the_scans_used_or_left_out() {
     );
     assert_eq!(record(&mut p, &all, false), "all");
 }
+
+/// Bounds of the visible points, from the points themselves.
+fn exact_bounds(p: &Project, scan: &geemil_core::Scan) -> geemil_core::Bounds {
+    let mut points = (0..scan.chunks.len() as u32).flat_map(|c| p.points(scan, c).unwrap());
+    let mut bounds = geemil_core::Bounds::at(points.next().unwrap().position);
+    for s in points {
+        bounds.include(s.position);
+    }
+    bounds
+}
+
+#[test]
+fn a_scans_visible_bounds_leave_out_points_in_hidden_layers() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("cloud.las");
+    let mut writer = las::Writer::from_path(&source, las::Header::default()).unwrap();
+    for i in 0..2000 {
+        let (x, y) = ((i % 40) as f64 * 0.05, (i / 40) as f64 * 0.05);
+        writer
+            .write_point(las::Point {
+                x,
+                y,
+                z: (x * 7. + y * 3.) % 0.2,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    // Distant noise, and a stray point just beyond one edge.
+    for (x, y, z) in [(80., 60., 9.), (2.3, 1., 0.1)] {
+        writer
+            .write_point(las::Point {
+                x,
+                y,
+                z,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+    let mut p = Project::create(&dir.path().join("p"), "Bounds").unwrap();
+    let job = JobControl::default();
+    let options = ImportOptions {
+        chunk_points: 64,
+        ..Default::default()
+    };
+    p.import_file(&source, options, &job).unwrap();
+    let scan = p.scans().next().unwrap().clone();
+    let all = p.visible_bounds(&scan).unwrap().unwrap();
+    assert!(all.max[0] - all.min[0] > 70.);
+    let world = p.world_matrix(&scan);
+    let at = |x, y, z| world.transform_point3(glam::DVec3::new(x, y, z)).to_array();
+    // The distant point alone in a hidden layer, then the strip with the
+    // stray point, which cuts through chunks with visible points.
+    let crop = |center, size| geemil_core::CropBox {
+        center,
+        size,
+        rotation: [0., 0., 0., 1.],
+    };
+    p.move_box(
+        &crop(at(80., 60., 9.), [4., 4., 4.]),
+        true,
+        &ids(&p),
+        &p.layer_named("Noise"),
+        &job,
+    )
+    .unwrap();
+    let noise = p.visible_bounds(&scan).unwrap().unwrap();
+    assert!(noise.max[0] - noise.min[0] < 3., "{noise:?}");
+    assert_eq!(
+        format!("{noise:?}"),
+        format!("{:?}", exact_bounds(&p, &scan))
+    );
+    p.move_box(
+        &crop(at(2.2, 1., 0.1), [0.4, 4., 4.]),
+        true,
+        &ids(&p),
+        &p.layer_named("Noise"),
+        &job,
+    )
+    .unwrap();
+    let strip = p.visible_bounds(&scan).unwrap().unwrap();
+    assert!(strip.max[0] - strip.min[0] < 2.1, "{strip:?}");
+    assert_eq!(
+        format!("{strip:?}"),
+        format!("{:?}", exact_bounds(&p, &scan))
+    );
+    // Showing the layer again brings the points back into the box.
+    let code = p
+        .current()
+        .layers
+        .iter()
+        .find(|l| l.name == "Noise")
+        .unwrap()
+        .code;
+    p.set_layer_visible(code, true).unwrap();
+    let shown = p.visible_bounds(&scan).unwrap().unwrap();
+    assert_eq!(format!("{shown:?}"), format!("{all:?}"));
+}

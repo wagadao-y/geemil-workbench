@@ -5,8 +5,8 @@
 use crate::codec::{pack_labels, unpack_labels};
 use crate::parallel::for_each_unordered;
 use crate::{
-    DEFAULT_LAYER, JobControl, LabelBlock, LabelPatch, Layer, LayerTarget, Project, Revision, Scan,
-    Stage,
+    Bounds, DEFAULT_LAYER, JobControl, LabelBlock, LabelPatch, Layer, LayerTarget, Project,
+    Revision, Scan, Stage,
 };
 use anyhow::{Result, anyhow, ensure};
 use std::{
@@ -62,6 +62,19 @@ impl LabelIndex {
 /// share it, and a different state's question replaces it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LabelIndexCache(Arc<Mutex<Option<Arc<LabelIndex>>>>);
+
+/// The bounds [`Project::visible_bounds`] found for each scan in the state
+/// last asked about. Clones of a project share it, and a different state's
+/// question empties it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct VisibleBoundsCache(Arc<Mutex<VisibleBounds>>);
+/// A state and each scan's visible bounds in it.
+type VisibleBounds = (Uuid, HashMap<Uuid, Option<Bounds>>);
+
+/// Whether `outer` holds all of `inner`.
+fn holds(outer: &Bounds, inner: &Bounds) -> bool {
+    (0..3).all(|k| outer.min[k] <= inner.min[k] && inner.max[k] <= outer.max[k])
+}
 
 /// The lowest code no layer of `state` uses.
 fn free_code(state: &Revision) -> Result<u8> {
@@ -229,6 +242,56 @@ impl Project {
             n => n,
         };
         Ok(workers.min(capacity))
+    }
+    /// The bounds, in scan coordinates, of the scan's points in visible
+    /// layers; none when none is visible. A chunk wholly visible counts with
+    /// its bounds and one wholly hidden not at all, both without reading it;
+    /// a chunk with both is read only when it reaches outside the bounds
+    /// found so far, so points moved out of the work, such as distant
+    /// noise, stop widening the scan's box at little cost. Kept per state.
+    pub fn visible_bounds(&self, scan: &Scan) -> Result<Option<Bounds>> {
+        let state = self.current().id;
+        {
+            let cache = self.visible_bounds.0.lock().unwrap();
+            if cache.0 == state
+                && let Some(bounds) = cache.1.get(&scan.id)
+            {
+                return Ok(*bounds);
+            }
+        }
+        let hidden = self.hidden_counts(&[scan]).remove(0);
+        let mut bounds: Option<Bounds> = None;
+        let mut mixed = vec![];
+        for (chunk, (c, hidden)) in scan.chunks.iter().zip(hidden).enumerate() {
+            if hidden == 0 {
+                match &mut bounds {
+                    Some(b) => {
+                        b.include(c.bounds.min);
+                        b.include(c.bounds.max);
+                    }
+                    None => bounds = Some(c.bounds),
+                }
+            } else if hidden < c.count as u64 {
+                mixed.push(chunk as u32);
+            }
+        }
+        for chunk in mixed {
+            if bounds.is_some_and(|b| holds(&b, &scan.chunks[chunk as usize].bounds)) {
+                continue;
+            }
+            for sample in self.points(scan, chunk)? {
+                match &mut bounds {
+                    Some(b) => b.include(sample.position),
+                    None => bounds = Some(Bounds::at(sample.position)),
+                }
+            }
+        }
+        let mut cache = self.visible_bounds.0.lock().unwrap();
+        if cache.0 != state {
+            *cache = (state, HashMap::new());
+        }
+        cache.1.insert(scan.id, bounds);
+        Ok(bounds)
     }
     /// Points per layer over the scans of the current state, for every layer.
     pub fn layer_counts(&self) -> BTreeMap<u8, u64> {
