@@ -48,15 +48,16 @@ impl Workbench {
             fit_distance: Some(to.distance),
             start: Instant::now(),
         });
-        self.selection.clear();
+        self.selection.camera_moved();
         self.dirty = true;
     }
 
     /// Orbit (middle in every tool, left in tools that pick by clicking), pan
     /// (right), zoom (wheel), double-click picking of the orbit centre (middle
     /// in every tool, left in camera mode), and clicking a point to select its
-    /// scan (camera mode). Any camera change drops the selection, which is
-    /// tied to the camera it was drawn with.
+    /// scan (camera mode). Ctrl+wheel moves forward and back, carrying the
+    /// orbit centre along. A finished selection keeps the camera it was drawn
+    /// with; one being drawn is dropped.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
         if self.crop.dragging() {
             return;
@@ -81,7 +82,15 @@ impl Workbench {
             moved = true;
         }
         if response.hovered() {
-            let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
+            // egui turns Ctrl+wheel into zoom, and leaves no scroll.
+            let (scroll, zoom) = ctx.input(|i| (i.smooth_scroll_delta.y, i.zoom_delta()));
+            if zoom != 1. {
+                let (.., forward) = view_basis(self.camera);
+                self.camera.target = (DVec3::from(self.camera.target)
+                    + forward * self.camera.distance * (zoom as f64).ln())
+                .to_array();
+                moved = true;
+            }
             if scroll != 0. {
                 self.camera.distance =
                     (self.camera.distance * (-scroll as f64 * 0.003).exp()).clamp(0.001, 1e10);
@@ -91,7 +100,7 @@ impl Workbench {
         if moved {
             self.flight = None;
             self.dirty = true;
-            self.selection.clear();
+            self.selection.camera_moved();
         }
         let navigating = self.selection.tool == Tool::Navigate;
         let transforming = self.selection.tool == Tool::Transform && !self.gizmo.on_handle();
@@ -123,8 +132,36 @@ impl Workbench {
                 fit_distance: None,
                 start: Instant::now(),
             });
-            self.selection.clear();
+            self.selection.camera_moved();
         }
+    }
+    /// Flying with the keys in every tool: arrows move along the view and
+    /// sideways, PageUp and PageDown up and down, carrying the orbit centre
+    /// along at the orbit distance a second; Shift is four times faster and
+    /// Ctrl four times slower.
+    pub(super) fn fly_input(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() || self.dialog.is_some() {
+            return;
+        }
+        let (step, modifiers, dt) = ctx.input(|i| {
+            let axis = |plus, minus| i.key_down(plus) as i32 - i.key_down(minus) as i32;
+            let step = [
+                axis(egui::Key::ArrowRight, egui::Key::ArrowLeft),
+                axis(egui::Key::ArrowUp, egui::Key::ArrowDown),
+                axis(egui::Key::PageUp, egui::Key::PageDown),
+            ];
+            (step, i.modifiers, i.stable_dt)
+        });
+        if step == [0; 3] {
+            return;
+        }
+        // A long first frame after idling would jump.
+        let dt = (dt as f64).min(0.1);
+        self.camera = fly(self.camera, step, modifiers, dt);
+        self.flight = None;
+        self.dirty = true;
+        self.selection.camera_moved();
+        ctx.request_repaint();
     }
     /// Whether the pointer drag orbits the camera now.
     fn orbiting(&self, response: &egui::Response) -> bool {
@@ -242,6 +279,23 @@ impl Workbench {
     }
 }
 
+/// `camera` moved for `dt` seconds by `step` (right, forward, up; each -1,
+/// 0 or 1) at its orbit distance a second, four times faster with Shift and
+/// slower with Ctrl. The orbit centre moves along.
+fn fly(mut camera: Camera, step: [i32; 3], modifiers: egui::Modifiers, dt: f64) -> Camera {
+    let (right, _, forward) = view_basis(camera);
+    let speed = if modifiers.shift {
+        4.
+    } else if modifiers.command {
+        0.25
+    } else {
+        1.
+    } * camera.distance;
+    let direction = right * step[0] as f64 + forward * step[1] as f64 + DVec3::Z * step[2] as f64;
+    camera.target = (DVec3::from(camera.target) + direction * speed * dt).to_array();
+    camera
+}
+
 fn view_basis(camera: Camera) -> (DVec3, DVec3, DVec3) {
     let forward = -DVec3::new(
         camera.yaw.cos() * camera.pitch.cos(),
@@ -278,7 +332,7 @@ fn framed_camera(camera: Camera, corners: &[DVec3]) -> Camera {
 
 #[cfg(test)]
 mod tests {
-    use super::{framed_camera, view_basis};
+    use super::{fly, framed_camera, view_basis};
     use geemil_core::{Bounds, Camera};
     use glam::{DMat4, DVec3};
 
@@ -344,5 +398,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn flying_moves_eye_and_centre_together_at_the_orbit_distance_a_second() {
+        let camera = Camera {
+            target: [1., 2., 3.],
+            distance: 10.,
+            yaw: 0.3,
+            pitch: 0.4,
+            ..Camera::default()
+        };
+        let (right, _, forward) = view_basis(camera);
+        let none = eframe::egui::Modifiers::NONE;
+        let ahead = fly(camera, [0, 1, 0], none, 0.5);
+        let moved = DVec3::from(ahead.target) - DVec3::from(camera.target);
+        assert!(moved.abs_diff_eq(forward * 5., 1e-9));
+        assert!((ahead.eye() - camera.eye()).abs_diff_eq(moved, 1e-9));
+        assert_eq!(ahead.distance, camera.distance);
+        let fast = fly(camera, [-1, 0, 1], eframe::egui::Modifiers::SHIFT, 0.5);
+        let moved = DVec3::from(fast.target) - DVec3::from(camera.target);
+        assert!(moved.abs_diff_eq((DVec3::Z - right) * 20., 1e-9));
+        let slow = fly(camera, [0, 0, -1], eframe::egui::Modifiers::COMMAND, 1.);
+        assert!((slow.target[2] - (camera.target[2] - 2.5)).abs() < 1e-9);
     }
 }

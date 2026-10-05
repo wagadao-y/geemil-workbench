@@ -89,6 +89,18 @@ impl Default for SelectionState {
     }
 }
 impl SelectionState {
+    /// The camera moved. A finished selection stays with the camera it was
+    /// drawn with; one being drawn is dropped, as its points so far belong
+    /// to the old view.
+    pub(super) fn camera_moved(&mut self) {
+        if (!self.closed && !self.polygon.is_empty()) || self.drag_start.is_some() {
+            self.clear();
+        }
+    }
+    /// The camera the selection was drawn with, once it is finished.
+    pub(super) fn drawn_with(&self) -> Option<Camera> {
+        self.selection().map(|s| s.camera)
+    }
     pub(super) fn clear(&mut self) {
         self.polygon.clear();
         self.closed = false;
@@ -286,6 +298,22 @@ impl Workbench {
         {
             self.selection.clear();
         }
+        // The outline only shows from where it was drawn; the marks show
+        // from anywhere.
+        if let Some(camera) = self.selection.drawn_with()
+            && camera != self.camera
+        {
+            let back = format!(
+                "{} {}",
+                egui_phosphor::regular::ARROW_U_UP_LEFT,
+                t.selection_view
+            );
+            if ui.button(back).clicked() {
+                self.camera = camera;
+                self.flight = None;
+                self.dirty = true;
+            }
+        }
         let preview = &self.selection.preview;
         if self.selection.is_ready() && preview.marks_for.is_some() {
             ui.separator();
@@ -465,7 +493,7 @@ impl Workbench {
     }
     pub(super) fn draw_selection(&self, ui: &egui::Ui, response: &egui::Response) {
         let s = &self.selection;
-        if s.polygon.is_empty() {
+        if s.polygon.is_empty() || s.camera.is_some_and(|c| c != self.camera) {
             return;
         }
         let rect = response.rect;
@@ -556,4 +584,39 @@ fn start_search(
         ctx.request_repaint();
     });
     NearestSearch { cancel, rx }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SelectionState, Tool};
+    use eframe::egui;
+    use geemil_core::{Camera, SelectionMode};
+
+    #[test]
+    fn finished_selections_outlive_camera_moves_and_unfinished_ones_do_not() {
+        let camera = Camera::default();
+        let mut s = SelectionState::default();
+        s.select_rect(
+            camera,
+            [0.2, 0.2],
+            [0.6, 0.6],
+            SelectionMode::ExcludeInside,
+            false,
+        );
+        s.camera_moved();
+        assert!(s.is_ready());
+        assert_eq!(s.drawn_with(), Some(camera));
+        // An open polygon belongs to the view its vertices were clicked in.
+        s.clear();
+        s.tool = Tool::Polygon;
+        s.camera = Some(camera);
+        s.polygon = vec![egui::pos2(0.1, 0.1), egui::pos2(0.5, 0.1)];
+        s.camera_moved();
+        assert!(s.polygon.is_empty());
+        // So does a rectangle still being dragged.
+        s.tool = Tool::Rect;
+        s.drag_start = Some(egui::pos2(0.1, 0.1));
+        s.camera_moved();
+        assert!(s.drag_start.is_none());
+    }
 }

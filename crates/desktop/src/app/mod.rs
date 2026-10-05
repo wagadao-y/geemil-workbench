@@ -280,7 +280,7 @@ impl Workbench {
             frame_bounds(&mut self.camera, &p.bounds());
             self.flight = None;
             self.dirty = true;
-            self.selection.clear();
+            self.selection.camera_moved();
         }
     }
     /// Starts imports for files dropped on the window.
@@ -333,6 +333,9 @@ impl eframe::App for Workbench {
         self.align_update();
         if self.dialog.is_none() {
             self.keyboard(&ctx);
+        }
+        if self.project.is_some() {
+            self.fly_input(&ctx);
         }
         self.dropped_files(&ctx);
         self.menu_bar(ui);

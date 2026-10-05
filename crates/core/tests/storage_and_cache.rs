@@ -617,7 +617,7 @@ fn the_view_cache_evicts_the_least_recently_used_node() {
     };
     // Room for all three but one byte, so loading the third evicts one.
     let mut cache = ViewCache::new(bytes(a) + bytes(b) + bytes(c) - 1);
-    let mut load = |cache: &mut ViewCache, node| {
+    let load = |cache: &mut ViewCache, node| {
         let pick = geemil_core::ViewPick {
             scan: scan.id,
             node,

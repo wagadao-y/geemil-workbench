@@ -322,7 +322,7 @@ impl Workbench {
             Action::ToggleOrtho => {
                 self.camera.ortho = !self.camera.ortho;
                 self.dirty = true;
-                self.selection.clear();
+                self.selection.camera_moved();
             }
             Action::Save => {
                 let n = self
@@ -675,6 +675,6 @@ impl Workbench {
         self.camera.pitch = pitch;
         self.flight = None;
         self.dirty = true;
-        self.selection.clear();
+        self.selection.camera_moved();
     }
 }
