@@ -17,7 +17,7 @@ mod storage;
 mod tree;
 mod view_cache;
 
-pub use align::{IcpOptions, IcpResult, rigid_fit};
+pub use align::{IcpOptions, IcpResult, IcpStep, rigid_fit};
 pub use edit::{
     Camera, LoadedNode, LoadedView, NodePoints, PreparedSelection, Projector, Selection,
     SelectionMode, SpacingCache, ViewPick, ViewPoint,

@@ -131,6 +131,14 @@ fn icp_recovers_a_scan_and_a_folder_misalignment() {
     assert_close(result.pose.matrix(), truth());
     assert!(result.rms < 0.006, "rms {}", result.rms);
     assert!(result.overlap > 0.9, "overlap {}", result.overlap);
+    // One run narrows from the start distance down to the end distance.
+    let distances: Vec<f64> = result.steps.iter().map(|s| s.distance).collect();
+    assert_eq!(distances, [0.5, 0.25, 0.125, 0.0625, 0.03125, 0.02]);
+    assert_eq!(result.stopped_at, None);
+    assert_eq!(
+        result.iterations,
+        result.steps.iter().map(|s| s.iterations).sum::<u32>()
+    );
 
     // Inside a turned folder the scan's own transform compensates the folder.
     let folder = p.create_group("Floor 1".into(), None).unwrap();

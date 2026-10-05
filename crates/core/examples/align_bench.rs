@@ -2,7 +2,7 @@
 //! scans and reports how far from the original pose it lands, and how long it
 //! takes. The project is not modified.
 //!
-//! cargo run -p geemil-core --release --example align_bench -- PROJECT [MAX_DISTANCE] [ERROR_SIZE] [SAMPLES] [ITERATIONS]
+//! cargo run -p geemil-core --release --example align_bench -- PROJECT [MAX_DISTANCE] [ERROR_SIZE] [SAMPLES] [ITERATIONS] [MIN_DISTANCE]
 use anyhow::Result;
 use geemil_core::{IcpOptions, JobControl, Project};
 use glam::{DMat4, DQuat, DVec3};
@@ -16,6 +16,7 @@ fn main() -> Result<()> {
     let size: f64 = args.get(2).map_or(Ok(1.), |s| s.parse())?;
     let samples = args.get(3).map_or(Ok(60_000), |s| s.parse())?;
     let iterations = args.get(4).map_or(Ok(50), |s| s.parse())?;
+    let min_distance = args.get(5).map_or(Ok(0.02), |s| s.parse())?;
     let error = DMat4::from_rotation_translation(
         DQuat::from_euler(
             glam::EulerRot::XYZ,
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
             &others,
             &IcpOptions {
                 max_distance,
+                min_distance,
                 samples,
                 iterations,
             },
@@ -68,11 +70,12 @@ fn main() -> Result<()> {
                     })
                     .fold(0., f64::max);
                 println!(
-                    "{}: {:.1?}, {} iterations, rms {:.4} m, overlap {:.0}%, worst corner error {:.4} m",
+                    "{}: {:.1?}, {} iterations, rms {:.4} m at {:.3} m, overlap {:.0}%, worst corner error {:.4} m",
                     scan.name,
                     elapsed,
                     r.iterations,
                     r.rms,
+                    r.steps.last().map_or(0., |s| s.distance),
                     r.overlap * 100.,
                     worst
                 );

@@ -107,9 +107,12 @@ pub fn rigid_fit(moving: &[DVec3], reference: &[DVec3]) -> Result<DMat4> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct IcpOptions {
-    /// Initial correspondence distance in metres; it shrinks as ICP converges,
-    /// so this should cover the remaining misalignment.
+    /// Initial correspondence distance in metres; it halves each time ICP
+    /// settles, so this should cover the remaining misalignment.
     pub max_distance: f64,
+    /// The distance it narrows to, in metres; at most `max_distance`.
+    pub min_distance: f64,
+    /// Iterations allowed at each distance.
     pub iterations: u32,
     /// Processing samples of the moved scans; the reference gets four times as
     /// many within reach of them.
@@ -119,21 +122,38 @@ impl Default for IcpOptions {
     fn default() -> Self {
         Self {
             max_distance: 0.5,
+            min_distance: 0.02,
             iterations: 50,
             samples: 60_000,
         }
     }
 }
+/// The fit at one correspondence distance.
 #[derive(Clone, Copy, Debug)]
+pub struct IcpStep {
+    pub distance: f64,
+    /// RMS distance of the correspondences to the reference surface, in metres.
+    pub rms: f64,
+    /// Fraction of moving samples with a correspondence at this distance.
+    pub overlap: f64,
+    pub iterations: u32,
+}
+#[derive(Clone, Debug)]
 pub struct IcpResult {
     /// The own transform of the moved item after alignment.
     pub pose: Pose,
-    /// RMS distance of the final correspondences to the reference surface, in
-    /// metres.
+    /// RMS of the narrowest distance reached, in metres.
     pub rms: f64,
-    /// Fraction of moving samples with a correspondence at the final distance.
+    /// Fraction of moving samples within the initial distance of the
+    /// reference after alignment: how much of the item overlaps it.
     pub overlap: f64,
+    /// Iterations over all distances.
     pub iterations: u32,
+    /// The distances from the initial one down, as far as they held.
+    pub steps: Vec<IcpStep>,
+    /// A narrower distance that fitted too little to trust; the result is that
+    /// of the one before it.
+    pub stopped_at: Option<f64>,
 }
 
 /// A uniform grid over points for fixed-radius neighbour queries.
@@ -255,6 +275,103 @@ fn solve6(a: [[f64; 6]; 6], b: [f64; 6]) -> Option<[f64; 6]> {
     Some(x)
 }
 
+/// The reference samples, their surface normals and a grid over them.
+struct Reference<'a> {
+    points: &'a [DVec3],
+    normals: &'a [Option<DVec3>],
+    grid: Grid,
+}
+impl Reference<'_> {
+    /// The reference sample nearest each moved point within `distance` (at
+    /// most the grid's cell), paired with the moved point.
+    fn pairs(&self, moving: &[DVec3], motion: DMat4, distance: f64) -> Vec<(DVec3, u32)> {
+        parallel(moving.len(), |range| {
+            range
+                .filter_map(|i| {
+                    let p = motion.transform_point3(moving[i]);
+                    let (j, _) = self.grid.nearest(self.points, p, distance)?;
+                    Some((p, j))
+                })
+                .collect()
+        })
+    }
+    /// One point-to-plane step from `pairs`: the motion to apply after the
+    /// current one.
+    fn step(&self, pairs: &[(DVec3, u32)], distance: f64) -> Result<DMat4> {
+        // Robust weights: full inside a third of the distance, then 1/r.
+        let huber = distance / 3.;
+        let mut a = [[0.; 6]; 6];
+        let mut b = [0.; 6];
+        let mut add = |row: [f64; 6], r: f64| {
+            let w = if r.abs() <= huber {
+                1.
+            } else {
+                huber / r.abs()
+            };
+            for i in 0..6 {
+                for j in 0..6 {
+                    a[i][j] += w * row[i] * row[j];
+                }
+                b[i] += w * row[i] * r;
+            }
+        };
+        for (p, j) in pairs {
+            let q = self.points[*j as usize];
+            match self.normals[*j as usize] {
+                Some(n) => {
+                    let c = p.cross(n);
+                    add([c.x, c.y, c.z, n.x, n.y, n.z], (q - *p).dot(n));
+                }
+                // Point-to-point rows where the reference has no plane.
+                None => {
+                    for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
+                        let c = p.cross(axis);
+                        add([c.x, c.y, c.z, axis.x, axis.y, axis.z], (q - *p).dot(axis));
+                    }
+                }
+            }
+        }
+        let Some(x) = solve6(a, b) else {
+            bail!(crate::CoreError::AlignmentUndetermined);
+        };
+        Ok(DMat4::from_rotation_translation(
+            DQuat::from_scaled_axis(DVec3::new(x[0], x[1], x[2])),
+            DVec3::new(x[3], x[4], x[5]),
+        ))
+    }
+    /// The RMS to the reference surface, where it is a plane, of `pairs`. Point
+    /// distances at edges would mostly measure the sample spacing.
+    fn rms(&self, pairs: &[(DVec3, u32)]) -> f64 {
+        let surface: Vec<f64> = pairs
+            .iter()
+            .filter_map(|(p, j)| {
+                self.normals[*j as usize].map(|n| (self.points[*j as usize] - *p).dot(n).powi(2))
+            })
+            .collect();
+        (surface.iter().sum::<f64>() / surface.len().max(1) as f64).sqrt()
+    }
+}
+
+/// How far `b` puts any of `points` from where `a` puts it.
+fn farthest_shift(points: &[DVec3], a: DMat4, b: DMat4) -> f64 {
+    points
+        .iter()
+        .map(|p| a.transform_point3(*p).distance(b.transform_point3(*p)))
+        .fold(0., f64::max)
+}
+
+/// The correspondence distances from `start`, halving down to `end`.
+fn narrowing(start: f64, end: f64) -> Vec<f64> {
+    let end = end.min(start);
+    let mut distances = vec![start];
+    while let Some(&last) = distances.last()
+        && last > end * (1. + 1e-9)
+    {
+        distances.push((last * 0.5).max(end));
+    }
+    distances
+}
+
 fn intersects(bounds: &Bounds, world: DMat4, region: Option<(DVec3, DVec3)>) -> bool {
     let Some((lo, hi)) = region else { return true };
     let (mut a, mut b) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
@@ -331,7 +448,9 @@ impl Project {
         Ok(result)
     }
     /// Aligns `item` (a scan or folder), starting from `initial` as its own
-    /// transform, to the scans `reference` by point-to-plane ICP.
+    /// transform, to the scans `reference` by point-to-plane ICP: at the
+    /// initial distance until it settles, then at half of it and so on down
+    /// to the narrowest. The samples are read once for all distances.
     pub fn icp(
         &self,
         item: Uuid,
@@ -394,16 +513,22 @@ impl Project {
             *p -= centre;
         }
         let d0 = options.max_distance;
-        let grid = Grid::new(&target, d0);
-        // Typical spacing of the reference samples sets the finest distance
-        // and the normal radius.
+        let first = Reference {
+            points: &target,
+            normals: &[],
+            grid: Grid::new(&target, d0),
+        };
+        // Typical spacing of the reference samples sets the normal radius and
+        // how still the narrowest distance must settle.
         let probes: Vec<_> = (0..target.len())
             .step_by((target.len() / 2000).max(1))
             .collect();
         let mut gaps: Vec<f64> = probes
             .iter()
             .filter_map(|&i| {
-                grid.near(&target, target[i], d0)
+                first
+                    .grid
+                    .near(&target, target[i], d0)
                     .filter(|(j, _)| *j as usize != i)
                     .map(|(_, d2)| d2)
                     .min_by(f64::total_cmp)
@@ -412,123 +537,96 @@ impl Project {
             .collect();
         gaps.sort_by(f64::total_cmp);
         let spacing = gaps.get(gaps.len() / 2).copied().unwrap_or(d0 / 10.);
-        let d_final = (spacing * 3.).clamp(d0 * 0.02, d0);
         let normals = normals(&target, (spacing * 4.).min(d0));
-        let mean = moving.iter().sum::<DVec3>() / moving.len() as f64;
-        let reach = moving.iter().map(|p| p.distance(mean)).fold(0., f64::max);
+        let first = Reference {
+            normals: &normals,
+            ..first
+        };
+        let distances = narrowing(d0, options.min_distance);
         let mut motion = DMat4::IDENTITY;
-        let mut iterations = 0;
-        let mut distance = d0;
-        for k in 0..options.iterations {
-            job.check()?;
-            job.report(Stage::IcpIterations, k as u64, options.iterations as u64);
-            iterations = k + 1;
-            let points: Vec<_> = moving.iter().map(|p| motion.transform_point3(*p)).collect();
-            let pairs = parallel(points.len(), |range| {
-                range
-                    .filter_map(|i| {
-                        let (j, _) = grid.nearest(&target, points[i], distance)?;
-                        Some((points[i], j))
-                    })
-                    .collect()
-            });
-            if pairs.len() < 6 {
-                bail!(crate::CoreError::NoOverlap);
-            }
-            // Robust weights: full inside a third of the distance, then 1/r.
-            let huber = distance / 3.;
-            let mut a = [[0.; 6]; 6];
-            let mut b = [0.; 6];
-            let mut add = |row: [f64; 6], r: f64| {
-                let w = if r.abs() <= huber {
-                    1.
-                } else {
-                    huber / r.abs()
-                };
-                for i in 0..6 {
-                    for j in 0..6 {
-                        a[i][j] += w * row[i] * row[j];
-                    }
-                    b[i] += w * row[i] * r;
-                }
-            };
-            for (p, j) in &pairs {
-                let q = target[*j as usize];
-                match normals[*j as usize] {
-                    Some(n) => {
-                        let c = p.cross(n);
-                        add([c.x, c.y, c.z, n.x, n.y, n.z], (q - *p).dot(n));
-                    }
-                    // Point-to-point rows where the reference has no plane.
-                    None => {
-                        for axis in [DVec3::X, DVec3::Y, DVec3::Z] {
-                            let c = p.cross(axis);
-                            add([c.x, c.y, c.z, axis.x, axis.y, axis.z], (q - *p).dot(axis));
-                        }
-                    }
-                }
-            }
-            let Some(x) = solve6(a, b) else {
-                bail!(crate::CoreError::AlignmentUndetermined);
-            };
-            let rotation = DVec3::new(x[0], x[1], x[2]);
-            let step = DMat4::from_rotation_translation(
-                DQuat::from_scaled_axis(rotation),
-                DVec3::new(x[3], x[4], x[5]),
-            );
-            motion = step * motion;
-            // Re-orthonormalise against drift.
-            let (_, r, t) = motion.to_scale_rotation_translation();
-            motion = DMat4::from_rotation_translation(r.normalize(), t);
-            // How far the farthest moving point went in this step.
-            let moved = rotation.length() * reach + DVec3::new(x[3], x[4], x[5]).length();
-            // Narrow the distance only once the motion settles at the current one,
-            // so far parts are not dropped while the overlap still slides; at the
-            // finest distance, settle well below the sample spacing.
-            let settled = if distance <= d_final {
-                spacing * 0.05
+        let mut steps: Vec<IcpStep> = vec![];
+        let mut stopped_at = None;
+        for (level, &distance) in distances.iter().enumerate() {
+            job.report(Stage::IcpIterations, level as u64, distances.len() as u64);
+            // A grid as fine as the distance keeps the narrow searches short.
+            let narrower;
+            let reference = if level == 0 {
+                &first
             } else {
-                distance * 0.02
+                narrower = Reference {
+                    points: &target,
+                    normals: &normals,
+                    grid: Grid::new(&target, distance),
+                };
+                &narrower
             };
-            if moved < settled {
-                if distance <= d_final {
-                    break;
+            // A narrower distance keeping under a tenth of the first's
+            // correspondences fits too little of the item to trust.
+            let least = steps
+                .first()
+                .map_or(6., |s| (s.overlap * moving.len() as f64 * 0.1).max(6.));
+            // Each distance settles before the next drops far parts; the
+            // narrowest well below the sample spacing.
+            let settled = if level + 1 == distances.len() {
+                spacing.min(distance) * 0.05
+            } else {
+                distance * 0.005
+            };
+            let mut trial = motion;
+            let mut iterations = 0;
+            let mut fitted = || -> Result<()> {
+                for _ in 0..options.iterations {
+                    job.check()?;
+                    iterations += 1;
+                    let pairs = reference.pairs(&moving, trial, distance);
+                    if (pairs.len() as f64) < least {
+                        bail!(crate::CoreError::NoOverlap);
+                    }
+                    let next = reference.step(&pairs, distance)? * trial;
+                    // Re-orthonormalise against drift.
+                    let (_, r, t) = next.to_scale_rotation_translation();
+                    let next = DMat4::from_rotation_translation(r.normalize(), t);
+                    let moved = farthest_shift(&moving, trial, next);
+                    trial = next;
+                    if moved < settled {
+                        break;
+                    }
                 }
-                distance = (distance * 0.5).max(d_final);
+                Ok(())
+            };
+            if let Err(e) = fitted() {
+                if level == 0 || crate::CoreError::find(&e) == Some(&crate::CoreError::Cancelled) {
+                    return Err(e);
+                }
+                stopped_at = Some(distance);
+                break;
             }
+            motion = trial;
+            let pairs = reference.pairs(&moving, motion, distance);
+            steps.push(IcpStep {
+                distance,
+                rms: reference.rms(&pairs),
+                overlap: pairs.len() as f64 / moving.len() as f64,
+                iterations,
+            });
         }
-        // Score at the final distance.
-        let points: Vec<_> = moving.iter().map(|p| motion.transform_point3(*p)).collect();
-        // Matched points count toward the overlap; the RMS uses the distance
-        // to the reference surface where it is a plane, as ICP minimises. Point
-        // distances at edges would mostly measure the sample spacing.
-        let matches: Vec<Option<f64>> = parallel(points.len(), |range| {
-            range
-                .filter_map(|i| {
-                    let (j, _) = grid.nearest(&target, points[i], d_final)?;
-                    Some(
-                        normals[j as usize]
-                            .map(|n| (target[j as usize] - points[i]).dot(n).powi(2)),
-                    )
-                })
-                .collect()
-        });
-        let surface: Vec<f64> = matches.iter().flatten().copied().collect();
-        let rms = (surface.iter().sum::<f64>() / surface.len().max(1) as f64).sqrt();
+        let last = steps.last().expect("the first distance fits or fails");
         let world_motion =
             DMat4::from_translation(centre) * motion * DMat4::from_translation(-centre);
         Ok(IcpResult {
             pose: self.moved_pose(item, initial, world_motion),
-            rms,
-            overlap: matches.len() as f64 / moving.len() as f64,
-            iterations,
+            rms: last.rms,
+            overlap: first.pairs(&moving, motion, d0).len() as f64 / moving.len() as f64,
+            iterations: steps.iter().map(|s| s.iterations).sum(),
+            steps,
+            stopped_at,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{rigid_fit, solve6, symmetric_eigen};
+    use super::{narrowing, rigid_fit, solve6, symmetric_eigen};
     use glam::{DMat4, DQuat, DVec3};
 
     #[test]
@@ -591,5 +689,13 @@ mod tests {
             row[5] = 0.;
         }
         assert!(solve6(a, b).is_none());
+    }
+
+    #[test]
+    fn distances_halve_down_to_the_end_and_never_widen() {
+        assert_eq!(narrowing(0.4, 0.1), [0.4, 0.2, 0.1]);
+        assert_eq!(narrowing(0.5, 0.2), [0.5, 0.25, 0.2]);
+        assert_eq!(narrowing(0.3, 0.3), [0.3]);
+        assert_eq!(narrowing(0.3, 1.), [0.3]);
     }
 }

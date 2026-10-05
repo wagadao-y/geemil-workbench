@@ -74,9 +74,10 @@ pub(super) struct Settings {
     moving_min_scans: u32,
     noise_radius: f64,
     noise_neighbours: u32,
-    /// Maximum correspondence distances, coarse to fine, each with its own
-    /// run button: ICP from a rough manual placement, then closer.
-    icp_distances: [f64; 4],
+    /// ICP correspondence distances: the first covers what is left of a rough
+    /// placement, and the run narrows it down to the last.
+    icp_start: f64,
+    icp_end: f64,
     icp_samples: usize,
     outlier_neighbours: u32,
     outlier_deviations: f64,
@@ -102,7 +103,8 @@ impl Default for Settings {
             moving_min_scans: 2,
             noise_radius: 0.05,
             noise_neighbours: 4,
-            icp_distances: [0.5, 0.1, 0.03, 0.01],
+            icp_start: 0.5,
+            icp_end: 0.02,
             icp_samples: 60_000,
             // CloudCompare's defaults.
             outlier_neighbours: 6,

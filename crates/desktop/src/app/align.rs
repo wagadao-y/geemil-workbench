@@ -6,6 +6,7 @@ use super::{
     dialogs::{AlignNext, Dialog},
     selection::Tool,
 };
+use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::{IcpOptions, IcpResult, Pose, Project, rigid_fit};
@@ -79,6 +80,40 @@ impl Align {
     pub(super) fn drop_result(&mut self) {
         self.preview = None;
         self.report = None;
+    }
+}
+
+/// The ICP result: the fit at each distance it narrowed through, and why it
+/// stopped short of the end distance if it did.
+fn icp_report(ui: &mut egui::Ui, t: &Strings, r: &IcpResult) {
+    let end = r.steps.last().map_or(0., |s| s.distance);
+    ui.label((t.align_icp_result)(r.rms, end, r.overlap * 100.));
+    egui::CollapsingHeader::new((t.align_icp_steps)(r.steps.len(), r.iterations))
+        .id_salt("icp steps")
+        .show(ui, |ui| {
+            egui::Grid::new("icp steps grid")
+                .num_columns(4)
+                .striped(true)
+                .show(ui, |ui| {
+                    for heading in t.align_icp_step_columns {
+                        ui.label(*heading);
+                    }
+                    ui.end_row();
+                    for s in &r.steps {
+                        ui.label(format!("{:.3} m", s.distance));
+                        ui.label(format!("{:.4} m", s.rms));
+                        ui.label(format!("{:.0}%", s.overlap * 100.));
+                        ui.label(s.iterations.to_string());
+                        ui.end_row();
+                    }
+                });
+        });
+    let warn = egui::Color32::from_rgb(255, 190, 80);
+    if let Some(at) = r.stopped_at {
+        ui.colored_label(warn, (t.align_icp_stopped)(at, end));
+    }
+    if r.overlap < 0.1 {
+        ui.colored_label(warn, t.align_low_overlap);
     }
 }
 
@@ -194,8 +229,8 @@ impl Workbench {
             && let Ok(result) = rx.try_recv()
         {
             self.align.icp = None;
-            self.status =
-                (self.t.align_icp_result)(result.rms, result.overlap * 100., result.iterations);
+            let end = result.steps.last().map_or(0., |s| s.distance);
+            self.status = (self.t.align_icp_result)(result.rms, end, result.overlap * 100.);
             self.align.preview = Some(result.pose);
             self.align.report = Some(Report::Icp(result));
         }
@@ -289,8 +324,8 @@ impl Workbench {
             Err(e) => self.error = Some(super::jobs::Notice::new(self.t, &e)),
         }
     }
-    /// Runs ICP with correspondences up to `max_distance` metres.
-    fn run_icp(&mut self, ctx: &egui::Context, max_distance: f64) {
+    /// Runs ICP from the start distance down to the end distance.
+    fn run_icp(&mut self, ctx: &egui::Context) {
         let (Some(p), Some(item)) = (self.project.clone(), self.align.item) else {
             return;
         };
@@ -303,7 +338,8 @@ impl Workbench {
         });
         let (_, reference) = self.align_scans(&p);
         let options = IcpOptions {
-            max_distance,
+            max_distance: self.settings.icp_start,
+            min_distance: self.settings.icp_end,
             samples: self.settings.icp_samples,
             ..Default::default()
         };
@@ -460,34 +496,23 @@ impl Workbench {
 
                 ui.strong(t.align_icp);
                 ui.small(t.align_icp_hint);
-                let mut run = None;
                 egui::Grid::new("icp options")
-                    .num_columns(3)
+                    .num_columns(2)
                     .show(ui, |ui| {
-                        // Coarse to fine, each run starting where the last left off.
-                        for (step, distance) in self.settings.icp_distances.iter_mut().enumerate() {
-                            ui.label(if step == 0 { t.align_icp_distance } else { "" });
-                            ui.add(
-                                egui::DragValue::new(distance)
-                                    .range(0.001..=20.)
-                                    .speed(0.005)
-                                    .max_decimals(3),
-                            );
-                            if ui
-                                .add_enabled(
-                                    idle && !reference.is_empty(),
-                                    egui::Button::new(format!(
-                                        "{} {}",
-                                        icon::MAGNET,
-                                        t.align_run_icp
-                                    )),
-                                )
-                                .clicked()
-                            {
-                                run = Some(*distance);
-                            }
-                            ui.end_row();
-                        }
+                        let metres = |value| {
+                            egui::DragValue::new(value)
+                                .range(0.001..=20.)
+                                .speed(0.005)
+                                .max_decimals(3)
+                                .suffix(" m")
+                        };
+                        ui.label(t.align_icp_start);
+                        ui.add(metres(&mut self.settings.icp_start));
+                        ui.end_row();
+                        ui.label(t.align_icp_end);
+                        ui.add(metres(&mut self.settings.icp_end))
+                            .on_hover_text(t.align_icp_end_hint);
+                        ui.end_row();
                         ui.label(t.align_icp_samples);
                         ui.add(
                             egui::DragValue::new(&mut self.settings.icp_samples)
@@ -496,8 +521,14 @@ impl Workbench {
                         );
                         ui.end_row();
                     });
-                if let Some(distance) = run {
-                    self.run_icp(&ctx, distance);
+                if ui
+                    .add_enabled(
+                        idle && !reference.is_empty(),
+                        egui::Button::new(format!("{} {}", icon::MAGNET, t.align_run_icp)),
+                    )
+                    .clicked()
+                {
+                    self.run_icp(&ctx);
                 }
                 ui.separator();
 
@@ -505,15 +536,7 @@ impl Workbench {
                     Some(Report::Pairs { rms }) => {
                         ui.label((t.align_pairs_result)(*rms));
                     }
-                    Some(Report::Icp(r)) => {
-                        ui.label((t.align_icp_result)(r.rms, r.overlap * 100., r.iterations));
-                        if r.overlap < 0.1 {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(255, 190, 80),
-                                t.align_low_overlap,
-                            );
-                        }
-                    }
+                    Some(Report::Icp(r)) => icp_report(ui, t, r),
                     None => {}
                 }
                 if preview {
@@ -591,7 +614,7 @@ impl Workbench {
         self.selection.tool = Tool::Align;
         self.select_tree_item(first);
         self.align_update();
-        self.run_icp(ctx, self.settings.icp_distances[0]);
+        self.run_icp(ctx);
     }
     /// For smoke tests: four pairs between displayed points of the first scan
     /// and the same places expressed in another scan, then a fit. The points
