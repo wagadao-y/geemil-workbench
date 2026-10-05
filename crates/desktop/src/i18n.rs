@@ -63,6 +63,14 @@ pub struct Strings {
     pub remove_noise: &'static str,
     pub remove_outliers: &'static str,
     pub reduce_overlap: &'static str,
+    pub remove_moving: &'static str,
+    pub moving_message: &'static str,
+    pub moving_cell: &'static str,
+    pub moving_cell_hint: &'static str,
+    pub moving_tolerance: &'static str,
+    pub moving_tolerance_hint: &'static str,
+    pub moving_min_scans: &'static str,
+    pub moving_min_scans_hint: &'static str,
     pub scatter: &'static str,
     pub overlap_message: &'static str,
     pub overlap_cell: &'static str,
@@ -76,7 +84,7 @@ pub struct Strings {
     pub voxel_size: &'static str,
     pub search_radius: &'static str,
     pub min_neighbours: &'static str,
-    pub filter_targets: fn(scans: usize) -> String,
+    pub filter_targets: fn(scans: usize, together: bool) -> String,
     pub run: &'static str,
     pub points_moved: fn(points: &str, layer: &str) -> String,
     pub status_no_change: &'static str,
@@ -191,6 +199,7 @@ pub struct Strings {
     pub layer_noise: &'static str,
     pub layer_subsampled: &'static str,
     pub layer_overlap: &'static str,
+    pub layer_moving: &'static str,
     pub new_layer: &'static str,
     pub new_layer_title: &'static str,
     pub new_layer_suffix: fn(name: &str) -> String,
@@ -358,6 +367,14 @@ pub static JA: Strings = Strings {
     remove_noise: "ノイズ除去…",
     remove_outliers: "統計的外れ値除去（SOR）…",
     reduce_overlap: "スキャンの重なりを整理…",
+    remove_moving: "動体除去…",
+    moving_message: "通行人など、あるスキャンにだけ写った物の点を移動先のレイヤーへ移します。別のスキャンのレーザーがその点の位置を素通りして奥まで届いていれば、そのスキャンを撮ったときそこには何もなかったとみなします。表示中のスキャンをまとめて判定し、位置合わせを済ませてから実行します。磨いた床などの映り込みで床下にできた点（ゴースト）があると床まで移ることがあるので、先に床下の点を別のレイヤーへ移しておいてください（非表示のレイヤーの点は判定に使いません）。素通りを判定できるのはスキャン位置（器械点）を持つスキャン（姿勢付きのE57）だけですが、判定される側はどのスキャンでも構いません。ずっと同じ場所にいた人や、1つのスキャンからしか見えない場所の物は残ります。細い物（手すり・椅子の脚など）が移ることがあるので、移した点を確かめてから書き出してください。",
+    moving_cell: "距離画像のマス（度）",
+    moving_cell_hint: "各スキャンの器械点から見た方向ごとに、測った距離を記録する格子の大きさです。スキャンの角度分解能より粗くしてください（目安は分解能の2倍以上）。細かいほど細い物まで見分けますが、計測の隙間を素通りと誤りやすくなり、メモリも増えます（0.1°で1スキャン約26MB）。",
+    moving_tolerance: "許容幅（m）",
+    moving_min_scans: "素通りしたスキャン数",
+    moving_min_scans_hint: "この数以上のスキャンが素通りした点だけを移します。2以上にすると、1つのスキャンだけの映り込み（ゴースト）や位置合わせのずれで静止物を移すのを防げます。ただし、そのスキャンを含めて2スキャンからしか見えない場所の動体は残ります。",
+    moving_tolerance_hint: "別のスキャンがこれ以上奥まで測っていれば素通りとみなします。遠いほどマスの大きさの分を加えます。位置合わせの誤差と計測のばらつきより大きくしてください。床に立つ人の足もとはこの幅の分だけ残ります。",
     scatter: "位置合わせ練習用にスキャンをばらす…",
     overlap_message: "スキャンが重なる場所では、場所ごとに最も密に点を取っているスキャン（近い・正面から撮ったスキャン）の点だけを残し、ほかのスキャンの点を移動先のレイヤーへ移します。スキャンごとの色の違いで点群がざらついて見えるのを防ぎます。スキャン位置は不要で、表示中のスキャンをまとめて判定します。移した点は「点群」へ戻せます。",
     overlap_cell: "判定の格子（m）",
@@ -371,8 +388,13 @@ pub static JA: Strings = Strings {
     voxel_size: "ボクセルの大きさ（m）",
     search_radius: "探索半径（m）",
     min_neighbours: "最小近傍点数",
-    filter_targets: |scans| {
-        format!("表示中の {scans} スキャンの、表示中のレイヤーの点に、スキャンごとに適用します。")
+    filter_targets: |scans, together| {
+        let how = if together {
+            "まとめて判定します"
+        } else {
+            "スキャンごとに適用します"
+        };
+        format!("表示中の {scans} スキャンの、表示中のレイヤーの点に、{how}。")
     },
     run: "実行",
     points_moved: |points, layer| format!("{points} 点を「{layer}」へ移動しました。"),
@@ -486,6 +508,7 @@ pub static JA: Strings = Strings {
     layer_noise: "ノイズ",
     layer_subsampled: "間引き",
     layer_overlap: "重複",
+    layer_moving: "動体",
     new_layer: "新しいレイヤー",
     new_layer_title: "新しいレイヤー",
     new_layer_suffix: |name| format!("{name}（新規）"),
@@ -511,6 +534,8 @@ pub static JA: Strings = Strings {
         "subsample" => "間引き",
         "noise_filter" => "ノイズ除去",
         "outlier_filter" => "外れ値除去",
+        "reduce_overlap" => "重なりの整理",
+        "moving_objects" => "動体除去",
         "box" => "ボックス切り出し",
         "create_group" | "rename_group" | "move" | "ungroup" => "ツリー編集",
         "remove_scans" => "スキャンを外す",
@@ -640,6 +665,8 @@ pub static JA: Strings = Strings {
         Stage::IcpSampling => "ICP: 点を抽出中",
         Stage::IcpIterations => "ICP: 反復計算中",
         Stage::ViewPoints => "表示点を読み込み中",
+        Stage::RangeImages => "動体: 距離画像を作成中",
+        Stage::MovingObjects => "動体: 判定中",
     },
     core_error: |error| {
         match error {
@@ -675,6 +702,9 @@ pub static JA: Strings = Strings {
         }
         CoreError::AlignmentUndetermined => {
             "重なる部分の形状（平面だけなど）から位置が決まりません。対応点で合わせてください。".into()
+        }
+        CoreError::NoScannerPositions => {
+            "表示中のスキャンにスキャン位置（器械点）を持つものがありません。動体除去には姿勢付きのE57のスキャンが必要です。".into()
         }
     }
     },

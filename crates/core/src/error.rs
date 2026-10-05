@@ -24,6 +24,8 @@ pub enum Stage {
     IcpSampling,
     IcpIterations,
     ViewPoints,
+    RangeImages,
+    MovingObjects,
 }
 impl fmt::Display for Stage {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -48,6 +50,8 @@ impl fmt::Display for Stage {
             Self::IcpSampling => "ICP: sampling",
             Self::IcpIterations => "ICP: iterating",
             Self::ViewPoints => "View points",
+            Self::RangeImages => "Range images",
+            Self::MovingObjects => "Moving objects",
         })
     }
 }
@@ -71,6 +75,8 @@ pub enum CoreError {
     NoOverlap,
     /// The overlap does not fix the motion, e.g. it is a single plane.
     AlignmentUndetermined,
+    /// Moving object removal needs scans that know where their scanner stood.
+    NoScannerPositions,
 }
 impl CoreError {
     pub fn find(error: &anyhow::Error) -> Option<&Self> {
@@ -106,6 +112,7 @@ impl fmt::Display for CoreError {
             Self::AlignmentUndetermined => {
                 write!(f, "The overlap does not determine the alignment")
             }
+            Self::NoScannerPositions => write!(f, "No scan has a scanner position"),
         }
     }
 }

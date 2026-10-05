@@ -67,6 +67,11 @@ pub(super) struct Settings {
     subsample_size: f64,
     subsample_merged: bool,
     overlap_size: f64,
+    /// Moving object removal: range image cell in degrees, tolerance and
+    /// how many scans must see through a point.
+    moving_cell_degrees: f64,
+    moving_tolerance: f64,
+    moving_min_scans: u32,
     noise_radius: f64,
     noise_neighbours: u32,
     /// Maximum correspondence distances, coarse to fine, each with its own
@@ -92,6 +97,9 @@ impl Default for Settings {
             subsample_size: 0.01,
             subsample_merged: false,
             overlap_size: 0.1,
+            moving_cell_degrees: 0.1,
+            moving_tolerance: 0.05,
+            moving_min_scans: 2,
             noise_radius: 0.05,
             noise_neighbours: 4,
             icp_distances: [0.5, 0.1, 0.03, 0.01],

@@ -159,7 +159,7 @@ impl Workbench {
                     self.dirty = true;
                 }
                 ui.separator();
-                ui.small((t.filter_targets)(self.visible.len()));
+                ui.small((t.filter_targets)(self.visible.len(), false));
                 if let Some(p) = &self.project {
                     ui.horizontal(|ui| {
                         destination_combo(

@@ -24,7 +24,7 @@ pub struct SmokeOptions {
     /// (mode, whether an inside selection limits its depth).
     pub select: Option<(SelectionMode, bool)>,
     /// Open this dialog for the capture: revisions, shortcuts, new-project,
-    /// cleanup, scatter, save-as, subsample, noise, export or export-las. Also selects the first folder of the tree.
+    /// cleanup, scatter, save-as, subsample, noise, moving, export or export-las. Also selects the first folder of the tree.
     pub dialog: Option<String>,
     /// Steps run one by one once the view loaded, each followed by a state
     /// line: exclude (move the selection to the "deleted" layer), undo, redo,
@@ -33,7 +33,9 @@ pub struct SmokeOptions {
     /// preview (edit the first scan's transform without applying it),
     /// apply-transform (apply the edited transform), subsample (5 cm voxels),
     /// subsample-merged (5 cm voxels over all visible scans),
-    /// noise (0.1 m radius, 4 neighbours), sor (6 neighbours, 1 sigma), align-icp (ICP of the first scan
+    /// noise (0.1 m radius, 4 neighbours), sor (6 neighbours, 1 sigma),
+    /// moving (0.1 degree cells, 5 cm tolerance, 2 scans), solo-layer (show only the
+    /// newest layer), align-icp (ICP of the first scan
     /// against the others, previewed), align-pairs (fit four coinciding pairs),
     /// align-apply (apply the previewed result), ortho (parallel projection,
     /// top view), box (a 2 m slice at the median height, inside highlighted),
@@ -56,6 +58,8 @@ pub(super) struct SmokeTest {
     select: Option<(SelectionMode, bool)>,
     dialog: Option<String>,
     script: std::collections::VecDeque<String>,
+    /// When the last script step ran; its view gets a moment to load.
+    last_step: Option<Instant>,
     requested: bool,
     probes: Vec<(egui::Pos2, [u8; 4])>,
     camera: Camera,
@@ -79,6 +83,7 @@ impl SmokeTest {
             select: options.select,
             dialog: options.dialog,
             script: options.script.into(),
+            last_step: None,
             requested: false,
             probes: vec![],
             camera: Camera::default(),
@@ -209,6 +214,14 @@ impl Workbench {
                     },
                     None,
                 )),
+                "moving" => Some(Dialog::Filter(
+                    super::dialogs::Filter::Moving {
+                        cell_degrees: self.settings.moving_cell_degrees,
+                        tolerance: self.settings.moving_tolerance,
+                        min_scans: self.settings.moving_min_scans,
+                    },
+                    None,
+                )),
                 "save-as" => Some(Dialog::SaveAs {
                     name: "リビジョン 2".into(),
                 }),
@@ -253,6 +266,7 @@ impl Workbench {
             && let Some(step) = self.smoke.script.pop_front()
         {
             self.smoke_step(ctx, &step);
+            self.smoke.last_step = Some(Instant::now());
             ctx.request_repaint();
         }
         let shown = self.shown_count();
@@ -335,6 +349,10 @@ impl Workbench {
             && (!self.nodes.is_empty() || empty)
             && !self.renderer.as_ref().is_some_and(|r| r.pending())
             && smoke.started.elapsed() > smoke.orbit_duration + Duration::from_secs(1)
+            && !self.dirty
+            && smoke
+                .last_step
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(1))
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             smoke.requested = true;
@@ -547,6 +565,15 @@ impl Workbench {
                 },
                 None,
             ),
+            "moving" => self.run_filter(
+                ctx,
+                super::dialogs::Filter::Moving {
+                    cell_degrees: 0.1,
+                    tolerance: 0.05,
+                    min_scans: 2,
+                },
+                None,
+            ),
             "restore" => {
                 // Every point of the newest layer back to the default one.
                 let newest = self
@@ -593,6 +620,19 @@ impl Workbench {
                     .unwrap_or_default();
                 for code in codes {
                     self.apply_edit(|p| p.set_layer_visible(code, true));
+                }
+            }
+            "solo-layer" => {
+                // Only the newest layer, e.g. what a filter just moved.
+                let codes: Vec<_> = self
+                    .project
+                    .as_ref()
+                    .map(|p| p.current().layers.iter().map(|l| l.code).collect())
+                    .unwrap_or_default();
+                if let Some(&last) = codes.last() {
+                    for code in codes {
+                        self.apply_edit(|p| p.set_layer_visible(code, code == last));
+                    }
                 }
             }
             "apply-transform" => {

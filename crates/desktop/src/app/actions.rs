@@ -48,6 +48,7 @@ pub(super) enum Action {
     RemoveNoise,
     RemoveOutliers,
     ReduceOverlap,
+    RemoveMoving,
     Scatter,
     Tool(Tool),
     Shortcuts,
@@ -81,6 +82,7 @@ impl Action {
             Self::RemoveNoise => icon::FUNNEL,
             Self::RemoveOutliers => icon::CHART_SCATTER,
             Self::ReduceOverlap => icon::INTERSECT,
+            Self::RemoveMoving => icon::PERSON_SIMPLE_WALK,
             Self::Scatter => icon::SHUFFLE,
             Self::Tool(Tool::Navigate) => icon::HAND,
             Self::Tool(Tool::Rect) => icon::SELECTION,
@@ -121,6 +123,7 @@ impl Action {
             Self::RemoveNoise => t.remove_noise.into(),
             Self::RemoveOutliers => t.remove_outliers.into(),
             Self::ReduceOverlap => t.reduce_overlap.into(),
+            Self::RemoveMoving => t.remove_moving.into(),
             Self::Scatter => t.scatter.into(),
             Self::Tool(Tool::Navigate) => t.navigate.into(),
             Self::Tool(Tool::Rect) => t.tool_rect.into(),
@@ -219,7 +222,7 @@ impl Workbench {
             Action::Subsample | Action::RemoveNoise | Action::RemoveOutliers => {
                 idle && !self.visible.is_empty()
             }
-            Action::ReduceOverlap => idle && self.visible.len() > 1,
+            Action::ReduceOverlap | Action::RemoveMoving => idle && self.visible.len() > 1,
             Action::FitView | Action::View(_) => project.is_some(),
             Action::Quit
             | Action::ClearSelection
@@ -367,6 +370,16 @@ impl Workbench {
                     None,
                 ))
             }
+            Action::RemoveMoving => {
+                self.dialog = Some(Dialog::Filter(
+                    Filter::Moving {
+                        cell_degrees: self.settings.moving_cell_degrees,
+                        tolerance: self.settings.moving_tolerance,
+                        min_scans: self.settings.moving_min_scans,
+                    },
+                    None,
+                ))
+            }
             Action::RemoveOutliers => {
                 self.dialog = Some(Dialog::Filter(
                     Filter::Statistical {
@@ -455,6 +468,15 @@ impl Workbench {
                 self.settings.subsample_merged = merged;
             }
             Filter::Overlap { size } => self.settings.overlap_size = size,
+            Filter::Moving {
+                cell_degrees,
+                tolerance,
+                min_scans,
+            } => {
+                self.settings.moving_cell_degrees = cell_degrees;
+                self.settings.moving_tolerance = tolerance;
+                self.settings.moving_min_scans = min_scans;
+            }
             Filter::Noise {
                 radius,
                 min_neighbours,
@@ -484,6 +506,18 @@ impl Workbench {
                     project.subsample_merged(size, &ids, &target, &job)?
                 }
                 Filter::Overlap { size } => project.reduce_overlap(size, &ids, &target, &job)?,
+                Filter::Moving {
+                    cell_degrees,
+                    tolerance,
+                    min_scans,
+                } => {
+                    let options = geemil_core::MovingOptions {
+                        cell_degrees,
+                        tolerance,
+                        min_scans,
+                    };
+                    project.remove_moving(options, &ids, &target, &job)?
+                }
                 Filter::Noise {
                     radius,
                     min_neighbours,

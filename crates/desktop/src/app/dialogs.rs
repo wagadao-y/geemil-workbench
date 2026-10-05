@@ -84,6 +84,12 @@ pub(super) enum Filter {
     Overlap {
         size: f64,
     },
+    /// Moving object removal over the visible scans together.
+    Moving {
+        cell_degrees: f64,
+        tolerance: f64,
+        min_scans: u32,
+    },
     Noise {
         radius: f64,
         min_neighbours: u32,
@@ -95,11 +101,19 @@ pub(super) enum Filter {
     },
 }
 impl Filter {
+    /// Whether it judges the visible scans together rather than each alone.
+    fn together(&self) -> bool {
+        matches!(
+            self,
+            Filter::Overlap { .. } | Filter::Moving { .. } | Filter::Subsample { merged: true, .. }
+        )
+    }
     /// The layer the filter moves points to unless another is chosen.
     pub(super) fn default_layer(&self, t: &'static Strings) -> &'static str {
         match self {
             Filter::Subsample { .. } => t.layer_subsampled,
             Filter::Overlap { .. } => t.layer_overlap,
+            Filter::Moving { .. } => t.layer_moving,
             Filter::Noise { .. } | Filter::Statistical { .. } => t.layer_noise,
         }
     }
@@ -374,6 +388,10 @@ impl Workbench {
                             format!("{} {}", icon::INTERSECT, t.reduce_overlap),
                             t.overlap_message,
                         ),
+                        Filter::Moving { .. } => (
+                            format!("{} {}", icon::PERSON_SIMPLE_WALK, t.remove_moving),
+                            t.moving_message,
+                        ),
                         Filter::Noise { .. } => (
                             format!("{} {}", icon::FUNNEL, t.remove_noise),
                             t.noise_message,
@@ -401,6 +419,30 @@ impl Workbench {
                             Filter::Overlap { size } => {
                                 ui.label(t.overlap_cell);
                                 ui.add(metres(size)).on_hover_text(t.overlap_cell_hint);
+                                ui.end_row();
+                            }
+                            Filter::Moving {
+                                cell_degrees,
+                                tolerance,
+                                min_scans,
+                            } => {
+                                ui.label(t.moving_cell);
+                                ui.add(
+                                    egui::DragValue::new(cell_degrees)
+                                        .range(0.01..=5.)
+                                        .speed(0.01)
+                                        .max_decimals(2)
+                                        .suffix("°"),
+                                )
+                                .on_hover_text(t.moving_cell_hint);
+                                ui.end_row();
+                                ui.label(t.moving_tolerance);
+                                ui.add(metres(tolerance))
+                                    .on_hover_text(t.moving_tolerance_hint);
+                                ui.end_row();
+                                ui.label(t.moving_min_scans);
+                                ui.add(egui::DragValue::new(min_scans).range(1..=10))
+                                    .on_hover_text(t.moving_min_scans_hint);
                                 ui.end_row();
                             }
                             Filter::Noise {
@@ -441,7 +483,7 @@ impl Workbench {
                             destination_combo(ui, t, p, "filter destination", default, destination);
                         });
                     }
-                    ui.small((t.filter_targets)(visible));
+                    ui.small((t.filter_targets)(visible, filter.together()));
                     ui.horizontal(|ui| {
                         ui.label(t.filter_memory);
                         ui.add(

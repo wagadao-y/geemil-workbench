@@ -41,9 +41,9 @@ impl Default for FilterOptions {
 }
 
 /// The valid points of a chunk in visible layers, in scan coordinates.
-struct ChunkPoints {
-    indices: Vec<u32>,
-    positions: Vec<DVec3>,
+pub(crate) struct ChunkPoints {
+    pub(crate) indices: Vec<u32>,
+    pub(crate) positions: Vec<DVec3>,
 }
 impl ChunkPoints {
     fn bytes(&self) -> usize {
@@ -54,7 +54,7 @@ impl ChunkPoints {
 /// A scan's view of the decoded chunks one filter keeps: a small LRU shared
 /// by the workers and by the caches of every scan the filter reads, within
 /// one budget, so a filter over many scans keeps as much as one over few.
-struct ChunkCache<'a> {
+pub(crate) struct ChunkCache<'a> {
     project: &'a Project,
     scan: &'a Scan,
     shared: Arc<SharedChunks>,
@@ -79,7 +79,7 @@ impl<'a> ChunkCache<'a> {
     }
     /// One cache per scan over a quarter of the filter memory together;
     /// with `release`, each scan's chunks leave once that scan is done.
-    fn for_scans(project: &'a Project, scans: &[&'a Scan], release: bool) -> Vec<Self> {
+    pub(crate) fn for_scans(project: &'a Project, scans: &[&'a Scan], release: bool) -> Vec<Self> {
         let shared = Arc::new(SharedChunks {
             state: Mutex::default(),
             limit: project.filter_options.memory_bytes / 4,
@@ -107,7 +107,7 @@ impl<'a> ChunkCache<'a> {
         });
         state.bytes -= freed;
     }
-    fn get(&self, chunk: u32, job: &JobControl) -> Result<Arc<ChunkPoints>> {
+    pub(crate) fn get(&self, chunk: u32, job: &JobControl) -> Result<Arc<ChunkPoints>> {
         {
             let mut state = self.shared.state.lock().unwrap();
             state.clock += 1;
@@ -1534,20 +1534,20 @@ impl Project {
 }
 
 /// Chunks done over all passes, for progress reports.
-struct Progress {
+pub(crate) struct Progress {
     stage: Stage,
     done: AtomicU64,
     total: u64,
 }
 impl Progress {
-    fn new(stage: Stage, scans: &[&Scan], passes: u64) -> Self {
+    pub(crate) fn new(stage: Stage, scans: &[&Scan], passes: u64) -> Self {
         Self {
             stage,
             done: AtomicU64::new(0),
             total: scans.iter().map(|s| s.chunks.len() as u64).sum::<u64>() * passes,
         }
     }
-    fn step(&self, job: &JobControl) {
+    pub(crate) fn step(&self, job: &JobControl) {
         job.report(
             self.stage,
             self.done.fetch_add(1, Ordering::Relaxed) + 1,
@@ -1561,7 +1561,7 @@ impl Progress {
 /// shuffled and final bytes), neighbour/own arrays, search structures,
 /// labels and scratch. Merged filtering can read a chunk from any current
 /// scan.
-fn filter_workers(project: &Project) -> Result<usize> {
+pub(crate) fn filter_workers(project: &Project) -> Result<usize> {
     let options = project.filter_options;
     ensure!(options.worker_threads <= 64, "Too many filter workers");
     let (mut largest_raw, mut largest_points) = (0, 0);
@@ -1609,7 +1609,7 @@ fn relabelled(
 /// the first error stops the rest. A scan's cache from
 /// [`ChunkCache::for_scans`] with `release` drops its chunks once its last
 /// chunk is consumed.
-fn each_chunk<R: Send>(
+pub(crate) fn each_chunk<R: Send>(
     caches: &[ChunkCache],
     job: &JobControl,
     progress: &Progress,
