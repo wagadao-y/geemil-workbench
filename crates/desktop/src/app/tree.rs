@@ -407,6 +407,7 @@ impl Workbench {
                                 actions.push(TreeAction::Properties(group.id));
                             }
                         });
+                    self.registration_mark(ui, p, group.id);
                 })
                 .body(|ui| {
                     // Indent the contents past the folder's checkbox too, not
@@ -465,6 +466,7 @@ impl Workbench {
                             actions.push(TreeAction::Properties(scan.id));
                         }
                     });
+                self.registration_mark(ui, p, scan.id);
             });
         }
     }

@@ -50,6 +50,7 @@ pub(super) enum Action {
     ReduceOverlap,
     RemoveMoving,
     Scatter,
+    RegistrationList,
     Tool(Tool),
     Shortcuts,
     About,
@@ -84,6 +85,7 @@ impl Action {
             Self::ReduceOverlap => icon::INTERSECT,
             Self::RemoveMoving => icon::PERSON_SIMPLE_WALK,
             Self::Scatter => icon::SHUFFLE,
+            Self::RegistrationList => icon::LIST_CHECKS,
             Self::Tool(Tool::Navigate) => icon::HAND,
             Self::Tool(Tool::Rect) => icon::SELECTION,
             Self::Tool(Tool::Polygon) => icon::POLYGON,
@@ -125,6 +127,7 @@ impl Action {
             Self::ReduceOverlap => t.reduce_overlap.into(),
             Self::RemoveMoving => t.remove_moving.into(),
             Self::Scatter => t.scatter.into(),
+            Self::RegistrationList => t.align_list.into(),
             Self::Tool(Tool::Navigate) => t.navigate.into(),
             Self::Tool(Tool::Rect) => t.tool_rect.into(),
             Self::Tool(Tool::Polygon) => t.tool_polygon.into(),
@@ -214,6 +217,7 @@ impl Workbench {
             Action::NewProject | Action::Open | Action::OpenRecent(_) => idle,
             Action::Import | Action::NewFolder => idle && project.is_some(),
             Action::Export | Action::Scatter => idle && has_scans,
+            Action::RegistrationList => has_scans,
             Action::Undo => idle && self.undo.can_undo(),
             Action::Redo => idle && self.undo.can_redo(),
             Action::Exclude => idle && self.selection.is_ready(),
@@ -401,6 +405,7 @@ impl Workbench {
                 }
             }
             Action::Scatter => self.dialog = Some(Dialog::Scatter),
+            Action::RegistrationList => self.align.list_open = true,
             Action::Shortcuts => self.dialog = Some(Dialog::Shortcuts),
             Action::About => self.dialog = Some(Dialog::About),
         }

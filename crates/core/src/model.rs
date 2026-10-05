@@ -333,6 +333,47 @@ pub struct Revision {
     /// Unix seconds when the user saved this revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_at: Option<u64>,
+    /// How scans and folders were last aligned, by id.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub registrations: BTreeMap<Uuid, Registration>,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationMethod {
+    /// A fit to picked point pairs.
+    Pairs,
+    Icp,
+    /// All scans adjusted together.
+    Global,
+}
+/// How well an alignment fits its reference.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AlignmentFit {
+    pub method: RegistrationMethod,
+    /// RMS in metres: of the picked pairs, else to the reference surface.
+    pub rms: f64,
+    /// Fraction of the item's samples near the reference; not for pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlap: Option<f64>,
+    /// The narrowest correspondence distance reached, in metres; not for pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distance: Option<f64>,
+    /// Whether it stopped narrowing short of the end distance.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stopped: bool,
+    /// How many scans it was aligned to.
+    pub references: usize,
+}
+/// The last alignment of a scan or folder.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Registration {
+    #[serde(flatten)]
+    pub fit: AlignmentFit,
+    /// Where the alignment put the item in the project frame: its folders'
+    /// transforms and its own. Another place now means it moved since.
+    pub placed: Pose,
+    /// Unix seconds.
+    pub at: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Manifest {
@@ -448,6 +489,7 @@ impl Project {
                     groups: vec![],
                     scan_groups: BTreeMap::new(),
                     saved_at: Some(crate::history::now()),
+                    registrations: BTreeMap::new(),
                 }],
                 current: id,
                 draft: None,

@@ -9,7 +9,10 @@ use super::{
 use crate::i18n::Strings;
 use eframe::egui;
 use egui_phosphor::regular as icon;
-use geemil_core::{IcpOptions, IcpResult, Pose, Project, rigid_fit};
+use geemil_core::{
+    AlignmentFit, GlobalOptions, GlobalResult, IcpOptions, IcpResult, Pose, Project,
+    RegistrationMethod, rigid_fit,
+};
 use glam::DVec3;
 use std::collections::HashSet;
 use std::sync::mpsc;
@@ -34,8 +37,36 @@ struct Pair {
     reference: Option<Pick>,
 }
 enum Report {
-    Pairs { rms: f64 },
-    Icp(IcpResult),
+    Pairs {
+        rms: f64,
+    },
+    Icp {
+        result: IcpResult,
+        references: usize,
+    },
+}
+impl Report {
+    /// How well the result fits, as applying it records.
+    fn fit(&self) -> AlignmentFit {
+        match self {
+            Self::Pairs { rms, .. } => AlignmentFit {
+                method: RegistrationMethod::Pairs,
+                rms: *rms,
+                overlap: None,
+                distance: None,
+                stopped: false,
+                references: 0,
+            },
+            Self::Icp { result, references } => AlignmentFit {
+                method: RegistrationMethod::Icp,
+                rms: result.rms,
+                overlap: Some(result.overlap),
+                distance: result.steps.last().map(|s| s.distance),
+                stopped: result.stopped_at.is_some(),
+                references: *references,
+            },
+        }
+    }
 }
 
 pub(super) struct Align {
@@ -45,7 +76,12 @@ pub(super) struct Align {
     /// The proposed own transform of `item`, shown until applied or dropped.
     preview: Option<Pose>,
     report: Option<Report>,
-    icp: Option<mpsc::Receiver<IcpResult>>,
+    icp: Option<mpsc::Receiver<(IcpResult, usize)>>,
+    global: Option<mpsc::Receiver<GlobalResult>>,
+    /// The last global adjustment, for the alignment list.
+    pub(super) last_global: Option<GlobalResult>,
+    /// Whether the alignment list is open.
+    pub(super) list_open: bool,
     /// Colour the moved and the reference points apart.
     tint: bool,
     /// Which side to show, so a point hidden behind the other side can be picked.
@@ -66,6 +102,9 @@ impl Default for Align {
             preview: None,
             report: None,
             icp: None,
+            global: None,
+            last_global: None,
+            list_open: false,
             tint: true,
             show: Show::Both,
             picks: 0,
@@ -225,13 +264,20 @@ impl Workbench {
             }
         }
         if let Some(rx) = &self.align.icp
-            && let Ok(result) = rx.try_recv()
+            && let Ok((result, references)) = rx.try_recv()
         {
             self.align.icp = None;
             let end = result.steps.last().map_or(0., |s| s.distance);
             self.status = (self.t.align_icp_result)(result.rms, end, result.overlap * 100.);
             self.align.preview = Some(result.pose);
-            self.align.report = Some(Report::Icp(result));
+            self.align.report = Some(Report::Icp { result, references });
+        }
+        if let Some(rx) = &self.align.global
+            && let Ok(result) = rx.try_recv()
+        {
+            self.align.global = None;
+            self.align.last_global = Some(result);
+            self.align.list_open = true;
         }
     }
     /// Where a pick is now, with the preview or as applied.
@@ -336,6 +382,7 @@ impl Workbench {
                 .unwrap_or_default()
         });
         let (_, reference) = self.align_scans(&p);
+        let references = reference.len();
         let options = IcpOptions {
             max_distance: self.settings.icp_start,
             min_distance: self.settings.icp_end,
@@ -347,7 +394,7 @@ impl Workbench {
         let project = (*p).clone();
         self.start(ctx, false, move |job| {
             let result = project.icp(item, initial, &reference, &options, &job)?;
-            let _ = tx.send(result);
+            let _ = tx.send((result, references));
             Ok(project)
         });
     }
@@ -370,9 +417,82 @@ impl Workbench {
     }
     pub(super) fn align_apply(&mut self) {
         if let Some((item, pose)) = self.align_preview() {
-            self.apply_edit(|p| p.set_transform(item, pose));
+            match self.align.report.as_ref().map(Report::fit) {
+                Some(fit) => self.apply_edit(|p| p.apply_alignment(item, pose, fit)),
+                None => self.apply_edit(|p| p.set_transform(item, pose)),
+            };
             self.align.preview = None;
         }
+    }
+    /// The scans the global adjustment works on, and those it holds still:
+    /// the scans of the item selected in the tree, else the first of them.
+    fn global_scans(&self, p: &Project) -> (Vec<Uuid>, Vec<Uuid>) {
+        let scans: Vec<Uuid> = p
+            .scans()
+            .map(|s| s.id)
+            .filter(|id| self.visible.contains(id))
+            .collect();
+        let selected: Vec<Uuid> = self
+            .align
+            .item
+            .map(|i| p.scans_within(i))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| scans.contains(id))
+            .collect();
+        let fixed = if selected.is_empty() {
+            scans.first().copied().into_iter().collect()
+        } else {
+            selected
+        };
+        (scans, fixed)
+    }
+    /// Adjusts all visible scans together and applies the result as one edit,
+    /// recording each scan's fit; undo takes it back.
+    fn run_global(&mut self, ctx: &egui::Context) {
+        let Some(p) = self.project.clone() else {
+            return;
+        };
+        let (scans, fixed) = self.global_scans(&p);
+        let options = GlobalOptions {
+            max_distance: self.settings.global_start,
+            min_distance: self.settings.global_end,
+            samples: self.settings.global_samples,
+            ..Default::default()
+        };
+        let (tx, rx) = mpsc::channel();
+        self.align.global = Some(rx);
+        let mut project = (*p).clone();
+        self.start(ctx, true, move |job| {
+            let result = project.align_globally(&scans, &fixed, &options, &job)?;
+            let end = result.steps.last().map(|s| s.distance);
+            let fit = |id: Uuid| {
+                let scan = result.scans_after.iter().find(|f| f.scan == id)?;
+                Some(AlignmentFit {
+                    method: RegistrationMethod::Global,
+                    rms: scan.rms?,
+                    overlap: Some(scan.overlap),
+                    distance: end,
+                    stopped: result.stopped_at.is_some(),
+                    references: scan.neighbours,
+                })
+            };
+            // Moved scans with their new transforms; fixed ones where they are,
+            // since they took part. Scans overlapping none get no record.
+            let mut items = vec![];
+            for (id, pose) in &result.poses {
+                items.extend(fit(*id).map(|f| (*id, *pose, f)));
+            }
+            for id in &result.fixed {
+                let own = project.current().transforms.get(id).copied();
+                items.extend(fit(*id).map(|f| (*id, own.unwrap_or_default(), f)));
+            }
+            if !items.is_empty() {
+                project.apply_alignments(&items)?;
+            }
+            let _ = tx.send(result);
+            Ok(project)
+        });
     }
     /// The right-hand panel of the registration tool.
     pub(super) fn align_panel(&mut self, ui: &mut egui::Ui) {
@@ -535,7 +655,7 @@ impl Workbench {
                     Some(Report::Pairs { rms }) => {
                         ui.label((t.align_pairs_result)(*rms));
                     }
-                    Some(Report::Icp(r)) => icp_report(ui, t, r),
+                    Some(Report::Icp { result, .. }) => icp_report(ui, t, result),
                     None => {}
                 }
                 if preview {
@@ -562,6 +682,66 @@ impl Workbench {
                         self.align.report = None;
                     }
                 });
+                ui.separator();
+
+                ui.strong(t.align_global);
+                ui.small(t.align_global_hint);
+                let (scans, fixed) = self.global_scans(&p);
+                let fixed_names: Vec<String> = fixed
+                    .iter()
+                    .filter_map(|id| p.scan(*id).map(|s| s.name.clone()))
+                    .collect();
+                egui::Grid::new("global options")
+                    .num_columns(2)
+                    .show(ui, |ui| {
+                        ui.label(t.align_global_scans);
+                        ui.label((t.align_global_scan_count)(scans.len()));
+                        ui.end_row();
+                        ui.label(t.align_global_fixed);
+                        ui.label(match &fixed_names[..] {
+                            [one] => one.clone(),
+                            names => (t.align_global_fixed_count)(names.len()),
+                        })
+                        .on_hover_text(t.align_global_fixed_hint);
+                        ui.end_row();
+                        let metres = |value| {
+                            egui::DragValue::new(value)
+                                .range(0.001..=5.)
+                                .speed(0.005)
+                                .max_decimals(3)
+                                .suffix(" m")
+                        };
+                        ui.label(t.align_icp_start);
+                        ui.add(metres(&mut self.settings.global_start));
+                        ui.end_row();
+                        ui.label(t.align_icp_end);
+                        ui.add(metres(&mut self.settings.global_end));
+                        ui.end_row();
+                        ui.label(t.align_global_samples);
+                        ui.add(
+                            egui::DragValue::new(&mut self.settings.global_samples)
+                                .range(5_000..=500_000)
+                                .speed(1000.),
+                        );
+                        ui.end_row();
+                    });
+                if ui
+                    .add_enabled(
+                        idle && !preview && scans.len() >= 2,
+                        egui::Button::new(format!("{} {}", icon::GRAPH, t.align_global_run)),
+                    )
+                    .on_disabled_hover_text(t.align_global_unavailable)
+                    .clicked()
+                {
+                    self.run_global(&ctx);
+                }
+                ui.separator();
+                if ui
+                    .button(format!("{} {}", icon::LIST_CHECKS, t.align_list))
+                    .clicked()
+                {
+                    self.align.list_open = true;
+                }
             });
     }
     /// Numbered markers on the picked points, joined within each pair.
@@ -603,6 +783,17 @@ impl Workbench {
                 );
             }
         }
+    }
+    /// For smoke tests: adjusts all visible scans together, the first fixed.
+    pub(super) fn smoke_global(&mut self, ctx: &egui::Context) {
+        let first = self
+            .project
+            .as_ref()
+            .and_then(|p| p.scans().next().map(|s| s.id));
+        self.selection.tool = Tool::Align;
+        self.select_tree_item(first);
+        self.align_update();
+        self.run_global(ctx);
     }
     /// For smoke tests: aligns the first scan to the others by ICP.
     pub(super) fn smoke_icp(&mut self, ctx: &egui::Context) {
@@ -659,7 +850,7 @@ impl Workbench {
     }
     pub(super) fn align_summary(&self) -> String {
         match &self.align.report {
-            Some(Report::Icp(r)) => format!(
+            Some(Report::Icp { result: r, .. }) => format!(
                 "icp rms {:.4} m, overlap {:.0}%, {} iterations, preview {}",
                 r.rms,
                 r.overlap * 100.,

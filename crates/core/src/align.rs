@@ -193,7 +193,10 @@ impl Grid {
 }
 
 /// Splits `0..n` over worker threads and concatenates their results in order.
-fn parallel<T: Send>(n: usize, work: impl Fn(std::ops::Range<usize>) -> Vec<T> + Sync) -> Vec<T> {
+pub(crate) fn parallel<T: Send>(
+    n: usize,
+    work: impl Fn(std::ops::Range<usize>) -> Vec<T> + Sync,
+) -> Vec<T> {
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(16));
     let size = n.div_ceil(workers).max(1024);
     std::thread::scope(|scope| {
@@ -274,13 +277,13 @@ fn solve6(a: [[f64; 6]; 6], b: [f64; 6]) -> Option<[f64; 6]> {
 /// Samples of a surface with their normals, in a kd-tree for nearest-point
 /// queries: each subslice is a subtree whose middle element splits it on the
 /// axis stored with it.
-struct Surface {
-    points: Vec<DVec3>,
-    normals: Vec<Option<DVec3>>,
+pub(crate) struct Surface {
+    pub(crate) points: Vec<DVec3>,
+    pub(crate) normals: Vec<Option<DVec3>>,
     axes: Vec<u8>,
 }
 impl Surface {
-    fn new(points: Vec<DVec3>, normal_radius: f64) -> Self {
+    pub(crate) fn new(points: Vec<DVec3>, normal_radius: f64) -> Self {
         let normals = normals(&points, normal_radius);
         let mut items: Vec<(DVec3, Option<DVec3>)> = points.into_iter().zip(normals).collect();
         let mut axes = vec![0u8; items.len()];
@@ -318,7 +321,7 @@ impl Surface {
         }
     }
     /// The sample nearest `p` within `radius` and its squared distance.
-    fn nearest(&self, p: DVec3, radius: f64) -> Option<(u32, f64)> {
+    pub(crate) fn nearest(&self, p: DVec3, radius: f64) -> Option<(u32, f64)> {
         fn visit(tree: &Surface, range: std::ops::Range<usize>, p: DVec3, best: &mut (u32, f64)) {
             if range.is_empty() {
                 return;
@@ -418,7 +421,7 @@ impl Surface {
 
 /// The median distance from some of `points` to their nearest other point
 /// within `reach`; a tenth of `reach` when none has one.
-fn typical_spacing(points: &[DVec3], reach: f64) -> f64 {
+pub(crate) fn typical_spacing(points: &[DVec3], reach: f64) -> f64 {
     let grid = Grid::new(points, reach);
     let mut gaps: Vec<f64> = (0..points.len())
         .step_by((points.len() / 2000).max(1))
@@ -443,7 +446,7 @@ fn farthest_shift(points: &[DVec3], a: DMat4, b: DMat4) -> f64 {
 }
 
 /// The correspondence distances from `start`, halving down to `end`.
-fn narrowing(start: f64, end: f64) -> Vec<f64> {
+pub(crate) fn narrowing(start: f64, end: f64) -> Vec<f64> {
     let end = end.min(start);
     let mut distances = vec![start];
     while let Some(&last) = distances.last()
@@ -478,7 +481,7 @@ impl Project {
     /// it and mapped by `world`: whole levels of the additive display octree,
     /// coarsest first, as far as the budget reaches. `region` limits them to
     /// a box in the mapped frame.
-    fn processing_samples(
+    pub(crate) fn processing_samples(
         &self,
         scan: &Scan,
         world: DMat4,

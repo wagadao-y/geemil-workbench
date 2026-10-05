@@ -1,4 +1,7 @@
-use geemil_core::{IcpOptions, ImportOptions, JobControl, Pose, Project, rigid_fit};
+use geemil_core::{
+    AlignmentFit, GlobalOptions, IcpOptions, ImportOptions, JobControl, Pose, Project,
+    RegistrationMethod, rigid_fit,
+};
 use glam::{DMat4, DQuat, DVec3};
 use std::path::Path;
 
@@ -230,4 +233,105 @@ fn icp_reports_no_overlap_and_point_pairs_set_the_initial_pose() {
         )
         .unwrap();
     assert_close(result.pose.matrix(), truth());
+}
+
+#[test]
+fn applied_alignments_are_recorded_until_their_item_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut p, reference, moving) = project(dir.path());
+    let result = p
+        .icp(
+            moving,
+            Pose::default(),
+            &[reference],
+            &IcpOptions::default(),
+            &JobControl::default(),
+        )
+        .unwrap();
+    let fit = AlignmentFit {
+        method: RegistrationMethod::Icp,
+        rms: result.rms,
+        overlap: Some(result.overlap),
+        distance: result.steps.last().map(|s| s.distance),
+        stopped: false,
+        references: 1,
+    };
+    p.apply_alignment(moving, result.pose, fit).unwrap();
+    let state = p.registration(moving).unwrap();
+    assert_eq!(state.registration.fit, fit);
+    assert!(!state.moved);
+    assert!(p.registration(reference).is_none());
+
+    // Into a folder that does not move it: still where it was aligned.
+    let folder = p.create_group("Floor 1".into(), None).unwrap();
+    p.move_to_group(&[moving], Some(folder)).unwrap();
+    assert!(!p.scan_registration(moving).unwrap().moved);
+    // Turning the folder moves it.
+    let turn = Pose::from_matrix(DMat4::from_rotation_z(0.01));
+    p.set_transform(folder, turn).unwrap();
+    assert!(p.scan_registration(moving).unwrap().moved);
+
+    // A folder aligned as a whole speaks for the scans in it.
+    p.apply_alignment(folder, turn, fit).unwrap();
+    let inherited = p.scan_registration(moving).unwrap();
+    assert_eq!(inherited.item, folder);
+    assert!(!inherited.moved);
+
+    p.remove_scans(&[moving]).unwrap();
+    assert!(!p.current().registrations.contains_key(&moving));
+}
+
+#[test]
+fn global_adjustment_moves_the_free_scans_onto_the_fixed_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut p, reference, moving) = project(dir.path());
+    // Left about 0.6 degrees and 4 cm off, as aligning one by one might.
+    let off = DMat4::from_rotation_translation(
+        DQuat::from_euler(glam::EulerRot::XYZ, 0.003, -0.002, 0.01),
+        DVec3::new(0.03, -0.02, 0.01),
+    );
+    p.set_transform(moving, Pose::from_matrix(off * truth()))
+        .unwrap();
+    let options = GlobalOptions {
+        max_distance: 0.2,
+        ..Default::default()
+    };
+    let result = p
+        .align_globally(
+            &[reference, moving],
+            &[reference],
+            &options,
+            &JobControl::default(),
+        )
+        .unwrap();
+    assert_eq!(result.fixed, [reference]);
+    assert!(result.isolated.is_empty());
+    assert_eq!(result.poses.len(), 1);
+    let (id, pose) = result.poses[0];
+    assert_eq!(id, moving);
+    assert_close(pose.matrix(), truth());
+    let (before, after) = (&result.before[0], &result.after[0]);
+    assert!(
+        after.rms < before.rms,
+        "{:?} -> {:?}",
+        before.rms,
+        after.rms
+    );
+    assert_eq!(result.scans_after.len(), 2);
+
+    // Applied together, with a record for each.
+    let fit = AlignmentFit {
+        method: RegistrationMethod::Global,
+        rms: after.rms.unwrap(),
+        overlap: Some(after.overlap),
+        distance: Some(0.02),
+        stopped: false,
+        references: 1,
+    };
+    let own = Pose::default();
+    p.apply_alignments(&[(moving, pose, fit), (reference, own, fit)])
+        .unwrap();
+    assert!(p.registration(moving).is_some() && p.registration(reference).is_some());
+    let scan = p.scans().find(|s| s.id == moving).unwrap().clone();
+    assert_close(p.world_matrix(&scan), truth());
 }

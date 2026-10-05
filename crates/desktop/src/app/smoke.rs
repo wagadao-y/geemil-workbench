@@ -509,6 +509,11 @@ impl Workbench {
             }
             "box-crop" => self.exclude_box(ctx, false),
             "align-icp" => self.smoke_icp(ctx),
+            "align-global" => self.smoke_global(ctx),
+            "align-list" => {
+                self.align.list_open = true;
+                eprintln!("Smoke align list: {}", self.registration_counts());
+            }
             "align-pairs" => {
                 self.smoke_pairs();
                 eprintln!("Smoke align: {}", self.align_summary());

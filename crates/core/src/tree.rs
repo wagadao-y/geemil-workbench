@@ -207,6 +207,7 @@ impl Project {
             }
             s.groups.retain(|g| g.id != id);
             s.transforms.remove(&id);
+            s.registrations.remove(&id);
             Ok(())
         })
     }
@@ -218,6 +219,7 @@ impl Project {
                 ensure!(s.scans.contains(id), "Missing scan");
                 s.scan_groups.remove(id);
                 s.transforms.remove(id);
+                s.registrations.remove(id);
             }
             s.scans.retain(|id| !ids.contains(id));
             Ok(())
@@ -304,6 +306,7 @@ impl Project {
             |s| {
                 for (id, pose) in poses {
                     s.transforms.insert(id, pose);
+                    s.registrations.remove(&id);
                 }
                 Ok(())
             },

@@ -10,6 +10,7 @@ mod layers;
 mod measure;
 mod menu;
 mod navigation;
+mod registrations;
 mod revisions;
 mod selection;
 mod smoke;
@@ -79,6 +80,11 @@ pub(super) struct Settings {
     icp_start: f64,
     icp_end: f64,
     icp_samples: usize,
+    /// Global adjustment: the distances, as for ICP but starting from scans
+    /// already aligned one by one, and samples of each scan.
+    global_start: f64,
+    global_end: f64,
+    global_samples: usize,
     outlier_neighbours: u32,
     outlier_deviations: f64,
     outlier_reach: f64,
@@ -106,6 +112,9 @@ impl Default for Settings {
             icp_start: 0.5,
             icp_end: 0.02,
             icp_samples: 60_000,
+            global_start: 0.1,
+            global_end: 0.02,
+            global_samples: 50_000,
             // CloudCompare's defaults.
             outlier_neighbours: 6,
             outlier_deviations: 1.0,
@@ -360,6 +369,7 @@ impl eframe::App for Workbench {
         } else {
             self.welcome(ui);
         }
+        self.registrations_window(&ctx);
         self.dialogs(&ctx);
         self.request_view();
         self.update_title(&ctx);
