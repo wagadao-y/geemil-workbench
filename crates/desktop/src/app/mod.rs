@@ -20,6 +20,7 @@ mod undo;
 mod view;
 mod viewport;
 mod welcome;
+mod window;
 
 pub use smoke::SmokeOptions;
 
@@ -89,6 +90,8 @@ pub(super) struct Settings {
     outlier_deviations: f64,
     outlier_reach: f64,
     filter_memory_mib: usize,
+    /// The window's last size and place while not maximized.
+    normal_window: Option<window::NormalWindow>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -120,6 +123,7 @@ impl Default for Settings {
             outlier_deviations: 1.0,
             outlier_reach: 0.5,
             filter_memory_mib: 768,
+            normal_window: None,
         }
     }
 }
@@ -181,6 +185,7 @@ pub struct Workbench {
     dialog: Option<dialogs::Dialog>,
     title: String,
 
+    window: window::WindowState,
     smoke: SmokeTest,
 }
 impl Workbench {
@@ -244,6 +249,7 @@ impl Workbench {
             undo: Default::default(),
             dialog: None,
             title: String::new(),
+            window: window::WindowState::new(cc.storage),
             smoke,
         };
         if let Some(path) = path {
@@ -347,6 +353,7 @@ impl eframe::App for Workbench {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.smoke_frame(&ctx);
+        self.track_window(&ctx);
         self.poll_job();
         self.poll_view();
         self.align_update();
