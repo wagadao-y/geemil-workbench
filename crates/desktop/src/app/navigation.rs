@@ -5,8 +5,18 @@ use eframe::egui;
 use geemil_core::Camera;
 use glam::DVec3;
 use std::time::{Duration, Instant};
+use uuid::Uuid;
 
 const FLIGHT: Duration = Duration::from_millis(250);
+
+/// A shown point under the pointer.
+pub(super) struct Picked {
+    pub(super) scan: Uuid,
+    /// In scan coordinates.
+    pub(super) local: DVec3,
+    /// In the project frame, as drawn.
+    pub(super) world: DVec3,
+}
 
 /// Retargets the orbit centre, optionally moving closer to frame a tree item.
 pub(super) struct Flight {
@@ -125,18 +135,35 @@ impl Workbench {
                     && response.dragged_by(egui::PointerButton::Primary)))
     }
     /// The shown point under the pointer, with its scan.
-    fn pick_shown(&self, response: &egui::Response) -> Option<(uuid::Uuid, DVec3)> {
+    fn pick_shown(&self, response: &egui::Response) -> Option<(Uuid, DVec3)> {
+        self.pick_at(response).map(|p| (p.scan, p.world))
+    }
+    /// The shown point under the pointer in the viewport.
+    pub(super) fn pick_at(&self, response: &egui::Response) -> Option<Picked> {
         let pos = response.interact_pointer_pos()?;
         let rect = response.rect;
-        let click = [
+        self.pick_point([
             ((pos.x - rect.left()) / rect.width()) as f64,
             ((pos.y - rect.top()) / rect.height()) as f64,
-        ];
-        let viewport = [rect.width() as f64, rect.height() as f64];
-        // Splat radius in logical pixels, like `viewport`.
-        let radius = self.settings.point_size as f64 / 2.;
-        let points = self.shown_points(true).map(|(scan, _, p)| (scan, p));
-        pick_tagged(points, &self.camera, click, viewport, radius)
+        ])
+    }
+    /// The shown point at `click` (normalized viewport coordinates) as last
+    /// drawn: the frontmost one covering it, else the closest on screen
+    /// within a few pixels of its splat.
+    pub(super) fn pick_point(&self, click: [f64; 2]) -> Option<Picked> {
+        let reach = (self.settings.point_size / 2. + 6.) * self.pixels_per_point;
+        let (node, index) = self.renderer.as_ref()?.pick(click, reach.ceil() as u32)?;
+        let node = self.nodes.get(node)?;
+        let local = DVec3::from(node.samples.get(index)?.position);
+        let world = self
+            .scan_worlds(true)
+            .get(&node.scan)?
+            .transform_point3(local);
+        Some(Picked {
+            scan: node.scan,
+            local,
+            world,
+        })
     }
     /// Advances the retarget animation; call once per frame before drawing.
     pub(super) fn advance_flight(&mut self, ctx: &egui::Context) {
@@ -249,55 +276,10 @@ fn framed_camera(camera: Camera, corners: &[DVec3]) -> Camera {
     }
 }
 
-/// The displayed point under `click` (normalized viewport coordinates): the
-/// nearest to the camera among splats covering the click, else the closest on
-/// screen within a few extra pixels. `viewport` and `radius` are in the same
-/// pixel units.
-pub(super) fn pick(
-    points: impl IntoIterator<Item = DVec3>,
-    camera: &Camera,
-    click: [f64; 2],
-    viewport: [f64; 2],
-    radius: f64,
-) -> Option<DVec3> {
-    let points = points.into_iter().map(|p| ((), p));
-    pick_tagged(points, camera, click, viewport, radius).map(|(_, p)| p)
-}
-
-/// [`pick`] for points that carry a tag, such as their scan.
-fn pick_tagged<T>(
-    points: impl IntoIterator<Item = (T, DVec3)>,
-    camera: &Camera,
-    click: [f64; 2],
-    viewport: [f64; 2],
-    radius: f64,
-) -> Option<(T, DVec3)> {
-    let near = radius + 6.;
-    let projector = camera.projector();
-    let mut covering: Option<(f64, (T, DVec3))> = None;
-    let mut closest: Option<(f64, (T, DVec3))> = None;
-    for (tag, position) in points {
-        let Some((uv, depth)) = projector.project(position) else {
-            continue;
-        };
-        let dx = (uv[0] - click[0]) * viewport[0];
-        let dy = (uv[1] - click[1]) * viewport[1];
-        let d2 = dx * dx + dy * dy;
-        if d2 <= radius * radius {
-            if covering.as_ref().is_none_or(|(best, _)| depth < *best) {
-                covering = Some((depth, (tag, position)));
-            }
-        } else if d2 <= near * near && closest.as_ref().is_none_or(|(best, _)| d2 < *best) {
-            closest = Some((d2, (tag, position)));
-        }
-    }
-    covering.or(closest).map(|(_, picked)| picked)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{framed_camera, pick, pick_tagged, view_basis};
-    use geemil_core::{Bounds, Camera, Sample};
+    use super::{framed_camera, view_basis};
+    use geemil_core::{Bounds, Camera};
     use glam::{DMat4, DVec3};
 
     #[test]
@@ -362,56 +344,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn sample(position: [f64; 3]) -> Sample {
-        Sample {
-            chunk: 0,
-            index: 0,
-            position,
-            color: [255; 4],
-        }
-    }
-
-    #[test]
-    fn picks_the_front_point_under_the_cursor() {
-        // Looking along +Y at the origin from 10 m away.
-        let camera = Camera {
-            yaw: -std::f64::consts::FRAC_PI_2,
-            pitch: 0.,
-            distance: 10.,
-            aspect: 1.,
-            ..Camera::default()
-        };
-        let behind = sample([0., 5., 0.]);
-        let front = sample([0., -5., 0.]);
-        let aside = sample([3., 0., 0.]);
-        let (behind_at, front_at) = (DVec3::from(behind.position), DVec3::from(front.position));
-        let points = [behind, front, aside.clone()].map(|s| DVec3::from(s.position));
-        let viewport = [1000., 1000.];
-        assert_eq!(
-            pick(points, &camera, [0.5, 0.5], viewport, 2.),
-            Some(DVec3::new(0., -5., 0.))
-        );
-        // Nothing covers an empty spot, but a point a few pixels away is taken.
-        let (uv, _) = camera.project(DVec3::new(3., 0., 0.)).unwrap();
-        assert_eq!(
-            pick(
-                [DVec3::from(aside.position)],
-                &camera,
-                [uv[0] + 0.005, uv[1]],
-                viewport,
-                2.
-            ),
-            Some(DVec3::new(3., 0., 0.))
-        );
-        let aside = [DVec3::from(aside.position)];
-        assert_eq!(pick(aside, &camera, [0.1, 0.1], viewport, 2.), None);
-        // The front point's tag, such as its scan, comes with it.
-        let tagged = [("behind", behind_at), ("front", front_at)];
-        assert_eq!(
-            pick_tagged(tagged, &camera, [0.5, 0.5], viewport, 2.),
-            Some(("front", front_at))
-        );
     }
 }

@@ -215,40 +215,15 @@ impl Workbench {
         if !self.aligning() || self.align.item.is_none() || !response.clicked() {
             return;
         }
-        let Some(pos) = response.interact_pointer_pos() else {
-            return;
-        };
-        let rect = response.rect;
-        let projector = self.camera.projector();
-        let radius = self.settings.point_size as f64 / 2.;
-        let near = radius + 6.;
-        let mut covering: Option<(f64, Pick)> = None;
-        let mut closest: Option<(f64, Pick)> = None;
-        for (scan, sample, world) in self.shown_points(true) {
-            let Some((uv, depth)) = projector.project(world) else {
-                continue;
-            };
-            let dx = uv[0] * rect.width() as f64 - (pos.x - rect.left()) as f64;
-            let dy = uv[1] * rect.height() as f64 - (pos.y - rect.top()) as f64;
-            let d2 = dx * dx + dy * dy;
-            let pick = || Pick {
-                scan,
-                local: DVec3::from(sample.position),
-                order: 0,
-            };
-            if d2 <= radius * radius {
-                if covering.as_ref().is_none_or(|(best, _)| depth < *best) {
-                    covering = Some((depth, pick()));
-                }
-            } else if d2 <= near * near && closest.as_ref().is_none_or(|(best, _)| d2 < *best) {
-                closest = Some((d2, pick()));
-            }
-        }
-        let Some((_, mut pick)) = covering.or(closest) else {
+        let Some(picked) = self.pick_at(response) else {
             return;
         };
         self.align.picks += 1;
-        pick.order = self.align.picks;
+        let pick = Pick {
+            scan: picked.scan,
+            local: picked.local,
+            order: self.align.picks,
+        };
         let Some(p) = self.project.clone() else {
             return;
         };

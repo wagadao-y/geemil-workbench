@@ -40,6 +40,23 @@ pub(super) fn node_points(
     })
 }
 
+/// `f` of each item, on all cores.
+pub(super) fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let per = items.len().div_ceil(threads).max(1);
+    let f = &f;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = items
+            .chunks(per)
+            .map(|part| scope.spawn(move || part.iter().map(f).collect::<Vec<_>>()))
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker panicked"))
+            .collect()
+    })
+}
+
 /// Distinct sRGB colours for colouring by scan (Tableau 10).
 const SCAN_COLORS: [[u8; 3]; 10] = [
     [78, 121, 167],
@@ -386,11 +403,8 @@ impl Workbench {
             .map(|p| p.scans().enumerate().map(|(i, s)| (s.id, i)).collect())
             .unwrap_or_default();
         let marks = self.selection.marks();
-        let mut offset = 0;
         let mut result = Vec::with_capacity(self.nodes.len());
         for (i, node) in self.nodes.iter().enumerate() {
-            let range = offset..offset + node.samples.len();
-            offset = range.end;
             let Some(world) = worlds.get(&node.scan) else {
                 continue;
             };
@@ -401,10 +415,11 @@ impl Workbench {
                 tint = [r as f32 / 255., g as f32 / 255., b as f32 / 255., 1.];
             }
             result.push(DrawNode {
+                id: i,
                 samples: &node.samples,
                 world: *world,
                 tint,
-                marks: marks.and_then(|(m, _)| m.get(range)),
+                marks: marks.as_ref().and_then(|m| m(i)),
                 spacings: self
                     .spacings
                     .get(i)

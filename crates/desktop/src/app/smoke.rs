@@ -577,8 +577,7 @@ impl Workbench {
                 if let Some(p) = self.project.clone()
                     && let Some(item) = self.single_tree_item()
                 {
-                    let viewport = [self.camera.aspect * 1000., 1000.];
-                    self.place_handles(&p, item, [0.5, 0.5], viewport);
+                    self.place_handles(&p, item, [0.5, 0.5]);
                 }
                 println!(
                     "Smoke handles: before {:?} after {:?}",

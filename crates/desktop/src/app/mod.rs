@@ -142,6 +142,8 @@ pub struct Workbench {
     height_range: Option<[f64; 2]>,
     height_for: Option<(Uuid, Vec<Uuid>)>,
     view_ms: f64,
+    /// Of the viewport, as last drawn.
+    pixels_per_point: f32,
     dirty: bool,
     last_request: Instant,
     last_camera: Camera,
@@ -206,6 +208,7 @@ impl Workbench {
             height_range: None,
             height_for: None,
             view_ms: 0.,
+            pixels_per_point: 1.,
             dirty: false,
             last_request: Instant::now(),
             last_camera: Camera::default(),

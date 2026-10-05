@@ -1,7 +1,7 @@
 struct Camera {
     matrix: mat4x4<f32>, viewport: vec2<f32>, size: f32, adaptive: f32, tint: vec4<f32>,
     depth: vec4<f32>, highlight_box: mat4x4<f32>, box_highlight_on: f32, ramp_on: f32,
-    pixels_per_metre: f32, padding: f32,
+    pixels_per_metre: f32, segment: u32,
     // Height in the ramp's 0..1 range as dot(ramp, (position, 1)).
     ramp: vec4<f32>,
 };
@@ -18,6 +18,7 @@ struct Out {
     @location(0) color: vec4<f32>,
     @location(1) corner: vec2<f32>,
     @location(2) depth: f32,
+    @location(3) @interpolate(flat) id: vec2<u32>,
 };
 // sRGB highlight matching the box edges.
 const BOX_HIGHLIGHT = vec3<f32>(1.0, 0.863, 0.314);
@@ -25,7 +26,7 @@ const BOX_HIGHLIGHT = vec3<f32>(1.0, 0.863, 0.314);
 const HIGHLIGHT = vec3<f32>(1.0, 0.188, 0.188);
 // Largest adaptive splat in physical pixels, like Potree's maximum size.
 const MAX_ADAPTIVE = 64.0;
-@vertex fn vertex(@builtin(vertex_index) id: u32, @location(0) position: vec3<f32>, @location(1) color: vec4<f32>, @location(2) flags: u32, @location(3) spacing: f32) -> Out {
+@vertex fn vertex(@builtin(vertex_index) id: u32, @builtin(instance_index) point: u32, @location(0) position: vec3<f32>, @location(1) color: vec4<f32>, @location(2) flags: u32, @location(3) spacing: f32) -> Out {
     let corners = array<vec2<f32>, 6>(vec2(-1.0,-1.0),vec2(1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,-1.0),vec2(1.0,1.0),vec2(-1.0,1.0));
     var out: Out;
     out.position = camera.matrix * vec4(position,1.0);
@@ -54,6 +55,8 @@ const MAX_ADAPTIVE = 64.0;
     // View-space distance along the camera axis; screen-aligned splats keep it
     // constant. 0 marks background, so keep drawn points above it.
     out.depth = max(dot(camera.depth, vec4(position, 1.0)), 1e-6);
+    // Which point this is, for picking.
+    out.id = vec2(camera.segment + 1u, point);
     return out;
 }
 fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
@@ -61,8 +64,8 @@ fn srgb_to_linear(srgb: vec3<f32>) -> vec3<f32> {
     let high = pow((srgb + vec3<f32>(0.055)) / vec3<f32>(1.055), vec3<f32>(2.4));
     return select(high, low, srgb <= vec3<f32>(0.04045));
 }
-struct Target { @location(0) color: vec4<f32>, @location(1) depth: f32 };
+struct Target { @location(0) color: vec4<f32>, @location(1) depth: f32, @location(2) id: vec2<u32> };
 @fragment fn fragment(in: Out) -> Target {
     if dot(in.corner,in.corner) > 1.0 { discard; }
-    return Target(vec4(srgb_to_linear(in.color.rgb), in.color.a), in.depth);
+    return Target(vec4(srgb_to_linear(in.color.rgb), in.color.a), in.depth, in.id);
 }

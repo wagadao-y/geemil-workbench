@@ -538,7 +538,7 @@ impl Workbench {
                 ((pos.x - rect.left()) / rect.width()) as f64,
                 ((pos.y - rect.top()) / rect.height()) as f64,
             ];
-            self.place_handles(&p, item, click, [rect.width() as f64, rect.height() as f64]);
+            self.place_handles(&p, item, click);
             return;
         }
         let Some(center) = item_pivot(&p, item, None, self.gizmo.placed(item)) else {
@@ -591,16 +591,8 @@ impl Workbench {
     /// Puts the handles on the displayed point of any scan double-clicked at
     /// `click` (normalized viewport coordinates); a double-click on no point
     /// returns them to their default. `viewport` is in screen points.
-    pub(super) fn place_handles(
-        &mut self,
-        p: &Project,
-        item: Uuid,
-        click: [f64; 2],
-        viewport: [f64; 2],
-    ) {
-        let radius = self.settings.point_size as f64 / 2.;
-        let points = self.shown_points(true).map(|(.., p)| p);
-        let picked = super::navigation::pick(points, &self.camera, click, viewport, radius);
+    pub(super) fn place_handles(&mut self, p: &Project, item: Uuid, click: [f64; 2]) {
+        let picked = self.pick_point(click).map(|p| p.world);
         self.gizmo.placed = picked
             .zip(item_frame(p, item, None))
             .map(|(world, frame)| (item, frame.inverse().transform_point3(world)));

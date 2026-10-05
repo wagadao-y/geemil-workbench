@@ -589,3 +589,49 @@ fn cached_view_spacings_are_reused_until_the_loaded_nodes_below_change() {
         !Arc::ptr_eq(fine, c) && fine.as_ref() != c.as_ref()
     }));
 }
+
+#[test]
+fn the_view_cache_evicts_the_least_recently_used_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("demo.e57");
+    interchange::create_demo(&input).unwrap();
+    let mut p = Project::create(&dir.path().join("project"), "Test").unwrap();
+    let options = ImportOptions {
+        view_grid: 4,
+        view_leaf_points: 64,
+        ..Default::default()
+    };
+    p.import_file(&input, options, &JobControl::default())
+        .unwrap();
+    let p = Arc::new(p);
+    let scan = p.scans().next().unwrap().clone();
+    let nodes: Vec<u32> = (0..scan.nodes.len() as u32)
+        .filter(|&n| scan.nodes[n as usize].count > 0)
+        .take(3)
+        .collect();
+    let [a, b, c] = nodes[..] else {
+        panic!("too few nodes")
+    };
+    let bytes = |n: u32| {
+        scan.nodes[n as usize].count as usize * std::mem::size_of::<geemil_core::Sample>() + 128
+    };
+    // Room for all three but one byte, so loading the third evicts one.
+    let mut cache = ViewCache::new(bytes(a) + bytes(b) + bytes(c) - 1);
+    let mut load = |cache: &mut ViewCache, node| {
+        let pick = geemil_core::ViewPick {
+            scan: scan.id,
+            node,
+            quota: None,
+        };
+        p.load_view_nodes(&[pick], cache, &JobControl::default(), 0, |_| Ok(()))
+            .unwrap();
+    };
+    load(&mut cache, a);
+    load(&mut cache, b);
+    // Using the first again leaves the second the oldest.
+    load(&mut cache, a);
+    load(&mut cache, c);
+    assert!(cache.contains(&p, scan.id, a));
+    assert!(!cache.contains(&p, scan.id, b));
+    assert!(cache.contains(&p, scan.id, c));
+}

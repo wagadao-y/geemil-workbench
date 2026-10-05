@@ -1,5 +1,5 @@
 //! Distance measurement between two picked points.
-use super::{Workbench, navigation::pick, selection::Tool};
+use super::{Workbench, selection::Tool};
 use eframe::egui;
 use glam::DVec3;
 
@@ -32,18 +32,7 @@ impl Workbench {
         if self.selection.tool != Tool::Measure || !response.clicked() {
             return;
         }
-        let Some(pos) = response.interact_pointer_pos() else {
-            return;
-        };
-        let rect = response.rect;
-        let click = [
-            ((pos.x - rect.left()) / rect.width()) as f64,
-            ((pos.y - rect.top()) / rect.height()) as f64,
-        ];
-        let viewport = [rect.width() as f64, rect.height() as f64];
-        let radius = self.settings.point_size as f64 / 2.;
-        let points = self.shown_points(true).map(|(.., p)| p);
-        if let Some(point) = pick(points, &self.camera, click, viewport, radius) {
+        if let Some(point) = self.pick_at(response).map(|p| p.world) {
             if self.measure.points.len() >= 2 {
                 self.measure.points.clear();
             }

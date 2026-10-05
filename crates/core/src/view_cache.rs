@@ -1,7 +1,11 @@
 use crate::layers::is_set;
 use crate::{JobControl, Project, Sample, Scan};
 use anyhow::Result;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::PathBuf,
+    sync::Arc,
+};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -27,6 +31,12 @@ pub(crate) struct NodeEstimates {
     pub own: Vec<f64>,
     pub below: Vec<f64>,
 }
+/// A cached item, in [`ViewCache::order`].
+#[derive(Clone, Copy)]
+enum Slot {
+    Node(Key),
+    Hidden((Uuid, u32)),
+}
 struct HiddenEntry {
     mask: Option<Arc<Vec<u8>>>,
     used: u64,
@@ -48,6 +58,8 @@ pub struct ViewCache {
     hidden: HashMap<(Uuid, u32), HiddenEntry>,
     /// Per scan for this epoch; small, so not charged to the limit.
     estimates: HashMap<Uuid, Arc<NodeEstimates>>,
+    /// Entries and hidden masks by when they were last used, oldest first.
+    order: BTreeMap<u64, Slot>,
     limit: usize,
     clock: u64,
     stats: ViewCacheStats,
@@ -59,6 +71,7 @@ impl ViewCache {
             entries: HashMap::new(),
             hidden: HashMap::new(),
             estimates: HashMap::new(),
+            order: BTreeMap::new(),
             limit: max_bytes,
             clock: 0,
             stats: ViewCacheStats::default(),
@@ -76,29 +89,32 @@ impl ViewCache {
     /// Evicts least recently used entries until `incoming` more bytes fit.
     fn evict(&mut self, incoming: usize) {
         while self.stats.resident_bytes + incoming > self.limit {
-            let node = self
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(key, e)| (*key, e.used));
-            let hidden = self
-                .hidden
-                .iter()
-                .min_by_key(|(_, e)| e.used)
-                .map(|(key, e)| (*key, e.used));
-            if let Some((key, used)) = hidden
-                && node.is_none_or(|(_, node_used)| used <= node_used)
-            {
+            let Some((_, slot)) = self.order.pop_first() else {
+                break;
+            };
+            self.forget(slot);
+        }
+    }
+    /// Drops a cached item, already taken out of `order`.
+    fn forget(&mut self, slot: Slot) {
+        match slot {
+            Slot::Node(key) => {
+                let entry = self.entries.remove(&key).unwrap();
+                self.stats.resident_bytes -= entry.bytes;
+            }
+            Slot::Hidden(key) => {
                 let entry = self.hidden.remove(&key).unwrap();
                 self.stats.resident_bytes -= entry.bytes;
                 self.stats.hidden_bytes -= entry.bytes;
-            } else if let Some((key, _)) = node {
-                let entry = self.entries.remove(&key).unwrap();
-                self.stats.resident_bytes -= entry.bytes;
-            } else {
-                break;
             }
         }
+    }
+    /// Moves a cached item last used at `used` to the end of `order`.
+    fn touch(&mut self, used: u64, slot: Slot) -> u64 {
+        self.clock += 1;
+        self.order.remove(&used);
+        self.order.insert(self.clock, slot);
+        self.clock
     }
     fn hidden_mask(
         &mut self,
@@ -106,9 +122,11 @@ impl ViewCache {
         scan: &Scan,
         chunk: u32,
     ) -> Result<Option<Arc<Vec<u8>>>> {
-        self.clock += 1;
-        if let Some(entry) = self.hidden.get_mut(&(scan.id, chunk)) {
-            entry.used = self.clock;
+        let key = (scan.id, chunk);
+        if let Some(used) = self.hidden.get(&key).map(|e| e.used) {
+            let used = self.touch(used, Slot::Hidden(key));
+            let entry = self.hidden.get_mut(&key).unwrap();
+            entry.used = used;
             return Ok(entry.mask.clone());
         }
         let mask = (project.hidden_count(scan, chunk) > 0)
@@ -117,8 +135,10 @@ impl ViewCache {
         let bytes = mask.as_ref().map_or(0, |m| m.capacity()) + 128;
         if bytes <= self.limit {
             self.evict(bytes);
+            self.clock += 1;
+            self.order.insert(self.clock, Slot::Hidden(key));
             self.hidden.insert(
-                (scan.id, chunk),
+                key,
                 HiddenEntry {
                     mask: mask.clone(),
                     used: self.clock,
@@ -141,6 +161,7 @@ impl ViewCache {
             self.entries.clear();
             self.hidden.clear();
             self.estimates.clear();
+            self.order.clear();
             self.stats.resident_bytes = 0;
             self.stats.hidden_bytes = 0;
             self.epoch = Some((
@@ -190,10 +211,11 @@ impl ViewCache {
             scan: scan.id,
             node,
         };
-        self.clock += 1;
-        if let Some(entry) = self.entries.get_mut(&key) {
+        if let Some(used) = self.entries.get(&key).map(|e| e.used) {
             self.stats.hits += 1;
-            entry.used = self.clock;
+            let used = self.touch(used, Slot::Node(key));
+            let entry = self.entries.get_mut(&key).unwrap();
+            entry.used = used;
             return Ok(entry.samples.clone());
         }
         let samples = project.read_view(scan, node)?;
@@ -215,7 +237,6 @@ impl ViewCache {
             scan: scan.id,
             node,
         };
-        self.clock += 1;
         let samples: Arc<[Sample]> = if project.current().layers.iter().all(|l| l.visible) {
             job.check()?;
             samples.into()
@@ -248,7 +269,14 @@ impl ViewCache {
         // Charge entry/Arc/hash-table overhead too, including nodes left empty.
         let bytes = std::mem::size_of_val(samples.as_ref()) + 128;
         if bytes <= self.limit {
+            // A node decoded twice replaces its first entry.
+            if let Some(old) = self.entries.get(&key).map(|e| e.used) {
+                self.order.remove(&old);
+                self.forget(Slot::Node(key));
+            }
             self.evict(bytes);
+            self.clock += 1;
+            self.order.insert(self.clock, Slot::Node(key));
             self.stats.resident_bytes += bytes;
             self.entries.insert(
                 key,

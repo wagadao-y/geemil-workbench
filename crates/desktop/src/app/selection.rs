@@ -11,8 +11,10 @@ use super::{
     layers::{destination, destination_combo},
 };
 use eframe::egui;
-use geemil_core::{Camera, JobControl, Project, Selection, SelectionMode};
+use geemil_core::{Camera, JobControl, Project, Sample, Selection, SelectionMode};
+use glam::DMat4;
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -67,9 +69,6 @@ pub(super) struct SelectionState {
     drag_start: Option<egui::Pos2>,
     camera: Option<Camera>,
     preview: Preview,
-    /// Increases whenever preview marks change, across clears, so the renderer
-    /// never mistakes new marks for ones it already uploaded.
-    revision: u64,
 }
 impl Default for SelectionState {
     fn default() -> Self {
@@ -86,7 +85,6 @@ impl Default for SelectionState {
             drag_start: None,
             camera: None,
             preview: Preview::default(),
-            revision: 0,
         }
     }
 }
@@ -133,21 +131,20 @@ impl SelectionState {
     pub(super) fn preview_summary(&self) -> Option<String> {
         let preview = &self.preview;
         preview.marks_for.as_ref().map(|_| {
+            let displayed: usize = preview.marks.iter().map(|m| m.samples.len()).sum();
             format!(
-                "{} of {} displayed points marked, nearest {:?}",
-                preview.marked,
-                preview.marks.len(),
-                preview.nearest
+                "{} of {displayed} displayed points marked, nearest {:?}",
+                preview.marked, preview.nearest
             )
         })
     }
-    /// Points to highlight, parallel to the displayed points, and their revision.
-    pub(super) fn marks(&self) -> Option<(&[bool], u64)> {
+    /// The points to highlight of each displayed node, if any.
+    pub(super) fn marks<'a>(&'a self) -> Option<impl Fn(usize) -> Option<&'a Arc<[bool]>> + 'a> {
         let preview = &self.preview;
         preview
             .marks_for
             .as_ref()
-            .map(|_| (preview.marks.as_slice(), self.revision))
+            .map(|_| |i: usize| preview.marks.get(i).and_then(|m| m.marks.as_ref()))
     }
     fn selection(&self) -> Option<Selection> {
         if self.polygon.len() < 3 {
@@ -175,8 +172,19 @@ struct Preview {
     search: Option<NearestSearch>,
     /// Inputs of `marks`; a change recomputes them.
     marks_for: Option<MarksInput>,
-    /// Parallel to the displayed points; true for points the move takes.
-    marks: Vec<bool>,
+    /// Parallel to the displayed nodes.
+    marks: Vec<NodeMarks>,
+    marked: usize,
+}
+/// The points of a displayed node a move takes.
+#[derive(Clone)]
+struct NodeMarks {
+    /// Held so their address, which identifies the node, stays unique.
+    samples: Arc<[Sample]>,
+    /// Where the node's scan is; none when it is hidden.
+    world: Option<DMat4>,
+    /// True for points the move takes; none when it takes none.
+    marks: Option<Arc<[bool]>>,
     marked: usize,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -195,7 +203,7 @@ struct NearestInput {
     root: PathBuf,
     revision: Uuid,
 }
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq)]
 struct MarksInput {
     polygon: Vec<egui::Pos2>,
     camera: Camera,
@@ -379,8 +387,7 @@ impl Workbench {
                 revision: project.current().id,
             };
             if preview.nearest_for.as_ref() != Some(&input) {
-                let points = super::view::node_points(&self.nodes, worlds.clone());
-                preview.nearest = displayed_nearest(&selection, points.map(|(.., p)| p));
+                preview.nearest = displayed_nearest(&selection, &self.nodes, &worlds);
                 preview.search = Some(start_search(ctx, project, &selection, &input.visible));
                 preview.nearest_for = Some(input);
             }
@@ -410,23 +417,50 @@ impl Workbench {
                 // Nothing inside the polygon: nothing to move.
                 _ => f64::NEG_INFINITY,
             };
-            // Parallel to all loaded nodes; points of hidden scans stay unmarked.
-            preview.marks = self
-                .nodes
-                .iter()
-                .flat_map(|node| {
-                    let world = worlds.get(&node.scan).copied();
-                    let test = &test;
-                    node.samples.iter().map(move |p| {
+            // When only the displayed nodes changed, those still shown where
+            // they were keep their marks, which the renderer then keeps too.
+            let same_test = preview.marks_for.as_ref().is_some_and(|old| {
+                *old == MarksInput {
+                    points: old.points,
+                    ..input.clone()
+                }
+            });
+            let address = |samples: &Arc<[Sample]>| Arc::as_ptr(samples) as *const () as usize;
+            let previous: HashMap<usize, NodeMarks> = if same_test {
+                std::mem::take(&mut preview.marks)
+                    .into_iter()
+                    .map(|m| (address(&m.samples), m))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
+            // Points of hidden scans stay unmarked.
+            preview.marks = super::view::par_map(&self.nodes, |node| {
+                let world = worlds.get(&node.scan).copied();
+                if let Some(kept) = previous.get(&address(&node.samples))
+                    && kept.world == world
+                {
+                    return kept.clone();
+                }
+                let marks: Vec<bool> = node
+                    .samples
+                    .iter()
+                    .map(|p| {
                         world.is_some_and(|w| {
                             test.excludes(w.transform_point3(p.position.into()), limit)
                         })
                     })
-                })
-                .collect();
-            preview.marked = preview.marks.iter().filter(|m| **m).count();
+                    .collect();
+                let marked = marks.iter().filter(|m| **m).count();
+                NodeMarks {
+                    samples: node.samples.clone(),
+                    world,
+                    marks: (marked > 0).then(|| marks.into()),
+                    marked,
+                }
+            });
+            preview.marked = preview.marks.iter().map(|m| m.marked).sum();
             preview.marks_for = Some(input);
-            s.revision += 1;
         }
     }
     pub(super) fn draw_selection(&self, ui: &egui::Ui, response: &egui::Response) {
@@ -480,11 +514,23 @@ impl Workbench {
     }
 }
 
-fn displayed_nearest(selection: &Selection, points: impl Iterator<Item = glam::DVec3>) -> Nearest {
+fn displayed_nearest(
+    selection: &Selection,
+    nodes: &[geemil_core::LoadedNode],
+    worlds: &HashMap<Uuid, DMat4>,
+) -> Nearest {
     let test = selection.prepare();
-    let nearest = points
-        .filter_map(|p| test.contains(p))
-        .fold(f64::INFINITY, f64::min);
+    let nearest = super::view::par_map(nodes, |node| {
+        let Some(world) = worlds.get(&node.scan) else {
+            return f64::INFINITY;
+        };
+        node.samples
+            .iter()
+            .filter_map(|p| test.contains(world.transform_point3(p.position.into())))
+            .fold(f64::INFINITY, f64::min)
+    })
+    .into_iter()
+    .fold(f64::INFINITY, f64::min);
     if nearest.is_finite() {
         Nearest::Displayed(nearest)
     } else {
