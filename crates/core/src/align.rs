@@ -190,10 +190,6 @@ impl Grid {
                 (d2 <= r2).then_some((i, d2))
             })
     }
-    fn nearest(&self, points: &[DVec3], p: DVec3, radius: f64) -> Option<(u32, f64)> {
-        self.near(points, p, radius)
-            .min_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)))
-    }
 }
 
 /// Splits `0..n` over worker threads and concatenates their results in order.
@@ -275,21 +271,89 @@ fn solve6(a: [[f64; 6]; 6], b: [f64; 6]) -> Option<[f64; 6]> {
     Some(x)
 }
 
-/// The reference samples, their surface normals and a grid over them.
-struct Reference<'a> {
-    points: &'a [DVec3],
-    normals: &'a [Option<DVec3>],
-    grid: Grid,
+/// Samples of a surface with their normals, in a kd-tree for nearest-point
+/// queries: each subslice is a subtree whose middle element splits it on the
+/// axis stored with it.
+struct Surface {
+    points: Vec<DVec3>,
+    normals: Vec<Option<DVec3>>,
+    axes: Vec<u8>,
 }
-impl Reference<'_> {
-    /// The reference sample nearest each moved point within `distance` (at
-    /// most the grid's cell), paired with the moved point.
+impl Surface {
+    fn new(points: Vec<DVec3>, normal_radius: f64) -> Self {
+        let normals = normals(&points, normal_radius);
+        let mut items: Vec<(DVec3, Option<DVec3>)> = points.into_iter().zip(normals).collect();
+        let mut axes = vec![0u8; items.len()];
+        fn build(items: &mut [(DVec3, Option<DVec3>)], axes: &mut [u8]) {
+            if items.len() <= 1 {
+                return;
+            }
+            let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
+            for (p, _) in items.iter() {
+                lo = lo.min(*p);
+                hi = hi.max(*p);
+            }
+            let extent = hi - lo;
+            let axis = if extent.x >= extent.y && extent.x >= extent.z {
+                0
+            } else if extent.y >= extent.z {
+                1
+            } else {
+                2
+            };
+            let mid = items.len() / 2;
+            items.select_nth_unstable_by(mid, |a, b| a.0[axis].total_cmp(&b.0[axis]));
+            axes[mid] = axis as u8;
+            let (left, right) = items.split_at_mut(mid);
+            let (left_axes, right_axes) = axes.split_at_mut(mid);
+            build(left, left_axes);
+            build(&mut right[1..], &mut right_axes[1..]);
+        }
+        build(&mut items, &mut axes);
+        let (points, normals) = items.into_iter().unzip();
+        Self {
+            points,
+            normals,
+            axes,
+        }
+    }
+    /// The sample nearest `p` within `radius` and its squared distance.
+    fn nearest(&self, p: DVec3, radius: f64) -> Option<(u32, f64)> {
+        fn visit(tree: &Surface, range: std::ops::Range<usize>, p: DVec3, best: &mut (u32, f64)) {
+            if range.is_empty() {
+                return;
+            }
+            let mid = range.start + range.len() / 2;
+            let q = tree.points[mid];
+            let d2 = q.distance_squared(p);
+            if d2 < best.1 {
+                *best = (mid as u32, d2);
+            }
+            let axis = tree.axes[mid] as usize;
+            let diff = p[axis] - q[axis];
+            let (near, far) = if diff < 0. {
+                (range.start..mid, mid + 1..range.end)
+            } else {
+                (mid + 1..range.end, range.start..mid)
+            };
+            visit(tree, near, p, best);
+            if diff * diff < best.1 {
+                visit(tree, far, p, best);
+            }
+        }
+        // Only points strictly within reach of the limit replace it.
+        let mut best = (u32::MAX, radius * radius * (1. + 1e-12));
+        visit(self, 0..self.points.len(), p, &mut best);
+        (best.0 != u32::MAX).then_some(best)
+    }
+    /// The sample nearest each moved point within `distance`, paired with the
+    /// moved point.
     fn pairs(&self, moving: &[DVec3], motion: DMat4, distance: f64) -> Vec<(DVec3, u32)> {
         parallel(moving.len(), |range| {
             range
                 .filter_map(|i| {
                     let p = motion.transform_point3(moving[i]);
-                    let (j, _) = self.grid.nearest(self.points, p, distance)?;
+                    let (j, _) = self.nearest(p, distance)?;
                     Some((p, j))
                 })
                 .collect()
@@ -350,6 +414,24 @@ impl Reference<'_> {
             .collect();
         (surface.iter().sum::<f64>() / surface.len().max(1) as f64).sqrt()
     }
+}
+
+/// The median distance from some of `points` to their nearest other point
+/// within `reach`; a tenth of `reach` when none has one.
+fn typical_spacing(points: &[DVec3], reach: f64) -> f64 {
+    let grid = Grid::new(points, reach);
+    let mut gaps: Vec<f64> = (0..points.len())
+        .step_by((points.len() / 2000).max(1))
+        .filter_map(|i| {
+            grid.near(points, points[i], reach)
+                .filter(|(j, _)| *j as usize != i)
+                .map(|(_, d2)| d2)
+                .min_by(f64::total_cmp)
+                .map(f64::sqrt)
+        })
+        .collect();
+    gaps.sort_by(f64::total_cmp);
+    gaps.get(gaps.len() / 2).copied().unwrap_or(reach / 10.)
 }
 
 /// How far `b` puts any of `points` from where `a` puts it.
@@ -513,53 +595,16 @@ impl Project {
             *p -= centre;
         }
         let d0 = options.max_distance;
-        let first = Reference {
-            points: &target,
-            normals: &[],
-            grid: Grid::new(&target, d0),
-        };
         // Typical spacing of the reference samples sets the normal radius and
         // how still the narrowest distance must settle.
-        let probes: Vec<_> = (0..target.len())
-            .step_by((target.len() / 2000).max(1))
-            .collect();
-        let mut gaps: Vec<f64> = probes
-            .iter()
-            .filter_map(|&i| {
-                first
-                    .grid
-                    .near(&target, target[i], d0)
-                    .filter(|(j, _)| *j as usize != i)
-                    .map(|(_, d2)| d2)
-                    .min_by(f64::total_cmp)
-                    .map(f64::sqrt)
-            })
-            .collect();
-        gaps.sort_by(f64::total_cmp);
-        let spacing = gaps.get(gaps.len() / 2).copied().unwrap_or(d0 / 10.);
-        let normals = normals(&target, (spacing * 4.).min(d0));
-        let first = Reference {
-            normals: &normals,
-            ..first
-        };
+        let spacing = typical_spacing(&target, d0);
+        let reference = Surface::new(target, (spacing * 4.).min(d0));
         let distances = narrowing(d0, options.min_distance);
         let mut motion = DMat4::IDENTITY;
         let mut steps: Vec<IcpStep> = vec![];
         let mut stopped_at = None;
         for (level, &distance) in distances.iter().enumerate() {
             job.report(Stage::IcpIterations, level as u64, distances.len() as u64);
-            // A grid as fine as the distance keeps the narrow searches short.
-            let narrower;
-            let reference = if level == 0 {
-                &first
-            } else {
-                narrower = Reference {
-                    points: &target,
-                    normals: &normals,
-                    grid: Grid::new(&target, distance),
-                };
-                &narrower
-            };
             // A narrower distance keeping under a tenth of the first's
             // correspondences fits too little of the item to trust.
             let least = steps
@@ -616,7 +661,7 @@ impl Project {
         Ok(IcpResult {
             pose: self.moved_pose(item, initial, world_motion),
             rms: last.rms,
-            overlap: first.pairs(&moving, motion, d0).len() as f64 / moving.len() as f64,
+            overlap: reference.pairs(&moving, motion, d0).len() as f64 / moving.len() as f64,
             iterations: steps.iter().map(|s| s.iterations).sum(),
             steps,
             stopped_at,

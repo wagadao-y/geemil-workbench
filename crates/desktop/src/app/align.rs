@@ -11,6 +11,7 @@ use eframe::egui;
 use egui_phosphor::regular as icon;
 use geemil_core::{IcpOptions, IcpResult, Pose, Project, rigid_fit};
 use glam::DVec3;
+use std::collections::HashSet;
 use std::sync::mpsc;
 use uuid::Uuid;
 
@@ -152,19 +153,22 @@ impl Workbench {
         }
         Some((self.align.item?, self.align.preview?))
     }
-    /// Whether the registration tool hides this scan for picking.
-    pub(super) fn align_hides(&self, scan: Uuid) -> bool {
-        let Some(p) = self.project.as_ref().filter(|_| self.aligning()) else {
-            return false;
-        };
-        let Some(item) = self.align.item else {
-            return false;
-        };
-        let moving = p.scans_within(item).contains(&scan);
-        match self.align.show {
-            Show::Both => false,
-            Show::Moving => !moving,
-            Show::Reference => moving,
+    /// The scans the item being aligned moves, while aligning one.
+    fn align_moving(&self) -> Option<HashSet<Uuid>> {
+        let p = self.project.as_ref().filter(|_| self.aligning())?;
+        Some(p.scans_within(self.align.item?).into_iter().collect())
+    }
+    /// Which scans the registration tool hides for picking.
+    pub(super) fn align_hides(&self) -> impl Fn(Uuid) -> bool + use<> {
+        let moving = self.align_moving();
+        let show = self.align.show;
+        move |scan| {
+            let Some(moving) = &moving else { return false };
+            match show {
+                Show::Both => false,
+                Show::Moving => !moving.contains(&scan),
+                Show::Reference => moving.contains(&scan),
+            }
         }
     }
     /// Takes back the most recent pick (Backspace).
@@ -180,16 +184,11 @@ impl Workbench {
         }
         pairs.retain(|pair| pair.moving.is_some() || pair.reference.is_some());
     }
-    pub(super) fn align_tint(&self, scan: Uuid) -> [f32; 4] {
-        let Some(p) = self
-            .project
-            .as_ref()
-            .filter(|_| self.aligning() && self.align.tint)
-        else {
-            return [0.; 4];
-        };
-        match self.align.item {
-            Some(item) if p.scans_within(item).contains(&scan) => tint(MOVING, 0.55),
+    /// The tint of each scan's points: the moved and the reference apart.
+    pub(super) fn align_tints(&self) -> impl Fn(Uuid) -> [f32; 4] + use<> {
+        let moving = self.align_moving().filter(|_| self.align.tint);
+        move |scan| match &moving {
+            Some(moving) if moving.contains(&scan) => tint(MOVING, 0.55),
             Some(_) => tint(REFERENCE, 0.45),
             None => [0.; 4],
         }

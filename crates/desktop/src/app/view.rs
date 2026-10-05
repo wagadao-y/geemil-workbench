@@ -368,9 +368,10 @@ impl Workbench {
                 .collect();
         };
         let preview = self.transform_preview().filter(|_| previewed);
+        let hides = self.align_hides();
         project
             .scans()
-            .filter(|s| self.visible.contains(&s.id) && !(previewed && self.align_hides(s.id)))
+            .filter(|s| self.visible.contains(&s.id) && !(previewed && hides(s.id)))
             .map(|scan| {
                 let world = match preview {
                     Some((item, pose)) => project.world_matrix_with(scan, item, pose),
@@ -405,12 +406,13 @@ impl Workbench {
             .map(|p| p.scans().enumerate().map(|(i, s)| (s.id, i)).collect())
             .unwrap_or_default();
         let marks = self.selection.marks();
+        let tints = self.align_tints();
         let mut result = Vec::with_capacity(self.nodes.len());
         for (i, node) in self.nodes.iter().enumerate() {
             let Some(world) = worlds.get(&node.scan) else {
                 continue;
             };
-            let mut tint = self.align_tint(node.scan);
+            let mut tint = tints(node.scan);
             if tint[3] == 0. && self.settings.color_mode == ColorMode::Scan {
                 let i = scans.get(&node.scan).copied().unwrap_or(0);
                 let [r, g, b] = SCAN_COLORS[i % SCAN_COLORS.len()];
