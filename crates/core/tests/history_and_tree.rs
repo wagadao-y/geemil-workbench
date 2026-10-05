@@ -423,24 +423,30 @@ fn scanner_positions_come_only_from_poses_of_their_own() {
 }
 
 #[test]
-fn scattering_turns_scans_about_z_and_stacks_their_centres_in_one_undoable_edit() {
+fn scattering_turns_scans_about_z_gathers_their_anchors_and_meets_their_floors() {
     let dir = tempfile::tempdir().unwrap();
     let mut p = imported(dir.path());
-    // A folder transform must not keep the centres apart.
+    // A folder transform must not keep the scans apart.
     let folder = p.children(None).0[0].id;
     p.set_transform(folder, shift(5.)).unwrap();
-    let target = p.bounds().center();
     let before = p.manifest.draft.clone();
     let worlds: Vec<_> = p.scans().map(|s| (s.id, p.world_matrix(s))).collect();
+    let anchors: Vec<DVec3> = p
+        .scans()
+        .map(|s| p.scan_anchor(s).unwrap().unwrap())
+        .collect();
+    let mean = anchors.iter().sum::<DVec3>() / anchors.len() as f64;
+    let floor = anchors.iter().map(|a| a.z).fold(f64::INFINITY, f64::min);
+    let target = DVec3::new(mean.x, mean.y, floor);
 
     p.scatter_scans(42).unwrap();
-    for scan in p.scans() {
-        let centre = scan.nodes[0].bounds.center();
-        let world = p.world_matrix(scan);
-        assert!(world.transform_point3(centre).abs_diff_eq(target, 1e-6));
+    for ((scan, (_, old)), anchor) in p.scans().zip(&worlds).zip(&anchors) {
+        let motion = p.world_matrix(scan) * old.inverse();
+        // Each anchor goes to the shared place, its floor to the lowest one.
+        assert!(motion.transform_point3(*anchor).abs_diff_eq(target, 1e-6));
+        let moved = p.scan_anchor(scan).unwrap().unwrap();
+        assert!((moved.z - floor).abs() < 1e-6);
         // Only a turn about Z: up stays up.
-        let old = worlds.iter().find(|(id, _)| *id == scan.id).unwrap().1;
-        let motion = world * old.inverse();
         assert!(
             motion
                 .transform_vector3(DVec3::Z)
@@ -451,8 +457,12 @@ fn scattering_turns_scans_about_z_and_stacks_their_centres_in_one_undoable_edit(
     assert_eq!(ops.last().unwrap()["kind"], "scatter");
 
     p.restore_working_state(before).unwrap();
-    for (id, world) in worlds {
-        let scan = p.scans().find(|s| s.id == id).unwrap();
-        assert!(p.world_matrix(scan).abs_diff_eq(world, 1e-9));
+    for (id, world) in &worlds {
+        let scan = p.scans().find(|s| s.id == *id).unwrap();
+        assert!(p.world_matrix(scan).abs_diff_eq(*world, 1e-9));
     }
+    // Points in hidden layers do not count; with none left, nothing moves.
+    exclude_everything(&mut p);
+    assert!(p.scans().all(|s| p.scan_anchor(s).unwrap().is_none()));
+    assert!(p.scatter_scans(42).is_err());
 }

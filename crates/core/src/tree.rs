@@ -4,9 +4,9 @@
 //! correction is the product of its folders' transforms, outermost first, and
 //! its own. Moving items between folders compensates their own transform so the
 //! points stay where they are.
-use crate::{Group, Pose, Project, Revision, Scan};
+use crate::{Group, JobControl, Pose, Project, Revision, Scan, ViewCache};
 use anyhow::{Result, ensure};
-use glam::{DMat4, DQuat};
+use glam::{DMat4, DQuat, DVec3};
 use serde_json::json;
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -223,11 +223,55 @@ impl Project {
             Ok(())
         })
     }
+    /// Where a scan sits for [`Project::scatter_scans`], in the project
+    /// frame: the median X and Y and the 1st percentile Z (its floor) of the
+    /// points of its root display node in visible layers. The root holds an
+    /// even sample of the whole scan, cheap to read, and stray points or
+    /// points moved to a hidden layer barely move or do not move these. None
+    /// when the root has no such point.
+    pub fn scan_anchor(&self, scan: &Scan) -> Result<Option<DVec3>> {
+        if scan.nodes.is_empty() {
+            return Ok(None);
+        }
+        let samples = ViewCache::new(0).samples(self, scan, 0, &JobControl::default())?;
+        if samples.is_empty() {
+            return Ok(None);
+        }
+        let world = self.world_matrix(scan);
+        let points: Vec<DVec3> = samples
+            .iter()
+            .map(|s| world.transform_point3(DVec3::from(s.position)))
+            .collect();
+        let quantile = |axis: usize, q: f64| {
+            let mut values: Vec<f64> = points.iter().map(|p| p[axis]).collect();
+            let at = ((values.len() - 1) as f64 * q).round() as usize;
+            *values.select_nth_unstable_by(at, f64::total_cmp).1
+        };
+        Ok(Some(DVec3::new(
+            quantile(0, 0.5),
+            quantile(1, 0.5),
+            quantile(2, 0.01),
+        )))
+    }
     /// Undoes the registration on purpose, for practising it: turns each scan
-    /// by a random angle about Z and moves the centre of its bounding box to
-    /// one shared point, the centre of all scans before. One edit, one undo.
+    /// by a random angle about Z, gathers their [`Project::scan_anchor`]s at
+    /// the mean of their X and Y and drops them to the lowest anchor's Z, so
+    /// the scans overlap and their floors meet. Scans without points in
+    /// visible layers stay. One edit, one undo.
     pub fn scatter_scans(&mut self, seed: u64) -> Result<()> {
-        let target = self.bounds().center();
+        let mut anchors = vec![];
+        for scan in self.scans() {
+            if let Some(anchor) = self.scan_anchor(scan)? {
+                anchors.push((scan, anchor));
+            }
+        }
+        ensure!(!anchors.is_empty(), "No points in visible layers");
+        let mean = anchors.iter().map(|(_, a)| *a).sum::<DVec3>() / anchors.len() as f64;
+        let floor = anchors
+            .iter()
+            .map(|(_, a)| a.z)
+            .fold(f64::INFINITY, f64::min);
+        let target = DVec3::new(mean.x, mean.y, floor);
         let mut random = seed;
         let mut next_angle = || {
             // SplitMix64; no randomness crate for a practice tool.
@@ -238,19 +282,19 @@ impl Project {
             z ^= z >> 31;
             (z >> 11) as f64 / (1u64 << 53) as f64 * std::f64::consts::TAU
         };
-        let poses: Vec<(Uuid, Pose)> = self
-            .scans()
-            .filter_map(|scan| {
-                let bounds = scan.nodes.first()?.bounds;
-                let centre = self.world_matrix(scan).transform_point3(bounds.center());
+        let poses: Vec<(Uuid, Pose)> = anchors
+            .iter()
+            .map(|(scan, anchor)| {
+                // A turn about Z keeps the anchor's height, which then drops
+                // to the floor.
                 let motion = DMat4::from_translation(target)
                     * DMat4::from_quat(DQuat::from_rotation_z(next_angle()))
-                    * DMat4::from_translation(-centre);
+                    * DMat4::from_translation(-*anchor);
                 let above = self
                     .parent_of(scan.id)
                     .map_or(DMat4::IDENTITY, |g| self.correction(g));
                 let own = above.inverse() * motion * self.correction(scan.id);
-                Some((scan.id, Pose::from_matrix(own)))
+                (scan.id, Pose::from_matrix(own))
             })
             .collect();
         let ids: Vec<Uuid> = poses.iter().map(|(id, _)| *id).collect();
