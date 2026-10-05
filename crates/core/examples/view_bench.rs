@@ -53,7 +53,7 @@ fn run(args: &[String]) -> Result<()> {
         let load_start = Instant::now();
         let mut points = 0;
         project.load_view_nodes(&picks, &mut cache, &job, workers, |node| {
-            points += node.samples.len();
+            points += node.points.len();
             Ok(())
         })?;
         let load_ms = load_start.elapsed().as_secs_f64() * 1000.;

@@ -191,7 +191,7 @@ impl Workbench {
         let reach = (self.settings.point_size / 2. + 6.) * self.pixels_per_point;
         let (node, index) = self.renderer.as_ref()?.pick(click, reach.ceil() as u32)?;
         let node = self.nodes.get(node)?;
-        let local = DVec3::from(node.samples.get(index)?.position);
+        let local = (index < node.points.len()).then(|| node.points.position(index))?;
         let world = self
             .scan_worlds(true)
             .get(&node.scan)?

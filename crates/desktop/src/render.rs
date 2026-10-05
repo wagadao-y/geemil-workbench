@@ -1,5 +1,5 @@
 use eframe::{egui, egui_wgpu::wgpu};
-use geemil_core::{Camera, Sample};
+use geemil_core::{Camera, NodePoints};
 use glam::{DMat4, DVec3};
 use std::{collections::HashMap, sync::Arc};
 use wgpu::util::DeviceExt;
@@ -21,15 +21,6 @@ const ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg32Uint;
 /// Picks look this many physical pixels around the pointer at most.
 const MAX_PICK_REACH: u32 = 32;
 
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct Vertex {
-    /// Relative to the node's origin.
-    position: [f32; 3],
-    /// sRGB code values; points.wgsl decodes RGB before writing to
-    /// SCENE_FORMAT. Alpha remains a linear coverage value.
-    color: [u8; 4],
-}
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Uniform {
@@ -129,11 +120,14 @@ pub struct DrawOptions<'a> {
     pub lines: &'a [Line],
 }
 /// A display octree node to draw: its points in scan coordinates, placed in
-/// the project frame by `world`.
+/// the project frame by `world`. Its view points are uploaded as they are:
+/// an f32 offset from the node's origin and sRGB code values, which
+/// points.wgsl decodes before writing to SCENE_FORMAT (alpha stays a linear
+/// coverage value).
 pub struct DrawNode<'a> {
     /// The caller's name for the node, which picks return.
     pub id: usize,
-    pub samples: &'a Arc<[Sample]>,
+    pub points: &'a Arc<NodePoints>,
     pub world: DMat4,
     /// sRGB colour (0..1) mixed into the points, by the fourth component.
     pub tint: [f32; 4],
@@ -143,10 +137,10 @@ pub struct DrawNode<'a> {
     /// Each point's spacing in metres, for adaptive point size.
     pub spacings: Option<&'a Arc<[f32]>>,
 }
-/// A node's points on the GPU. It keeps their samples, so a new node never
-/// reuses the address that identifies this one.
+/// A node's points on the GPU. It keeps them, so a new node never reuses
+/// the address that identifies this one.
 struct GpuNode {
-    _samples: Arc<[Sample]>,
+    _points: Arc<NodePoints>,
     origin: DVec3,
     vertices: wgpu::Buffer,
     /// One u32 per point; bit 0 highlights it. None draws `zeros` instead,
@@ -246,7 +240,7 @@ impl PointRenderer {
                 compilation_options: Default::default(),
                 buffers: &[
                     Some(wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        array_stride: std::mem::size_of::<geemil_core::ViewPoint>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &wgpu::vertex_attr_array![0=>Float32x3,1=>Unorm8x4],
                     }),
@@ -331,34 +325,26 @@ impl PointRenderer {
     /// Uploads a node unless resident, and brings its marks up to date.
     /// Returns false when it has to wait for a later frame.
     fn resident(&mut self, node: &DrawNode, uploaded: &mut usize) -> bool {
-        let key = Arc::as_ptr(node.samples) as *const () as usize;
+        let key = Arc::as_ptr(node.points) as usize;
         if !self.nodes.contains_key(&key) {
-            if *uploaded > 0 && *uploaded + node.samples.len() > UPLOAD_PER_FRAME {
+            if *uploaded > 0 && *uploaded + node.points.len() > UPLOAD_PER_FRAME {
                 self.pending = true;
                 return false;
             }
-            *uploaded += node.samples.len();
-            let origin = DVec3::from(node.samples[0].position);
-            let vertices: Vec<_> = node
-                .samples
-                .iter()
-                .map(|p| Vertex {
-                    position: (DVec3::from(p.position) - origin).as_vec3().to_array(),
-                    color: p.color,
-                })
-                .collect();
+            *uploaded += node.points.len();
             let gpu = GpuNode {
-                _samples: node.samples.clone(),
-                origin,
-                vertices: self.vertex_buffer("node points", bytemuck::cast_slice(&vertices)),
+                _points: node.points.clone(),
+                origin: DVec3::from(node.points.origin),
+                vertices: self
+                    .vertex_buffer("node points", bytemuck::cast_slice(&node.points.points)),
                 flags: None,
                 spacings: None,
                 spacings_written: None,
                 marks_written: None,
-                count: node.samples.len() as u32,
+                count: node.points.len() as u32,
                 used: 0,
             };
-            self.resident += node.samples.len();
+            self.resident += node.points.len();
             self.nodes.insert(key, gpu);
         }
         let gpu = &self.nodes[&key];
@@ -478,7 +464,7 @@ impl PointRenderer {
                 .iter()
                 .map(|n| {
                     let addresses = [
-                        address(Arc::as_ptr(n.samples) as *const ()),
+                        address(Arc::as_ptr(n.points) as *const ()),
                         n.marks.map_or(0, |m| address(Arc::as_ptr(m) as *const ())),
                         n.spacings
                             .map_or(0, |s| address(Arc::as_ptr(s) as *const ())),
@@ -498,9 +484,9 @@ impl PointRenderer {
         let mut uploaded = 0;
         let segments: Vec<_> = nodes
             .iter()
-            .filter(|n| !n.samples.is_empty())
+            .filter(|n| !n.points.is_empty())
             .filter(|n| self.resident(n, &mut uploaded))
-            .map(|n| (Arc::as_ptr(n.samples) as *const () as usize, n))
+            .map(|n| (Arc::as_ptr(n.points) as usize, n))
             .collect();
         self.drawn = segments.iter().map(|(_, n)| n.id).collect();
         self.evict();

@@ -233,14 +233,14 @@ impl Project {
         if scan.nodes.is_empty() {
             return Ok(None);
         }
-        let samples = ViewCache::new(0).samples(self, scan, 0, &JobControl::default())?;
-        if samples.is_empty() {
+        let root = ViewCache::new(0).samples(self, scan, 0, &JobControl::default())?;
+        if root.is_empty() {
             return Ok(None);
         }
         let world = self.world_matrix(scan);
-        let points: Vec<DVec3> = samples
-            .iter()
-            .map(|s| world.transform_point3(DVec3::from(s.position)))
+        let points: Vec<DVec3> = root
+            .positions()
+            .map(|p| world.transform_point3(p))
             .collect();
         let quantile = |axis: usize, q: f64| {
             let mut values: Vec<f64> = points.iter().map(|p| p[axis]).collect();

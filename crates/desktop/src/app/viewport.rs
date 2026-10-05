@@ -49,7 +49,7 @@ impl Workbench {
                         .flatten(),
                 },
             );
-            let points = nodes.iter().map(|n| n.samples.len()).sum();
+            let points = nodes.iter().map(|n| n.points.len()).sum();
             drop(nodes);
             self.smoke.view_rendered(renderer.pending(), points);
             self.renderer = Some(renderer);

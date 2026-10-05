@@ -124,7 +124,7 @@ fn view(
             let picks = project.select_view(&camera, 2_000_000, ids, &JobControl::default())?;
             points = 0;
             project.load_view_nodes(&picks, &mut cache, &JobControl::default(), 0, |node| {
-                points += node.samples.len();
+                points += node.points.len();
                 Ok(())
             })?;
             times.push(start.elapsed().as_secs_f64() * 1000.);

@@ -612,7 +612,7 @@ impl Workbench {
         let locals: Vec<DVec3> = self
             .shown_points(false)
             .filter(|(scan, ..)| *scan == first)
-            .map(|(_, s, _)| DVec3::from(s.position))
+            .map(|(_, local, ..)| local)
             .collect();
         if locals.is_empty() {
             return;

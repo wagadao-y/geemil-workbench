@@ -193,7 +193,7 @@ fn shown(p: &Project, cache: &mut ViewCache) -> u64 {
         .unwrap();
     let mut points = 0;
     p.load_view_nodes(&picks, cache, &job, 1, |node| {
-        points += node.samples.len() as u64;
+        points += node.points.len() as u64;
         Ok(())
     })
     .unwrap();

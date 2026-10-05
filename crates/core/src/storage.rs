@@ -172,13 +172,17 @@ pub(crate) fn valid(record: &[u8]) -> bool {
 }
 pub(crate) fn make_record(p: [f64; 3], color: [u8; 4], is_valid: bool, raw: &[u8]) -> Vec<u8> {
     let mut v = Vec::with_capacity(32 + raw.len());
-    for x in p {
-        v.extend(x.to_le_bytes());
-    }
-    v.extend(color);
-    v.extend([is_valid as u8, 0, 0, 0]);
+    push_record_head(&mut v, p, color, is_valid);
     v.extend(raw);
     v
+}
+/// The first 32 bytes of a point record, before its source values.
+pub(crate) fn push_record_head(out: &mut Vec<u8>, p: [f64; 3], color: [u8; 4], is_valid: bool) {
+    for x in p {
+        out.extend(x.to_le_bytes());
+    }
+    out.extend(color);
+    out.extend([is_valid as u8, 0, 0, 0]);
 }
 fn read_sample(r: &mut impl Read) -> Result<Sample> {
     let mut b = [0u8; SAMPLE_BYTES];

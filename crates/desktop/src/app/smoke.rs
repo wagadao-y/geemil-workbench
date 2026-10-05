@@ -2,7 +2,7 @@
 //! and check sRGB colour probes end to end. See README "CLIと検証".
 use super::Workbench;
 use eframe::egui;
-use geemil_core::{Camera, Sample, SelectionMode};
+use geemil_core::{Camera, NodePoints, Sample, SelectionMode};
 use std::{
     path::PathBuf,
     time::{Duration, Instant},
@@ -162,7 +162,7 @@ impl Workbench {
             self.nodes = vec![geemil_core::LoadedNode {
                 scan: uuid::Uuid::nil(),
                 node: 0,
-                samples: samples.into(),
+                points: NodePoints::new(glam::DVec3::ZERO, &samples).into(),
             }];
             self.points_generation += 1;
             self.settings.point_size = 8.;
@@ -352,14 +352,14 @@ impl Workbench {
         }
         let probes = self
             .shown_points(true)
-            .filter_map(|(_, sample, world)| {
+            .filter_map(|(_, _, color, world)| {
                 self.camera.project(world).map(|(uv, _)| {
                     (
                         egui::pos2(
                             rect.left() + uv[0] as f32 * rect.width(),
                             rect.top() + uv[1] as f32 * rect.height(),
                         ),
-                        sample.color,
+                        color,
                     )
                 })
             })
@@ -428,7 +428,7 @@ impl Workbench {
                         let (a, d) = (applied.get(&n.scan), drawn.get(&n.scan));
                         a.zip(d).is_some_and(|(a, d)| !a.abs_diff_eq(*d, 1e-9))
                     })
-                    .map(|n| n.samples.len())
+                    .map(|n| n.points.len())
                     .sum::<usize>();
                 eprintln!(
                     "Smoke preview: {:?}, {moved} of {} points moved",

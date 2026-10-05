@@ -1,7 +1,7 @@
 //! Numeric E57 point attributes stay in their original types. A small E57 template
 //! stores scan metadata and image blobs, without a second copy of the point cloud.
 use crate::parallel::OrderedPool;
-use crate::storage::{SpoolWriter, index, make_record};
+use crate::storage::{SpoolWriter, index, make_record, push_record_head};
 use crate::{Bounds, CoreError, ImageInfo, ImportOptions, JobControl, Pose, Project, Scan, Stage};
 use anyhow::{Context, Result, ensure};
 use e57::{
@@ -564,6 +564,54 @@ fn import_e57(
     Ok((scans, images))
 }
 
+/// Converts LAS records, `len` bytes each in `format`, to point records
+/// into `out`: position, colour (8 bits, or a light grey without) and the
+/// values X, Y, Z, intensity and with colour red, green and blue, followed by
+/// the source record in `source_format`. Returns their bounds.
+fn las_records(
+    raw: &[u8],
+    len: usize,
+    format: &las::point::Format,
+    transforms: &las::Vector<las::Transform>,
+    source_format: &las::point::Format,
+    out: &mut Vec<u8>,
+) -> Result<Option<Bounds>> {
+    out.clear();
+    let mut bounds: Option<Bounds> = None;
+    for record in raw.chunks_exact(len) {
+        let point = las::Point::new(las::raw::Point::read_from(record, format)?, transforms);
+        let p = [point.x, point.y, point.z];
+        ensure!(
+            p.iter().all(|v: &f64| v.is_finite()),
+            "LAS has non-finite coordinates"
+        );
+        let rgb = format
+            .has_color
+            .then(|| point.color.unwrap_or_default())
+            .map(|c| [c.red, c.green, c.blue]);
+        let color = rgb.map_or([180, 195, 210, 255], |[r, g, b]| {
+            [(r >> 8) as u8, (g >> 8) as u8, (b >> 8) as u8, 255]
+        });
+        push_record_head(out, p, color, true);
+        // The values as `encode` writes Double and Integer ones.
+        for v in p {
+            out.extend(v.to_le_bytes());
+        }
+        out.extend((point.intensity as i64).to_le_bytes());
+        for v in rgb.into_iter().flatten() {
+            out.extend((v as i64).to_le_bytes());
+        }
+        point
+            .into_raw(transforms)?
+            .write_to(&mut *out, source_format)?;
+        match &mut bounds {
+            Some(b) => b.include(p),
+            None => bounds = Some(Bounds::at(p)),
+        }
+    }
+    Ok(bounds)
+}
+
 fn import_las(
     source: &Path,
     stage: &Path,
@@ -676,54 +724,59 @@ fn import_las(
     let mut out = SpoolWriter::new(&spool, scan.records * scan.stride as u64, options)?;
     let mut bounds: Option<Bounds> = None;
     let mut count = 0;
+    // Large batches let a parallel LAZ decompressor spread them over its
+    // chunks; the workers then convert a batch's points side by side, each
+    // into a buffer it keeps, written in order.
+    let workers = options.workers()?;
+    let per_point = scan.stride as usize + source_format.len() as usize;
+    let batch_points = (options.worker_memory_bytes / 4 / per_point).clamp(8192, 1 << 19);
     let mut batch = las::PointDataBuilder::new()
         .for_header(reader.header())
         .build();
+    let mut buffers = vec![Vec::new(); workers];
     loop {
         job.check()?;
         job.report(Stage::ReadingLas, count, scan.records);
-        if reader.fill_points(8192, &mut batch)? == 0 {
+        let read = reader.fill_points(batch_points as u64, &mut batch)?;
+        if read == 0 {
             break;
         }
-        for point in batch.points() {
-            let point = point?;
-            let p = [point.x, point.y, point.z];
-            ensure!(
-                p.iter().all(|v: &f64| v.is_finite()),
-                "LAS has non-finite coordinates"
-            );
-            let mut raw = vec![
-                RecordValue::Double(p[0]),
-                RecordValue::Double(p[1]),
-                RecordValue::Double(p[2]),
-                RecordValue::Integer(point.intensity as i64),
-            ];
-            let mut color = [180, 195, 210, 255];
-            if header.point_format().has_color {
-                let c = point.color.unwrap_or_default();
-                raw.extend([
-                    RecordValue::Integer(c.red as i64),
-                    RecordValue::Integer(c.green as i64),
-                    RecordValue::Integer(c.blue as i64),
-                ]);
-                color = [
-                    (c.red >> 8) as u8,
-                    (c.green >> 8) as u8,
-                    (c.blue >> 8) as u8,
-                    255,
-                ];
+        let len = batch.record_len();
+        let per = (batch.len().div_ceil(workers)).max(1) * len;
+        let (format, transforms) = (batch.format(), batch.transforms());
+        let parts = std::thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .raw_bytes()
+                .chunks(per)
+                .zip(buffers.iter_mut())
+                .map(|(part, buffer)| {
+                    let source_format = &source_format;
+                    scope.spawn(move || {
+                        las_records(part, len, format, transforms, source_format, buffer)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .map_err(|_| anyhow::anyhow!("LAS worker panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (part, buffer) in parts.into_iter().zip(&buffers) {
+            out.write_all(buffer)?;
+            if let Some(part) = part {
+                match &mut bounds {
+                    Some(b) => {
+                        b.include(part.min);
+                        b.include(part.max);
+                    }
+                    None => bounds = Some(part),
+                }
             }
-            let mut record = make_record(p, color, true, &encode(&raw));
-            point
-                .into_raw(header.transforms())?
-                .write_to(&mut record, &source_format)?;
-            out.write_all(&record)?;
-            match &mut bounds {
-                Some(b) => b.include(p),
-                None => bounds = Some(Bounds::at(p)),
-            };
-            count += 1;
         }
+        count += read;
     }
     ensure!(count == scan.records, "LAS point count mismatch");
     scan.valid_points = count;

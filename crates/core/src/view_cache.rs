@@ -1,5 +1,5 @@
 use crate::layers::is_set;
-use crate::{JobControl, Project, Sample, Scan};
+use crate::{JobControl, NodePoints, Project, Sample, Scan, ViewPoint};
 use anyhow::Result;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -20,8 +20,10 @@ struct Key {
     scan: Uuid,
     node: u32,
 }
+/// Bytes a cached point takes: its [`ViewPoint`] and chunk reference.
+const POINT_BYTES: usize = std::mem::size_of::<ViewPoint>() + 8;
 struct Entry {
-    samples: Arc<[Sample]>,
+    points: Arc<NodePoints>,
     used: u64,
     bytes: usize,
 }
@@ -83,7 +85,7 @@ impl ViewCache {
     /// Room for about `points` samples, like Potree's point load limit of
     /// twice the point budget. Shrinking evicts the least recently used.
     pub fn set_point_limit(&mut self, points: usize) {
-        self.limit = points.saturating_mul(std::mem::size_of::<Sample>());
+        self.limit = points.saturating_mul(POINT_BYTES);
         self.evict(0);
     }
     /// Evicts least recently used entries until `incoming` more bytes fit.
@@ -206,7 +208,7 @@ impl ViewCache {
         scan: &Scan,
         node: u32,
         job: &JobControl,
-    ) -> Result<Arc<[Sample]>> {
+    ) -> Result<Arc<NodePoints>> {
         let key = Key {
             scan: scan.id,
             node,
@@ -216,7 +218,7 @@ impl ViewCache {
             let used = self.touch(used, Slot::Node(key));
             let entry = self.entries.get_mut(&key).unwrap();
             entry.used = used;
-            return Ok(entry.samples.clone());
+            return Ok(entry.points.clone());
         }
         let samples = project.read_view(scan, node)?;
         self.store_decoded(project, scan, node, samples, job)
@@ -230,16 +232,16 @@ impl ViewCache {
         node: u32,
         samples: Vec<Sample>,
         job: &JobControl,
-    ) -> Result<Arc<[Sample]>> {
+    ) -> Result<Arc<NodePoints>> {
         self.prepare(project);
         self.stats.misses += 1;
         let key = Key {
             scan: scan.id,
             node,
         };
-        let samples: Arc<[Sample]> = if project.current().layers.iter().all(|l| l.visible) {
+        let samples = if project.current().layers.iter().all(|l| l.visible) {
             job.check()?;
-            samples.into()
+            samples
         } else {
             let mut result = Vec::with_capacity(samples.len());
             // Keep the last mask locally even when it cannot fit in the cache.
@@ -264,10 +266,12 @@ impl ViewCache {
                 result.push(sample);
             }
             job.check()?;
-            result.into()
+            result
         };
+        let origin = scan.nodes[node as usize].bounds.center();
+        let points = Arc::new(NodePoints::new(origin, &samples));
         // Charge entry/Arc/hash-table overhead too, including nodes left empty.
-        let bytes = std::mem::size_of_val(samples.as_ref()) + 128;
+        let bytes = points.len() * POINT_BYTES + 128;
         if bytes <= self.limit {
             // A node decoded twice replaces its first entry.
             if let Some(old) = self.entries.get(&key).map(|e| e.used) {
@@ -281,12 +285,12 @@ impl ViewCache {
             self.entries.insert(
                 key,
                 Entry {
-                    samples: samples.clone(),
+                    points: points.clone(),
                     used: self.clock,
                     bytes,
                 },
             );
         }
-        Ok(samples)
+        Ok(points)
     }
 }

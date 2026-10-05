@@ -11,7 +11,7 @@ use super::{
     layers::{destination, destination_combo},
 };
 use eframe::egui;
-use geemil_core::{Camera, JobControl, Project, Sample, Selection, SelectionMode};
+use geemil_core::{Camera, JobControl, NodePoints, Project, Selection, SelectionMode};
 use glam::DMat4;
 use std::{
     collections::HashMap,
@@ -143,7 +143,7 @@ impl SelectionState {
     pub(super) fn preview_summary(&self) -> Option<String> {
         let preview = &self.preview;
         preview.marks_for.as_ref().map(|_| {
-            let displayed: usize = preview.marks.iter().map(|m| m.samples.len()).sum();
+            let displayed: usize = preview.marks.iter().map(|m| m.points.len()).sum();
             format!(
                 "{} of {displayed} displayed points marked, nearest {:?}",
                 preview.marked, preview.nearest
@@ -192,7 +192,7 @@ struct Preview {
 #[derive(Clone)]
 struct NodeMarks {
     /// Held so their address, which identifies the node, stays unique.
-    samples: Arc<[Sample]>,
+    points: Arc<NodePoints>,
     /// Where the node's scan is; none when it is hidden.
     world: Option<DMat4>,
     /// True for points the move takes; none when it takes none.
@@ -453,11 +453,11 @@ impl Workbench {
                     ..input.clone()
                 }
             });
-            let address = |samples: &Arc<[Sample]>| Arc::as_ptr(samples) as *const () as usize;
+            let address = |points: &Arc<NodePoints>| Arc::as_ptr(points) as usize;
             let previous: HashMap<usize, NodeMarks> = if same_test {
                 std::mem::take(&mut preview.marks)
                     .into_iter()
-                    .map(|m| (address(&m.samples), m))
+                    .map(|m| (address(&m.points), m))
                     .collect()
             } else {
                 HashMap::new()
@@ -465,23 +465,19 @@ impl Workbench {
             // Points of hidden scans stay unmarked.
             preview.marks = super::view::par_map(&self.nodes, |node| {
                 let world = worlds.get(&node.scan).copied();
-                if let Some(kept) = previous.get(&address(&node.samples))
+                if let Some(kept) = previous.get(&address(&node.points))
                     && kept.world == world
                 {
                     return kept.clone();
                 }
                 let marks: Vec<bool> = node
-                    .samples
-                    .iter()
-                    .map(|p| {
-                        world.is_some_and(|w| {
-                            test.excludes(w.transform_point3(p.position.into()), limit)
-                        })
-                    })
+                    .points
+                    .positions()
+                    .map(|p| world.is_some_and(|w| test.excludes(w.transform_point3(p), limit)))
                     .collect();
                 let marked = marks.iter().filter(|m| **m).count();
                 NodeMarks {
-                    samples: node.samples.clone(),
+                    points: node.points.clone(),
                     world,
                     marks: (marked > 0).then(|| marks.into()),
                     marked,
@@ -552,9 +548,9 @@ fn displayed_nearest(
         let Some(world) = worlds.get(&node.scan) else {
             return f64::INFINITY;
         };
-        node.samples
-            .iter()
-            .filter_map(|p| test.contains(world.transform_point3(p.position.into())))
+        node.points
+            .positions()
+            .filter_map(|p| test.contains(world.transform_point3(p)))
             .fold(f64::INFINITY, f64::min)
     })
     .into_iter()

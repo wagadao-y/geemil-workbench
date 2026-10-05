@@ -8,7 +8,7 @@ use super::ColorMode;
 use super::{Workbench, jobs::Notice, jobs::is_cancelled};
 use crate::render::DrawNode;
 use eframe::egui;
-use geemil_core::{Camera, JobControl, LoadedNode, Pose, Project, Sample, SpacingCache, ViewCache};
+use geemil_core::{Camera, JobControl, LoadedNode, Pose, Project, SpacingCache, ViewCache};
 use glam::{DMat4, DVec3};
 use std::{
     collections::HashMap,
@@ -21,20 +21,25 @@ use std::{
 };
 use uuid::Uuid;
 
-/// The points of `nodes` whose scan has a world matrix in `worlds`, with
-/// their scan, scan coordinates and place in the project frame.
+/// A shown point: its scan, scan coordinates, sRGB colour and place in the
+/// project frame.
+pub(super) type ShownPoint = (Uuid, DVec3, [u8; 4], DVec3);
+
+/// The points of `nodes` whose scan has a world matrix in `worlds`.
 pub(super) fn node_points(
     nodes: &[LoadedNode],
     worlds: HashMap<Uuid, DMat4>,
-) -> impl Iterator<Item = (Uuid, &Sample, DVec3)> + '_ {
+) -> impl Iterator<Item = ShownPoint> + '_ {
     nodes.iter().flat_map(move |node| {
         let world = worlds.get(&node.scan).copied();
-        node.samples.iter().filter_map(move |s| {
-            let world = world?;
+        let points = &node.points;
+        (0..points.len()).filter_map(move |i| {
+            let local = points.position(i);
             Some((
                 node.scan,
-                s,
-                world.transform_point3(DVec3::from(s.position)),
+                local,
+                points.points[i].color,
+                world?.transform_point3(local),
             ))
         })
     })
@@ -335,7 +340,7 @@ impl Workbench {
                     self.view.shown = result.serial;
                     self.spacings = spacings;
                     let moving = self.last_motion.elapsed() < Duration::from_millis(150);
-                    let points = nodes.iter().map(|n| n.samples.len()).sum();
+                    let points = nodes.iter().map(|n| n.points.len()).sum();
                     self.smoke.view_loaded(moving, points, result.partial);
                     self.nodes = nodes;
                     self.points_generation += 1;
@@ -377,10 +382,7 @@ impl Workbench {
     }
     /// The shown points with their scan, scan coordinates and place in the
     /// project frame: as drawn with `previewed`, else as applied.
-    pub(super) fn shown_points(
-        &self,
-        previewed: bool,
-    ) -> impl Iterator<Item = (Uuid, &Sample, DVec3)> + '_ {
+    pub(super) fn shown_points(&self, previewed: bool) -> impl Iterator<Item = ShownPoint> + '_ {
         node_points(&self.nodes, self.scan_worlds(previewed))
     }
     /// The number of points drawn.
@@ -389,7 +391,7 @@ impl Workbench {
         self.nodes
             .iter()
             .filter(|n| worlds.contains_key(&n.scan))
-            .map(|n| n.samples.len())
+            .map(|n| n.points.len())
             .sum()
     }
     /// What the renderer draws: each loaded node of a shown scan with the
@@ -416,14 +418,14 @@ impl Workbench {
             }
             result.push(DrawNode {
                 id: i,
-                samples: &node.samples,
+                points: &node.points,
                 world: *world,
                 tint,
                 marks: marks.as_ref().and_then(|m| m(i)),
                 spacings: self
                     .spacings
                     .get(i)
-                    .filter(|s| self.settings.adaptive_size && s.len() == node.samples.len()),
+                    .filter(|s| self.settings.adaptive_size && s.len() == node.points.len()),
             });
         }
         result
@@ -445,7 +447,7 @@ impl Workbench {
         let mut heights: Vec<f64> = self
             .shown_points(false)
             .step_by(step)
-            .map(|(_, _, p)| p.z)
+            .map(|(.., p)| p.z)
             .collect();
         heights.sort_by(f64::total_cmp);
         let at = |q: f64| heights[((heights.len() - 1) as f64 * q) as usize];

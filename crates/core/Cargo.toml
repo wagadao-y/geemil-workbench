@@ -13,6 +13,7 @@ glam.workspace = true
 e57.workspace = true
 las.workspace = true
 zstd.workspace = true
+bytemuck.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

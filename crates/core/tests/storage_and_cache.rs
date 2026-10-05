@@ -12,7 +12,7 @@ impl Points for geemil_core::LoadedView {
     fn points(&self) -> Vec<geemil_core::Sample> {
         self.nodes
             .iter()
-            .flat_map(|n| n.samples.iter().cloned())
+            .flat_map(|n| (0..n.points.len()).map(|i| n.points.sample(i)))
             .collect()
     }
 }
@@ -61,7 +61,7 @@ fn parallel_view_matches_serial_with_hidden_layers_quotas_and_cache_reuse() {
                 .iter()
                 .map(|pick| {
                     let node = project.view_node(pick, &job, &mut serial_cache).unwrap();
-                    (node.scan, node.node, node.samples)
+                    (node.scan, node.node, node.points)
                 })
                 .collect();
             let mut cache = ViewCache::new(16 * 1024 * 1024);
@@ -69,7 +69,7 @@ fn parallel_view_matches_serial_with_hidden_layers_quotas_and_cache_reuse() {
                 let mut actual = vec![];
                 project
                     .load_view_nodes(&picks, &mut cache, &job, 4, |node| {
-                        actual.push((node.scan, node.node, node.samples));
+                        actual.push((node.scan, node.node, node.points));
                         Ok(())
                     })
                     .unwrap();
@@ -502,23 +502,26 @@ fn view_spacings_follow_the_deepest_loaded_node_holding_each_point() {
     let all = p.view_spacings(&view.nodes, &job).unwrap();
     let loaded: std::collections::HashSet<_> =
         view.nodes.iter().map(|n| (n.scan, n.node)).collect();
-    let holds = |scan: &geemil_core::Scan, node: u32, q: [f64; 3]| {
+    // Within a millionth of the point's own node, the rounding of its offset.
+    let holds = |scan: &geemil_core::Scan, own: u32, node: u32, q: [f64; 3]| {
+        let o = scan.nodes[own as usize].bounds;
+        let slack = (0..3).map(|k| o.max[k] - o.min[k]).fold(0., f64::max) * 1e-6;
         let b = scan.nodes[node as usize].bounds;
-        (0..3).all(|k| b.min[k] <= q[k] && q[k] <= b.max[k])
+        (0..3).all(|k| b.min[k] - slack <= q[k] && q[k] <= b.max[k] + slack)
     };
     let mut deeper = 0;
     for (node, spacings) in view.nodes.iter().zip(&all) {
-        assert_eq!(spacings.len(), node.samples.len());
+        assert_eq!(spacings.len(), node.points.len());
         let scan = p.scan(node.scan).unwrap();
-        for (sample, s) in node.samples.iter().zip(spacings) {
-            let q = sample.position;
+        for (q, s) in node.points.positions().zip(spacings) {
+            let q = q.to_array();
             let deepest = (0..scan.nodes.len() as u32).find(|&n| {
                 loaded.contains(&(node.scan, n))
-                    && holds(scan, n, q)
+                    && holds(scan, node.node, n, q)
                     && !scan.nodes[n as usize]
                         .children
                         .iter()
-                        .any(|c| loaded.contains(&(node.scan, *c)) && holds(scan, *c, q))
+                        .any(|c| loaded.contains(&(node.scan, *c)) && holds(scan, node.node, *c, q))
             });
             assert_eq!(Some(*s), deepest.map(|n| spacing(node.scan, n)));
             deeper += (deepest != Some(node.node)) as usize;
@@ -613,7 +616,9 @@ fn the_view_cache_evicts_the_least_recently_used_node() {
         panic!("too few nodes")
     };
     let bytes = |n: u32| {
-        scan.nodes[n as usize].count as usize * std::mem::size_of::<geemil_core::Sample>() + 128
+        // A cached point: its view point and chunk reference.
+        scan.nodes[n as usize].count as usize * (std::mem::size_of::<geemil_core::ViewPoint>() + 8)
+            + 128
     };
     // Room for all three but one byte, so loading the third evicts one.
     let mut cache = ViewCache::new(bytes(a) + bytes(b) + bytes(c) - 1);

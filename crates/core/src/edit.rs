@@ -26,7 +26,76 @@ pub struct ViewPick {
 pub struct LoadedNode {
     pub scan: Uuid,
     pub node: u32,
-    pub samples: std::sync::Arc<[Sample]>,
+    pub points: Arc<NodePoints>,
+}
+/// A displayed point: its place relative to its node's origin and its sRGB
+/// colour, 16 bytes laid out as a GPU vertex.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ViewPoint {
+    pub offset: [f32; 3],
+    pub color: [u8; 4],
+}
+/// A display node's points, compact: in scan coordinates as `f32` offsets
+/// from the centre of the node's box, which keeps them within a hundredth of
+/// a millimetre for nodes up to a few hundred metres across.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NodePoints {
+    pub origin: [f64; 3],
+    pub points: Vec<ViewPoint>,
+    /// Each point's chunk and index there, parallel to `points`.
+    pub refs: Vec<[u32; 2]>,
+}
+impl NodePoints {
+    pub fn new(origin: DVec3, samples: &[Sample]) -> Self {
+        Self {
+            origin: origin.to_array(),
+            points: samples
+                .iter()
+                .map(|s| ViewPoint {
+                    offset: (DVec3::from(s.position) - origin).as_vec3().to_array(),
+                    color: s.color,
+                })
+                .collect(),
+            refs: samples.iter().map(|s| [s.chunk, s.index]).collect(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+    /// Point `i` in scan coordinates.
+    pub fn position(&self, i: usize) -> DVec3 {
+        DVec3::from(self.origin) + DVec3::from(glam::Vec3::from(self.points[i].offset))
+    }
+    /// The points in scan coordinates.
+    pub fn positions(&self) -> impl Iterator<Item = DVec3> + '_ {
+        let origin = DVec3::from(self.origin);
+        self.points
+            .iter()
+            .map(move |p| origin + DVec3::from(glam::Vec3::from(p.offset)))
+    }
+    /// Point `i` as a sample, in scan coordinates.
+    pub fn sample(&self, i: usize) -> Sample {
+        let [chunk, index] = self.refs[i];
+        Sample {
+            chunk,
+            index,
+            position: self.position(i).to_array(),
+            color: self.points[i].color,
+        }
+    }
+    /// The points at `indices`, in their order.
+    fn select(&self, indices: impl Iterator<Item = usize>) -> Self {
+        let (points, refs) = indices.map(|i| (self.points[i], self.refs[i])).unzip();
+        Self {
+            origin: self.origin,
+            points,
+            refs,
+        }
+    }
 }
 /// The nodes of a view, grouped by scan.
 #[derive(Clone, Debug, Default)]
@@ -42,7 +111,7 @@ pub struct SpacingCache {
     entries: HashMap<(Uuid, u32), SpacingEntry>,
 }
 struct SpacingEntry {
-    samples: Arc<[Sample]>,
+    points: Arc<NodePoints>,
     /// Loaded nodes reachable through loaded children, depth first.
     below: Vec<u32>,
     spacings: Arc<[f32]>,
@@ -588,9 +657,12 @@ impl Project {
                 continue;
             };
             let world = self.world_matrix(&self.manifest.scans[i]);
-            result.extend(node.samples.iter().map(|s| Sample {
-                position: world.transform_point3(DVec3::from(s.position)).to_array(),
-                ..*s
+            result.extend((0..node.points.len()).map(|j| {
+                let s = node.points.sample(j);
+                Sample {
+                    position: world.transform_point3(DVec3::from(s.position)).to_array(),
+                    ..s
+                }
             }));
         }
         Ok(result)
@@ -711,21 +783,20 @@ impl Project {
         let scan = self
             .scan(pick.scan)
             .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
-        let samples = cache.samples(self, scan, pick.node, job)?;
-        Ok(Self::loaded_node(pick, samples))
+        let points = cache.samples(self, scan, pick.node, job)?;
+        Ok(Self::loaded_node(pick, points))
     }
 
-    fn loaded_node(pick: &ViewPick, mut samples: Arc<[Sample]>) -> LoadedNode {
-        if let Some(q) = pick.quota.filter(|q| *q < samples.len()) {
+    fn loaded_node(pick: &ViewPick, mut points: Arc<NodePoints>) -> LoadedNode {
+        if let Some(q) = pick.quota.filter(|q| *q < points.len()) {
             // Spread over the whole node rather than a prefix.
-            samples = (0..q)
-                .map(|i| samples[i * samples.len() / q.max(1)].clone())
-                .collect();
+            let n = points.len();
+            points = Arc::new(points.select((0..q).map(|i| i * n / q.max(1))));
         }
         LoadedNode {
             scan: pick.scan,
             node: pick.node,
-            samples,
+            points,
         }
     }
 
@@ -760,8 +831,8 @@ impl Project {
         let serial = |pick: &ViewPick, cache: &mut ViewCache| -> Result<LoadedNode> {
             job.report(Stage::ViewPoints, 0, 0);
             job.check()?;
-            let samples = cache.samples(self, scan(pick.scan)?, pick.node, job)?;
-            Ok(Self::loaded_node(pick, samples))
+            let points = cache.samples(self, scan(pick.scan)?, pick.node, job)?;
+            Ok(Self::loaded_node(pick, points))
         };
         // Cached nodes require no worker or file access.
         let (cached, missing): (Vec<_>, Vec<_>) = picks
@@ -831,8 +902,10 @@ impl Project {
     /// Starting from the point's own node, it descends into loaded children
     /// whose box holds the point. A node's spacing is the longest side of its
     /// box over 128 cells, the grid it picks its points on (and about the
-    /// spacing of a leaf's points). So where finer nodes are loaded points
-    /// draw small, and where none are, such as around stray points, large.
+    /// spacing of a leaf's points). A box holds a point within a millionth
+    /// of the size of the point's own node, the rounding of its offset. So
+    /// where finer nodes are loaded points draw small, and where none are,
+    /// such as around stray points, large.
     pub fn view_spacings(&self, nodes: &[LoadedNode], job: &JobControl) -> Result<Vec<Vec<f32>>> {
         let mut cache = SpacingCache::default();
         Ok(self
@@ -889,7 +962,7 @@ impl Project {
                 cache
                     .entries
                     .get(&(n.scan, n.node))
-                    .filter(|e| Arc::ptr_eq(&e.samples, &n.samples) && e.below == *below)
+                    .filter(|e| Arc::ptr_eq(&e.points, &n.points) && e.below == *below)
                     .map(|e| e.spacings.clone())
             })
             .collect();
@@ -907,13 +980,16 @@ impl Project {
                 .filter(|c| loaded.contains(&(n.scan, *c)))
                 .collect();
             let own = spacing(node) as f32;
-            Ok(n.samples
-                .iter()
-                .map(|s| {
-                    let p = DVec3::from(s.position);
+            // Boxes are tight, so outer points lie on them; allow for the
+            // rounding of their f32 offsets.
+            let slack = DVec3::splat(spacing(node) * CELLS * 1e-6);
+            Ok(n.points
+                .positions()
+                .map(|p| {
                     let holds = |id: &u32| {
                         let b = &scan.nodes[*id as usize].bounds;
-                        p.cmpge(DVec3::from(b.min)).all() && p.cmple(DVec3::from(b.max)).all()
+                        p.cmpge(DVec3::from(b.min) - slack).all()
+                            && p.cmple(DVec3::from(b.max) + slack).all()
                     };
                     let Some(mut at) = children.iter().copied().find(|c| holds(c)) else {
                         return own;
@@ -967,7 +1043,7 @@ impl Project {
             .zip(&result)
             .map(|((n, below), spacings)| {
                 let entry = SpacingEntry {
-                    samples: n.samples.clone(),
+                    points: n.points.clone(),
                     below,
                     spacings: spacings.clone(),
                 };

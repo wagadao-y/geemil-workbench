@@ -86,7 +86,7 @@ fn main() -> Result<()> {
         let start = Instant::now();
         let mut loaded = 0;
         project.load_view_nodes(&picks, &mut cache, &job, 0, |node| {
-            loaded += node.samples.len();
+            loaded += node.points.len();
             Ok(())
         })?;
         println!(
