@@ -19,7 +19,7 @@ mod view_cache;
 pub use align::{IcpOptions, IcpResult, rigid_fit};
 pub use edit::{
     Camera, LoadedNode, LoadedView, PreparedSelection, Projector, Selection, SelectionMode,
-    ViewPick,
+    SpacingCache, ViewPick,
 };
 pub use error::{CoreError, Stage};
 pub use filter::FilterOptions;

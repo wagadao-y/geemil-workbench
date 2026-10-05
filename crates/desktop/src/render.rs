@@ -10,9 +10,9 @@ const SCENE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 // egui-wgpu (0.36) samples native textures as plain Rgba8Unorm holding sRGB
 // code values, so edl.wgsl encodes its linear result before writing here.
 const OUTPUT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
-/// Points uploaded per frame at most; the rest follow in later frames so a
-/// large view does not stall one.
-const UPLOAD_PER_FRAME: usize = 2_000_000;
+/// Points uploaded per frame at most (8 MB of vertices); the rest follow in
+/// later frames so a large view does not stall one.
+const UPLOAD_PER_FRAME: usize = 500_000;
 /// Per-pixel view depth for EDL; 0 marks background.
 const VIEW_DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 
@@ -140,14 +140,15 @@ struct GpuNode {
     _samples: Arc<[Sample]>,
     origin: DVec3,
     vertices: wgpu::Buffer,
-    /// One u32 per point; bit 0 highlights it.
-    flags: wgpu::Buffer,
-    /// One f32 per point: its spacing for adaptive point size.
-    spacings: wgpu::Buffer,
+    /// One u32 per point; bit 0 highlights it. None draws `zeros` instead,
+    /// while no point is highlighted.
+    flags: Option<wgpu::Buffer>,
+    /// One f32 per point: its spacing for adaptive point size. None draws
+    /// `zeros` instead, before any spacings are given.
+    spacings: Option<wgpu::Buffer>,
     /// The spacings written, kept so their address identifies them.
     spacings_written: Option<Arc<[f32]>>,
     count: u32,
-    marked: bool,
     marks_revision: u64,
     used: u64,
 }
@@ -162,6 +163,8 @@ pub struct PointRenderer {
     uniform_slots: usize,
     layout: wgpu::BindGroupLayout,
     bind: wgpu::BindGroup,
+    /// Zeros for nodes without flags or spacings, as long as the largest node.
+    zeros: wgpu::Buffer,
     /// Resident nodes by the address of their samples.
     nodes: HashMap<usize, GpuNode>,
     frame: u64,
@@ -257,6 +260,7 @@ impl PointRenderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let zeros = zeros(&device, 0);
         Self {
             device,
             queue,
@@ -266,6 +270,7 @@ impl PointRenderer {
             uniform_slots: 1,
             layout,
             bind,
+            zeros,
             nodes: HashMap::new(),
             frame: 0,
             resident: 0,
@@ -308,54 +313,56 @@ impl PointRenderer {
                     color: p.color,
                 })
                 .collect();
-            let create = |label, contents: &[u8]| {
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some(label),
-                        contents,
-                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    })
-            };
             let gpu = GpuNode {
                 _samples: node.samples.clone(),
                 origin,
-                vertices: create("node points", bytemuck::cast_slice(&vertices)),
-                flags: create("node flags", &vec![0u8; node.samples.len() * 4]),
-                spacings: create("node spacings", &vec![0u8; node.samples.len() * 4]),
+                vertices: self.vertex_buffer("node points", bytemuck::cast_slice(&vertices)),
+                flags: None,
+                spacings: None,
                 spacings_written: None,
                 count: node.samples.len() as u32,
-                marked: false,
                 marks_revision: 0,
                 used: 0,
             };
             self.resident += node.samples.len();
             self.nodes.insert(key, gpu);
         }
-        let gpu = self.nodes.get_mut(&key).unwrap();
-        gpu.used = self.frame;
-        if let Some(spacings) = node.spacings
-            && gpu
-                .spacings_written
+        let gpu = &self.nodes[&key];
+        let spacings = node.spacings.filter(|spacings| {
+            gpu.spacings_written
                 .as_ref()
                 .is_none_or(|w| !Arc::ptr_eq(w, spacings))
-        {
-            self.queue
-                .write_buffer(&gpu.spacings, 0, bytemuck::cast_slice(spacings));
-            gpu.spacings_written = Some(spacings.clone());
+        });
+        let spacings = spacings.map(|spacings| {
+            let buffer = self.vertex_buffer("node spacings", bytemuck::cast_slice(spacings));
+            (buffer, spacings.clone())
+        });
+        let flags = (gpu.marks_revision != revision).then(|| {
+            let marks = node.marks.filter(|m| m.iter().any(|m| *m))?;
+            let flags: Vec<u32> = (0..gpu.count as usize)
+                .map(|i| marks.get(i).is_some_and(|m| *m) as u32)
+                .collect();
+            Some(self.vertex_buffer("node flags", bytemuck::cast_slice(&flags)))
+        });
+        let gpu = self.nodes.get_mut(&key).unwrap();
+        gpu.used = self.frame;
+        if let Some((buffer, written)) = spacings {
+            gpu.spacings = Some(buffer);
+            gpu.spacings_written = Some(written);
         }
-        if gpu.marks_revision != revision {
+        if let Some(flags) = flags {
+            gpu.flags = flags;
             gpu.marks_revision = revision;
-            let marks = node.marks.filter(|m| m.iter().any(|m| *m));
-            if marks.is_some() || gpu.marked {
-                let flags: Vec<u32> = (0..gpu.count as usize)
-                    .map(|i| marks.and_then(|m| m.get(i)).is_some_and(|m| *m) as u32)
-                    .collect();
-                self.queue
-                    .write_buffer(&gpu.flags, 0, bytemuck::cast_slice(&flags));
-                gpu.marked = marks.is_some();
-            }
         }
         true
+    }
+    fn vertex_buffer(&self, label: &str, contents: &[u8]) -> wgpu::Buffer {
+        self.device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents,
+                usage: wgpu::BufferUsages::VERTEX,
+            })
     }
     /// Drops the least recently drawn nodes beyond the limit.
     fn evict(&mut self) {
@@ -426,6 +433,11 @@ impl PointRenderer {
             .map(|n| (Arc::as_ptr(n.samples) as *const () as usize, n))
             .collect();
         self.evict();
+        let longest = segments.iter().map(|(key, _)| self.nodes[key].count);
+        let longest = longest.max().unwrap_or(0) as u64;
+        if self.zeros.size() < longest * 4 {
+            self.zeros = zeros(&self.device, longest);
+        }
         let targets = self.targets.as_ref().unwrap();
         if segments.len() > self.uniform_slots {
             self.uniform_slots = segments.len().next_power_of_two();
@@ -607,8 +619,9 @@ impl PointRenderer {
                 let node = &self.nodes[key];
                 pass.set_bind_group(0, &self.bind, &[(i as u64 * self.uniform_stride) as u32]);
                 pass.set_vertex_buffer(0, node.vertices.slice(..));
-                pass.set_vertex_buffer(1, node.flags.slice(..));
-                pass.set_vertex_buffer(2, node.spacings.slice(..));
+                pass.set_vertex_buffer(1, node.flags.as_ref().unwrap_or(&self.zeros).slice(..));
+                let spacings = node.spacings.as_ref().unwrap_or(&self.zeros);
+                pass.set_vertex_buffer(2, spacings.slice(..));
                 pass.draw(0..6, 0..node.count);
             }
             if let Some(buffer) = &line_buffer {
@@ -704,6 +717,17 @@ impl PointRenderer {
 }
 
 const UNIFORM_SIZE: u64 = std::mem::size_of::<Uniform>() as u64;
+
+/// A vertex buffer of four zero bytes per point for at least `points`;
+/// wgpu clears new buffers.
+fn zeros(device: &wgpu::Device, points: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("zeros"),
+        size: points.max(1024).next_power_of_two() * 4,
+        usage: wgpu::BufferUsages::VERTEX,
+        mapped_at_creation: false,
+    })
+}
 
 fn uniform_slots(
     device: &wgpu::Device,

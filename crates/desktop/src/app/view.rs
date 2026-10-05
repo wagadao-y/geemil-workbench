@@ -8,7 +8,7 @@ use super::ColorMode;
 use super::{Workbench, jobs::Notice, jobs::is_cancelled};
 use crate::render::DrawNode;
 use eframe::egui;
-use geemil_core::{Camera, JobControl, LoadedNode, Pose, Project, Sample, ViewCache};
+use geemil_core::{Camera, JobControl, LoadedNode, Pose, Project, Sample, SpacingCache, ViewCache};
 use glam::{DMat4, DVec3};
 use std::{
     collections::HashMap,
@@ -94,6 +94,7 @@ impl ViewLoader {
         let live_epoch = epoch.clone();
         std::thread::spawn(move || {
             let mut cache = ViewCache::new(0);
+            let mut spacings = SpacingCache::default();
             let mut serial = 0;
             let Ok(mut request) = requests.recv() else {
                 return;
@@ -121,14 +122,14 @@ impl ViewLoader {
                     sent
                 };
                 let outcome = load(&request, &mut cache, &live_epoch, &requests, |nodes| {
-                    let nodes = with_spacings(&request, nodes);
+                    let nodes = with_spacings(&request, nodes, &mut spacings);
                     send(nodes, true, &mut serial, request.epoch);
                 });
                 match outcome {
                     Outcome::Done(nodes) => {
                         if live_epoch.load(Ordering::Relaxed) == request.epoch
                             && !send(
-                                with_spacings(&request, nodes),
+                                with_spacings(&request, nodes, &mut spacings),
                                 false,
                                 &mut serial,
                                 request.epoch,
@@ -182,16 +183,20 @@ enum Outcome {
 }
 
 /// The nodes with their points' spacings when the request asks for them.
-fn with_spacings(request: &ViewRequest, nodes: Vec<LoadedNode>) -> anyhow::Result<ViewNodes> {
+/// Nodes whose spacings are unchanged keep their arrays, which the renderer
+/// then does not upload again.
+fn with_spacings(
+    request: &ViewRequest,
+    nodes: Vec<LoadedNode>,
+    cache: &mut SpacingCache,
+) -> anyhow::Result<ViewNodes> {
     if !request.adaptive {
+        *cache = SpacingCache::default();
         return Ok((nodes, vec![]));
     }
     let spacings = request
         .project
-        .view_spacings(&nodes, &JobControl::default())?
-        .into_iter()
-        .map(Arc::from)
-        .collect();
+        .view_spacings_cached(&nodes, cache, &JobControl::default())?;
     Ok((nodes, spacings))
 }
 

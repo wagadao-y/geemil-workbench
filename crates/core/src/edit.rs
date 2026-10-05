@@ -7,7 +7,7 @@ use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3, DVec4};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BinaryHeap, HashSet},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
 };
 use uuid::Uuid;
@@ -32,6 +32,20 @@ pub struct LoadedNode {
 #[derive(Clone, Debug, Default)]
 pub struct LoadedView {
     pub nodes: Vec<LoadedNode>,
+}
+/// The spacings [`Project::view_spacings_cached`] found last, by node. They
+/// hold while the node's samples and the loaded nodes below it stay the same,
+/// so a camera move recomputes only nodes whose loaded subtree changed, and
+/// hands the renderer the same arrays for the rest.
+#[derive(Default)]
+pub struct SpacingCache {
+    entries: HashMap<(Uuid, u32), SpacingEntry>,
+}
+struct SpacingEntry {
+    samples: Arc<[Sample]>,
+    /// Loaded nodes reachable through loaded children, depth first.
+    below: Vec<u32>,
+    spacings: Arc<[f32]>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
@@ -820,15 +834,26 @@ impl Project {
     /// spacing of a leaf's points). So where finer nodes are loaded points
     /// draw small, and where none are, such as around stray points, large.
     pub fn view_spacings(&self, nodes: &[LoadedNode], job: &JobControl) -> Result<Vec<Vec<f32>>> {
+        let mut cache = SpacingCache::default();
+        Ok(self
+            .view_spacings_cached(nodes, &mut cache, job)?
+            .iter()
+            .map(|s| s.to_vec())
+            .collect())
+    }
+    /// [`Project::view_spacings`], reusing what `cache` holds from the last
+    /// call for nodes whose samples and loaded nodes below are unchanged. The
+    /// cache then holds this call's nodes.
+    pub fn view_spacings_cached(
+        &self,
+        nodes: &[LoadedNode],
+        cache: &mut SpacingCache,
+        job: &JobControl,
+    ) -> Result<Vec<Arc<[f32]>>> {
         const CELLS: f64 = 128.;
         let index = self.scan_index();
         let loaded: HashSet<(Uuid, u32)> = nodes.iter().map(|n| (n.scan, n.node)).collect();
-        let spacing = |node: &crate::Node| {
-            let b = &node.bounds;
-            (DVec3::from(b.max) - DVec3::from(b.min)).max_element() / CELLS
-        };
-        let one = |n: &LoadedNode| -> Result<Vec<f32>> {
-            job.check()?;
+        let scan_node = |n: &LoadedNode| -> Result<(&Scan, &crate::Node)> {
             let scan = &self.manifest.scans[*index
                 .get(&n.scan)
                 .ok_or_else(|| anyhow::anyhow!("Missing scan"))?];
@@ -836,6 +861,45 @@ impl Project {
                 .nodes
                 .get(n.node as usize)
                 .ok_or_else(|| anyhow::anyhow!("Invalid node"))?;
+            Ok((scan, node))
+        };
+        // The loaded nodes a node's points can descend into, which with its
+        // samples decide its spacings.
+        let below = nodes
+            .iter()
+            .map(|n| {
+                let (scan, _) = scan_node(n)?;
+                let mut reached = vec![];
+                let mut stack = vec![n.node];
+                while let Some(at) = stack.pop() {
+                    for &c in &scan.nodes[at as usize].children {
+                        if loaded.contains(&(n.scan, c)) {
+                            reached.push(c);
+                            stack.push(c);
+                        }
+                    }
+                }
+                Ok(reached)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let kept: Vec<Option<Arc<[f32]>>> = nodes
+            .iter()
+            .zip(&below)
+            .map(|(n, below)| {
+                cache
+                    .entries
+                    .get(&(n.scan, n.node))
+                    .filter(|e| Arc::ptr_eq(&e.samples, &n.samples) && e.below == *below)
+                    .map(|e| e.spacings.clone())
+            })
+            .collect();
+        let spacing = |node: &crate::Node| {
+            let b = &node.bounds;
+            (DVec3::from(b.max) - DVec3::from(b.min)).max_element() / CELLS
+        };
+        let one = |n: &LoadedNode| -> Result<Vec<f32>> {
+            job.check()?;
+            let (scan, node) = scan_node(n)?;
             let children: Vec<u32> = node
                 .children
                 .iter()
@@ -868,22 +932,49 @@ impl Project {
                 })
                 .collect())
         };
+        let missing: Vec<&LoadedNode> = nodes
+            .iter()
+            .zip(&kept)
+            .filter(|(_, k)| k.is_none())
+            .map(|(n, _)| n)
+            .collect();
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let per = nodes.len().div_ceil(threads).max(1);
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = nodes
+        let per = missing.len().div_ceil(threads).max(1);
+        let computed = std::thread::scope(|scope| {
+            let handles: Vec<_> = missing
                 .chunks(per)
-                .map(|part| scope.spawn(move || part.iter().map(one).collect::<Result<Vec<_>>>()))
+                .map(|part| {
+                    scope.spawn(move || part.iter().map(|n| one(n)).collect::<Result<Vec<_>>>())
+                })
                 .collect();
-            let mut all = Vec::with_capacity(nodes.len());
+            let mut all = Vec::with_capacity(missing.len());
             for h in handles {
                 all.extend(
                     h.join()
                         .map_err(|_| anyhow::anyhow!("Spacing worker panicked"))??,
                 );
             }
-            Ok(all)
-        })
+            Ok::<_, anyhow::Error>(all)
+        })?;
+        let mut computed = computed.into_iter();
+        let result: Vec<Arc<[f32]>> = kept
+            .into_iter()
+            .map(|k| k.unwrap_or_else(|| computed.next().unwrap().into()))
+            .collect();
+        cache.entries = nodes
+            .iter()
+            .zip(below)
+            .zip(&result)
+            .map(|((n, below), spacings)| {
+                let entry = SpacingEntry {
+                    samples: n.samples.clone(),
+                    below,
+                    spacings: spacings.clone(),
+                };
+                ((n.scan, n.node), entry)
+            })
+            .collect();
+        Ok(result)
     }
     /// [`Project::select_view`] and the chosen nodes' points, grouped by scan.
     pub fn load_view_cached(

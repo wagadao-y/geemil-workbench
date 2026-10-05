@@ -539,3 +539,53 @@ fn view_spacings_follow_the_deepest_loaded_node_holding_each_point() {
         assert!(fine.iter().zip(spacings).any(|(f, c)| f < c));
     }
 }
+
+#[test]
+fn cached_view_spacings_are_reused_until_the_loaded_nodes_below_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("demo.e57");
+    interchange::create_demo(&input).unwrap();
+    let mut p = Project::create(&dir.path().join("project"), "Test").unwrap();
+    let options = ImportOptions {
+        view_grid: 4,
+        view_leaf_points: 64,
+        ..Default::default()
+    };
+    p.import_file(&input, options, &JobControl::default())
+        .unwrap();
+    let ids: Vec<_> = p.scans().map(|s| s.id).collect();
+    let job = JobControl::default();
+    let camera = Camera {
+        target: p.bounds().center().to_array(),
+        distance: 30.,
+        ..Camera::default()
+    };
+    let view = p
+        .load_view_cached(&camera, 1 << 30, &ids, &job, &mut ViewCache::new(0))
+        .unwrap();
+    let roots: Vec<_> = view.nodes.iter().filter(|n| n.node == 0).cloned().collect();
+    let mut cache = geemil_core::SpacingCache::default();
+    let first = p
+        .view_spacings_cached(&view.nodes, &mut cache, &job)
+        .unwrap();
+    let values = |s: &[Arc<[f32]>]| s.iter().map(|s| s.to_vec()).collect::<Vec<_>>();
+    assert_eq!(values(&first), p.view_spacings(&view.nodes, &job).unwrap());
+    // Unchanged nodes hand back the same arrays, so the renderer keeps them.
+    let again = p
+        .view_spacings_cached(&view.nodes, &mut cache, &job)
+        .unwrap();
+    assert!(first.iter().zip(&again).all(|(a, b)| Arc::ptr_eq(a, b)));
+    // Dropping the nodes below a root changes its points' spacings.
+    let coarse = p.view_spacings_cached(&roots, &mut cache, &job).unwrap();
+    assert_eq!(values(&coarse), p.view_spacings(&roots, &job).unwrap());
+    let root_at = |scan| {
+        view.nodes
+            .iter()
+            .position(|n| n.scan == scan && n.node == 0)
+            .unwrap()
+    };
+    assert!(roots.iter().zip(&coarse).any(|(n, c)| {
+        let fine = &first[root_at(n.scan)];
+        !Arc::ptr_eq(fine, c) && fine.as_ref() != c.as_ref()
+    }));
+}
