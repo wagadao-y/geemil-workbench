@@ -1,5 +1,5 @@
 //! Automated GUI smoke tests: capture the window, optionally while orbiting,
-//! and check sRGB colour probes end to end. See README "CLIと検証".
+//! and check sRGB colour probes end to end. See docs/development.md "CLIと検証".
 use super::Workbench;
 use eframe::egui;
 use geemil_core::{Camera, NodePoints, Sample, SelectionMode};
