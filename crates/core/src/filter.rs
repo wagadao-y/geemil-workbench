@@ -66,9 +66,25 @@ struct SharedChunks {
     state: Mutex<CacheState>,
     limit: usize,
 }
+/// What the cache keeps of a chunk: its points, or a tree over them.
+#[derive(Clone)]
+enum Cached {
+    Points(Arc<ChunkPoints>),
+    Tree(Arc<KdTree>),
+}
+impl Cached {
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Points(points) => points.bytes(),
+            Self::Tree(tree) => tree.bytes(),
+        }
+    }
+}
+/// A cached item: a scan, its chunk, and whether it is the chunk's tree.
+type CacheKey = (Uuid, u32, bool);
 #[derive(Default)]
 struct CacheState {
-    entries: HashMap<(Uuid, u32), (Arc<ChunkPoints>, u64)>,
+    entries: HashMap<CacheKey, (Cached, u64)>,
     clock: u64,
     bytes: usize,
 }
@@ -98,24 +114,53 @@ impl<'a> ChunkCache<'a> {
     fn release(&self) {
         let mut state = self.shared.state.lock().unwrap();
         let mut freed = 0;
-        state.entries.retain(|(scan, _), (points, _)| {
+        state.entries.retain(|(scan, ..), (cached, _)| {
             let keep = *scan != self.scan.id;
             if !keep {
-                freed += points.bytes();
+                freed += cached.bytes();
             }
             keep
         });
         state.bytes -= freed;
     }
-    pub(crate) fn get(&self, chunk: u32, job: &JobControl) -> Result<Arc<ChunkPoints>> {
-        {
-            let mut state = self.shared.state.lock().unwrap();
-            state.clock += 1;
-            let clock = state.clock;
-            if let Some((points, used)) = state.entries.get_mut(&(self.scan.id, chunk)) {
-                *used = clock;
-                return Ok(points.clone());
+    /// What the cache holds under `key`, marked as just used.
+    fn lookup(&self, key: CacheKey) -> Option<Cached> {
+        let mut state = self.shared.state.lock().unwrap();
+        state.clock += 1;
+        let clock = state.clock;
+        let (cached, used) = state.entries.get_mut(&key)?;
+        *used = clock;
+        Some(cached.clone())
+    }
+    /// Keeps `cached` under `key`, dropping the least recently used items
+    /// beyond the budget. An item larger than the whole budget is not kept.
+    fn install(&self, key: CacheKey, cached: Cached) {
+        let bytes = cached.bytes();
+        let limit = self.shared.limit;
+        let mut state = self.shared.state.lock().unwrap();
+        while state.bytes + bytes > limit {
+            let Some(oldest) = state
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            let (old, _) = state.entries.remove(&oldest).unwrap();
+            state.bytes -= old.bytes();
+        }
+        let clock = state.clock;
+        if bytes <= limit {
+            if let Some((old, _)) = state.entries.insert(key, (cached, clock)) {
+                state.bytes -= old.bytes();
             }
+            state.bytes += bytes;
+        }
+    }
+    pub(crate) fn get(&self, chunk: u32, job: &JobControl) -> Result<Arc<ChunkPoints>> {
+        if let Some(Cached::Points(points)) = self.lookup((self.scan.id, chunk, false)) {
+            return Ok(points);
         }
         // Decode outside the lock; two workers may decode the same chunk once.
         let data = self.project.read_chunk(self.scan, chunk)?;
@@ -137,32 +182,45 @@ impl<'a> ChunkCache<'a> {
         drop(data);
         drop(hidden);
         let points = Arc::new(points);
-        let bytes = points.bytes();
-        let limit = self.shared.limit;
-        let mut state = self.shared.state.lock().unwrap();
-        while state.bytes + bytes > limit {
-            let Some(oldest) = state
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(id, _)| *id)
-            else {
-                break;
-            };
-            let (old, _) = state.entries.remove(&oldest).unwrap();
-            state.bytes -= old.bytes();
-        }
-        let clock = state.clock;
-        if bytes <= limit {
-            if let Some((old, _)) = state
-                .entries
-                .insert((self.scan.id, chunk), (points.clone(), clock))
-            {
-                state.bytes -= old.bytes();
-            }
-            state.bytes += bytes;
-        }
+        self.install((self.scan.id, chunk, false), Cached::Points(points.clone()));
         Ok(points)
+    }
+    /// A tree over the chunk's visible points; its `order` gives each tree
+    /// point's place in [`ChunkCache::get`]'s points.
+    fn tree(&self, chunk: u32, job: &JobControl) -> Result<Arc<KdTree>> {
+        if let Some(Cached::Tree(tree)) = self.lookup((self.scan.id, chunk, true)) {
+            return Ok(tree);
+        }
+        let points = self.get(chunk, job)?;
+        job.check()?;
+        let tree = Arc::new(KdTree::new(points.positions.clone()));
+        self.install((self.scan.id, chunk, true), Cached::Tree(tree.clone()));
+        Ok(tree)
+    }
+    /// The other chunks whose bounds come within `reach` of `chunk`'s, and
+    /// whether none of them reaches into `chunk`'s own bounds. Chunks are
+    /// leaves of an octree and do not overlap, except where a cell too deep
+    /// or too full of duplicates was cut into runs of points.
+    fn chunks_near(&self, chunk: u32, reach: f64) -> (Vec<(u32, DVec3, DVec3)>, bool) {
+        let own = &self.scan.chunks[chunk as usize].bounds;
+        let (lo, hi) = (DVec3::from(own.min), DVec3::from(own.max));
+        let mut alone = true;
+        let near = self
+            .scan
+            .chunks
+            .iter()
+            .enumerate()
+            .filter(|(id, c)| *id as u32 != chunk && overlaps(&c.bounds, lo - reach, hi + reach))
+            .map(|(id, c)| {
+                let (clo, chi) = (DVec3::from(c.bounds.min), DVec3::from(c.bounds.max));
+                // Touching faces leave no other point nearer than the face.
+                if clo.cmplt(hi).all() && chi.cmpgt(lo).all() {
+                    alone = false;
+                }
+                (id as u32, clo, chi)
+            })
+            .collect();
+        (near, alone)
     }
     /// Visible points of the other chunks that lie in the box `[lo, hi]`.
     fn visit_neighbours(
@@ -190,49 +248,6 @@ impl<'a> ChunkCache<'a> {
         }
         Ok(())
     }
-    fn neighbour_bound(&self, lo: DVec3, hi: DVec3) -> u64 {
-        self.scan
-            .chunks
-            .iter()
-            .filter(|c| overlaps(&c.bounds, lo, hi))
-            .map(|c| c.count as u64)
-            .sum()
-    }
-    /// The chunk's own points followed by the other chunks' points in
-    /// `[lo, hi]`, or `None` once they would exceed `limit` points.
-    fn points_near(
-        &self,
-        own: &ChunkPoints,
-        chunk: u32,
-        lo: DVec3,
-        hi: DVec3,
-        limit: usize,
-        job: &JobControl,
-    ) -> Result<Option<Vec<DVec3>>> {
-        if own.positions.len() > limit {
-            return Ok(None);
-        }
-        let bound = (self.neighbour_bound(lo, hi) as usize).min(limit);
-        let mut result = Vec::with_capacity(bound.max(own.positions.len()));
-        result.extend_from_slice(&own.positions);
-        for (id, info) in self.scan.chunks.iter().enumerate() {
-            let id = id as u32;
-            if id == chunk || !overlaps(&info.bounds, lo, hi) {
-                continue;
-            }
-            job.check()?;
-            let points = self.get(id, job)?;
-            for p in &points.positions {
-                if p.cmpge(lo).all() && p.cmple(hi).all() {
-                    if result.len() == limit {
-                        return Ok(None);
-                    }
-                    result.push(*p);
-                }
-            }
-        }
-        Ok(Some(result))
-    }
 }
 
 fn overlaps(bounds: &Bounds, lo: DVec3, hi: DVec3) -> bool {
@@ -243,21 +258,29 @@ fn cell(p: DVec3, size: f64) -> [i64; 3] {
     (p / size).floor().as_i64vec3().to_array()
 }
 
-/// A static kd-tree for nearest-neighbour queries: each subslice is a subtree
-/// whose middle element splits it on the axis stored with it.
+/// Subtrees this small are leaves, searched point by point: walking down to
+/// single points costs more than comparing a few.
+const LEAF: usize = 8;
+
+/// A static kd-tree for nearest-neighbour queries: each subslice of more than
+/// [`LEAF`] points is a subtree whose middle element splits it on the axis
+/// stored with it.
 struct KdTree {
     points: Vec<DVec3>,
     axes: Vec<u8>,
+    /// The index each point had in the list the tree was built from.
+    order: Vec<u32>,
 }
 impl KdTree {
-    fn new(mut points: Vec<DVec3>) -> Self {
-        let mut axes = vec![0u8; points.len()];
-        fn build(points: &mut [DVec3], axes: &mut [u8]) {
-            if points.len() <= 1 {
+    fn new(points: Vec<DVec3>) -> Self {
+        let mut items: Vec<(DVec3, u32)> = points.into_iter().zip(0..).collect();
+        let mut axes = vec![0u8; items.len()];
+        fn build(items: &mut [(DVec3, u32)], axes: &mut [u8]) {
+            if items.len() <= LEAF {
                 return;
             }
             let (mut lo, mut hi) = (DVec3::INFINITY, DVec3::NEG_INFINITY);
-            for p in points.iter() {
+            for (p, _) in items.iter() {
                 lo = lo.min(*p);
                 hi = hi.max(*p);
             }
@@ -269,16 +292,35 @@ impl KdTree {
             } else {
                 2
             };
-            let mid = points.len() / 2;
-            points.select_nth_unstable_by(mid, |a, b| a[axis].total_cmp(&b[axis]));
+            let mid = items.len() / 2;
+            items.select_nth_unstable_by(mid, |a, b| a.0[axis].total_cmp(&b.0[axis]));
             axes[mid] = axis as u8;
-            let (left, right) = points.split_at_mut(mid);
+            let (left, right) = items.split_at_mut(mid);
             let (left_axes, right_axes) = axes.split_at_mut(mid);
             build(left, left_axes);
             build(&mut right[1..], &mut right_axes[1..]);
         }
-        build(&mut points, &mut axes);
-        Self { points, axes }
+        build(&mut items, &mut axes);
+        let (points, order) = items.into_iter().unzip();
+        Self {
+            points,
+            axes,
+            order,
+        }
+    }
+    fn bytes(&self) -> usize {
+        self.points.capacity() * 24 + self.axes.capacity() + self.order.capacity() * 4 + 128
+    }
+    /// The points with an index below `count` in the list the tree was built
+    /// from, in the tree's order, with that index. Neighbouring points come
+    /// one after another, so queries for them in this order find the tree's
+    /// nodes they visit still in cache.
+    fn in_order(&self, count: usize) -> impl Iterator<Item = (usize, DVec3)> + '_ {
+        self.order
+            .iter()
+            .zip(&self.points)
+            .filter(move |(i, _)| (**i as usize) < count)
+            .map(|(i, p)| (*i as usize, *p))
     }
     /// The squared distances of the `best.len()` nearest points within
     /// `radius` of `p`, ascending; unfilled slots stay infinite.
@@ -289,6 +331,15 @@ impl KdTree {
     /// Merge this tree's neighbours into an existing sorted distance list.
     fn nearest_into(&self, p: DVec3, radius: f64, best: &mut [f64]) {
         let limit = radius * radius;
+        fn insert(best: &mut [f64], d2: f64) {
+            // Into the ascending list.
+            let mut i = best.len() - 1;
+            while i > 0 && best[i - 1] > d2 {
+                best[i] = best[i - 1];
+                i -= 1;
+            }
+            best[i] = d2;
+        }
         fn visit(
             tree: &KdTree,
             range: std::ops::Range<usize>,
@@ -296,20 +347,20 @@ impl KdTree {
             limit: f64,
             best: &mut [f64],
         ) {
-            if range.is_empty() {
+            if range.len() <= LEAF {
+                for q in &tree.points[range] {
+                    let d2 = q.distance_squared(p);
+                    if d2 <= limit && d2 < best[best.len() - 1] {
+                        insert(best, d2);
+                    }
+                }
                 return;
             }
             let mid = range.start + range.len() / 2;
             let q = tree.points[mid];
             let d2 = q.distance_squared(p);
             if d2 <= limit && d2 < best[best.len() - 1] {
-                // Insert into the ascending list.
-                let mut i = best.len() - 1;
-                while i > 0 && best[i - 1] > d2 {
-                    best[i] = best[i - 1];
-                    i -= 1;
-                }
-                best[i] = d2;
+                insert(best, d2);
             }
             let axis = tree.axes[mid] as usize;
             let diff = p[axis] - q[axis];
@@ -319,7 +370,11 @@ impl KdTree {
                 (mid + 1..range.end, range.start..mid)
             };
             visit(tree, near, p, limit, best);
-            if diff * diff <= limit.min(best[best.len() - 1]) {
+            // Only a strictly nearer point changes the list. Among many
+            // points at one spot, all at distance 0, also visiting ties
+            // searched the whole tree for each.
+            let gap = diff * diff;
+            if gap <= limit && gap < best[best.len() - 1] {
                 visit(tree, far, p, limit, best);
             }
         }
@@ -333,8 +388,15 @@ impl KdTree {
             r2: f64,
             cap: usize,
         ) -> usize {
-            if range.is_empty() || cap == 0 {
+            if cap == 0 {
                 return 0;
+            }
+            if range.len() <= LEAF {
+                return tree.points[range]
+                    .iter()
+                    .filter(|q| q.distance_squared(p) <= r2)
+                    .take(cap)
+                    .count();
             }
             let mid = range.start + range.len() / 2;
             let q = tree.points[mid];
@@ -355,8 +417,44 @@ impl KdTree {
     }
 }
 
+/// The squared distance from `p` to the box `[lo, hi]`; zero inside.
+fn gap_squared(p: DVec3, lo: DVec3, hi: DVec3) -> f64 {
+    (lo - p).max(p - hi).max(DVec3::ZERO).length_squared()
+}
+
+/// How far `p` is inside the box `[lo, hi]`: the distance to its nearest face.
+fn depth_inside(p: DVec3, lo: DVec3, hi: DVec3) -> f64 {
+    (p - lo).min(hi - p).min_element()
+}
+
+/// The trees of a chunk's neighbouring chunks, fetched once each as points
+/// near them need them.
+struct NearTrees<'c, 'a> {
+    cache: &'c ChunkCache<'a>,
+    near: Vec<(u32, DVec3, DVec3)>,
+    trees: HashMap<u32, Arc<KdTree>>,
+}
+impl<'c, 'a> NearTrees<'c, 'a> {
+    fn get(&mut self, chunk: u32, job: &JobControl) -> Result<Arc<KdTree>> {
+        if let Some(tree) = self.trees.get(&chunk) {
+            return Ok(tree.clone());
+        }
+        let tree = self.cache.tree(chunk, job)?;
+        self.trees.insert(chunk, tree.clone());
+        Ok(tree)
+    }
+}
+
 /// Mean distance from each visible point of `chunk` to its `k` nearest
 /// other points of the scan within `radius`; `None` where fewer are in reach.
+///
+/// Each point searches its own chunk's tree first. Its k-th distance there,
+/// or `radius`, bounds where nearer points can be; while that ball stays in
+/// the chunk's bounds and no other chunk reaches into them, the answer is
+/// complete. Otherwise the trees of the chunks within the ball are searched
+/// too, nearest first as the ball shrinks. Dense scans split into chunks
+/// smaller than `radius` thus never gather everything within `radius` of a
+/// chunk, which held many times the chunk's own points.
 fn mean_neighbour_distances(
     cache: &ChunkCache,
     chunk: u32,
@@ -365,32 +463,47 @@ fn mean_neighbour_distances(
     job: &JobControl,
 ) -> Result<(std::sync::Arc<ChunkPoints>, Vec<Option<f64>>)> {
     let own = cache.get(chunk, job)?;
+    let tree = cache.tree(chunk, job)?;
     let bounds = &cache.scan.chunks[chunk as usize].bounds;
-    let lo = DVec3::from(bounds.min) - radius;
-    let hi = DVec3::from(bounds.max) + radius;
-    // One tree of the points in reach, while they fit the scratch space
-    // (25 bytes a point in the tree).
-    let Some(points) = cache.points_near(&own, chunk, lo, hi, SCRATCH_BYTES / 32, job)? else {
-        return mean_neighbour_distances_streamed(cache, chunk, k, radius, job);
+    let (lo, hi) = (DVec3::from(bounds.min), DVec3::from(bounds.max));
+    let (near, alone) = cache.chunks_near(chunk, radius);
+    let mut others = NearTrees {
+        cache,
+        near,
+        trees: HashMap::new(),
     };
-    let tree = KdTree::new(points);
+    let limit = radius * radius;
     // The point itself comes first at distance 0.
     let mut best = vec![0.; k + 1];
-    let mut result = Vec::with_capacity(own.positions.len());
-    for (i, p) in own.positions.iter().enumerate() {
-        if i % 4096 == 0 {
+    let mut result = vec![None; own.positions.len()];
+    for (n, (i, p)) in tree.in_order(own.positions.len()).enumerate() {
+        if n % 4096 == 0 {
             job.check()?;
         }
-        tree.nearest(*p, radius, &mut best);
-        result.push(
-            best[k]
-                .is_finite()
-                .then(|| best[1..].iter().map(|d| d.sqrt()).sum::<f64>() / k as f64),
-        );
+        tree.nearest(p, radius, &mut best);
+        let reach = best[k].min(limit);
+        if !(alone && reach <= depth_inside(p, lo, hi).powi(2)) {
+            for j in 0..others.near.len() {
+                let (id, clo, chi) = others.near[j];
+                // The k-th distance so far only shrinks, and only a strictly
+                // nearer point changes it.
+                let gap = gap_squared(p, clo, chi);
+                if gap > limit || gap >= best[k] {
+                    continue;
+                }
+                others.get(id, job)?.nearest_into(p, radius, &mut best);
+            }
+        }
+        result[i] = best[k]
+            .is_finite()
+            .then(|| best[1..].iter().map(|d| d.sqrt()).sum::<f64>() / k as f64);
     }
     Ok((own, result))
 }
 
+/// The search [`mean_neighbour_distances`] replaced, kept as the reference
+/// its results must match: every point of the other chunks in reach.
+#[cfg(test)]
 fn mean_neighbour_distances_streamed(
     cache: &ChunkCache,
     chunk: u32,
@@ -927,33 +1040,50 @@ fn noise_chunk(
     job: &JobControl,
 ) -> Result<ChunkResult> {
     let own = cache.get(chunk, job)?;
+    let tree = cache.tree(chunk, job)?;
     let bounds = &cache.scan.chunks[chunk as usize].bounds;
-    let lo = DVec3::from(bounds.min) - radius;
-    let hi = DVec3::from(bounds.max) + radius;
-    // One tree of the points in reach, while they fit the scratch space
-    // (25 bytes a point in the tree).
-    let Some(points) = cache.points_near(&own, chunk, lo, hi, SCRATCH_BYTES / 32, job)? else {
-        return noise_chunk_streamed(cache, chunk, radius, min_neighbours, job);
+    let (lo, hi) = (DVec3::from(bounds.min), DVec3::from(bounds.max));
+    let (near, alone) = cache.chunks_near(chunk, radius);
+    let mut others = NearTrees {
+        cache,
+        near,
+        trees: HashMap::new(),
     };
-    let tree = KdTree::new(points);
+    // The tree holds the point itself too.
+    let wanted = min_neighbours as usize + 1;
     let mut mask = vec![0u8; (cache.scan.chunks[chunk as usize].count as usize).div_ceil(8)];
     let mut count = 0;
-    for (i, (p, index)) in own.positions.iter().zip(&own.indices).enumerate() {
-        if i % 4096 == 0 {
+    // As in [`mean_neighbour_distances`]: other chunks only where the ball
+    // leaves this one's bounds, and only until enough are found.
+    for (n, (i, p)) in tree.in_order(own.positions.len()).enumerate() {
+        if n % 4096 == 0 {
             job.check()?;
         }
-        // The tree holds the point itself too.
-        let found = tree
-            .count_within(*p, radius, min_neighbours as usize + 1)
-            .saturating_sub(1);
-        if found < min_neighbours as usize {
-            mask[*index as usize / 8] |= 1 << (index % 8);
+        let mut found = tree.count_within(p, radius, wanted);
+        if found < wanted && !(alone && radius <= depth_inside(p, lo, hi)) {
+            for j in 0..others.near.len() {
+                let (id, clo, chi) = others.near[j];
+                if found == wanted {
+                    break;
+                }
+                if gap_squared(p, clo, chi) > radius * radius {
+                    continue;
+                }
+                found += others.get(id, job)?.count_within(p, radius, wanted - found);
+            }
+        }
+        if found < wanted {
+            let index = own.indices[i];
+            mask[index as usize / 8] |= 1 << (index % 8);
             count += 1;
         }
     }
     Ok((mask, count))
 }
 
+/// The search [`noise_chunk`] replaced, kept as the reference its results
+/// must match: every point of the other chunks in reach.
+#[cfg(test)]
 fn noise_chunk_streamed(
     cache: &ChunkCache,
     chunk: u32,
@@ -1726,6 +1856,98 @@ mod tests {
         }]);
         assert!(!alone.is_empty());
         assert_eq!(alone, together);
+    }
+
+    #[test]
+    fn many_points_at_one_spot_are_searched_without_visiting_them_all() {
+        // As some scans hold: tens of thousands of points stacked at one place.
+        let mut points = vec![DVec3::new(1., 2., 3.); 20_000];
+        points.push(DVec3::new(1.5, 2., 3.));
+        let tree = KdTree::new(points.clone());
+        let started = std::time::Instant::now();
+        let mut best = vec![0.; 11];
+        for p in &points[..20_000] {
+            tree.nearest(*p, 0.5, &mut best);
+            assert_eq!(best[10], 0.);
+        }
+        // Visiting every tied point made this quadratic: minutes, not
+        // milliseconds.
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+        assert_eq!(
+            tree.count_within(DVec3::new(1.5, 2., 3.), 0.6, 30_000),
+            20_001
+        );
+        tree.nearest(DVec3::new(2., 2., 3.), 1.1, &mut best[..2]);
+        assert_eq!(best[..2], [0.25, 1.]);
+    }
+
+    #[test]
+    fn per_chunk_search_matches_the_reference_on_scattered_points() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("points.las");
+        let mut writer = las::Writer::from_path(&input, las::Header::default()).unwrap();
+        // A dense sheet, a sparse cloud around it and a few far strays, so
+        // balls cross chunk faces at every size.
+        let mut state = 7u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for i in 0..3000 {
+            let (x, y) = (next() * 2., next() * 2.);
+            let z = match i % 10 {
+                0..=6 => next() * 0.01,
+                7 | 8 => next() * 0.6,
+                _ => next() * 4.,
+            };
+            writer
+                .write_point(las::Point {
+                    x,
+                    y,
+                    z,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        writer.close().unwrap();
+        let mut p = Project::create(&dir.path().join("p"), "Scattered").unwrap();
+        let job = JobControl::default();
+        p.import_file(
+            &input,
+            crate::ImportOptions {
+                chunk_points: 64,
+                ..Default::default()
+            },
+            &job,
+        )
+        .unwrap();
+        let scan = p.scans().next().unwrap();
+        assert!(scan.chunks.len() > 30);
+        let cache = ChunkCache::new(&p, scan);
+        for chunk in 0..scan.chunks.len() as u32 {
+            for radius in [0.02, 0.1, 0.5, 3.] {
+                for count in [1, 6, 40] {
+                    assert_eq!(
+                        noise_chunk(&cache, chunk, radius, count, &job).unwrap(),
+                        noise_chunk_streamed(&cache, chunk, radius, count, &job).unwrap()
+                    );
+                    let (_, chunked) =
+                        mean_neighbour_distances(&cache, chunk, count as usize, radius, &job)
+                            .unwrap();
+                    let (_, reference) = mean_neighbour_distances_streamed(
+                        &cache,
+                        chunk,
+                        count as usize,
+                        radius,
+                        &job,
+                    )
+                    .unwrap();
+                    assert_eq!(chunked, reference);
+                }
+            }
+        }
     }
 
     #[test]

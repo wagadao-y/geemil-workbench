@@ -12,7 +12,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     ensure!(
         args.len() >= 2,
-        "Usage: import_bench SOURCE NEW_PROJECT [WORKERS] [MEMORY_MIB] [COMPARE_PROJECT]"
+        "Usage: import_bench SOURCE NEW_PROJECT [WORKERS] [MEMORY_MIB] [COMPARE_PROJECT or -] [CHUNK_POINTS]"
     );
     let defaults = ImportOptions::default();
     let options = ImportOptions {
@@ -22,6 +22,12 @@ fn main() -> Result<()> {
             .map(|v| v.parse::<usize>())
             .transpose()?
             .map_or(defaults.worker_memory_bytes, |mib| mib * 1024 * 1024),
+        // Smaller chunks, as dense scans split into, to test filters on.
+        chunk_points: args
+            .get(5)
+            .map(|v| v.parse())
+            .transpose()?
+            .unwrap_or(defaults.chunk_points),
         ..defaults
     };
     let start = Instant::now();
@@ -65,7 +71,7 @@ fn main() -> Result<()> {
     for (stage, seconds) in &state.2 {
         println!("{stage}: {seconds:.3}s (wall time; stages overlap)");
     }
-    if let Some(reference) = args.get(4) {
+    if let Some(reference) = args.get(4).filter(|a| *a != "-") {
         let reference = Project::load(Path::new(reference))?;
         ensure!(
             project.manifest.scans.len() == reference.manifest.scans.len(),
