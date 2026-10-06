@@ -305,7 +305,7 @@ impl Project {
         let paths: Vec<_> = scans
             .iter()
             .map(|s| {
-                let stem = file_stem(&s.name, &mut used);
+                let stem = file_stem(self.scan_name(s), &mut used);
                 directory.join(format!("{stem}.{}", if laz { "laz" } else { "las" }))
             })
             .collect();

@@ -905,6 +905,10 @@ impl Project {
                 };
                 let mut out = writer.add_pointcloud(&scan.guid, pc.prototype.clone())?;
                 copy_scan_metadata(&pc, &mut out, pose);
+                // A renamed scan goes out under its new name.
+                if self.current().scan_names.contains_key(&scan.id) {
+                    out.set_name(Some(self.scan_name(scan).to_owned()));
+                }
                 for id in 0..scan.chunks.len() {
                     job.check()?;
                     job.report(Stage::WritingE57, id as u64, scan.chunks.len() as u64);

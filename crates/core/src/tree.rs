@@ -57,6 +57,19 @@ fn is_within(state: &Revision, id: Uuid, ancestor: Uuid) -> bool {
     false
 }
 
+/// Takes scans out of `state` with what refers to them.
+fn remove_scans(state: &mut Revision, ids: &[Uuid]) -> Result<()> {
+    for id in ids {
+        ensure!(state.scans.contains(id), "Missing scan");
+        state.scan_groups.remove(id);
+        state.transforms.remove(id);
+        state.registrations.remove(id);
+        state.scan_names.remove(id);
+    }
+    state.scans.retain(|id| !ids.contains(id));
+    Ok(())
+}
+
 /// Moves `id` into `target` and adjusts its own transform to keep its place.
 fn place(state: &mut Revision, id: Uuid, target: Option<Uuid>) {
     let world = correction(state, id);
@@ -183,31 +196,34 @@ impl Project {
             },
         )
     }
-    /// Removes a folder; its contents move up one level and keep their place.
-    pub fn ungroup(&mut self, id: Uuid) -> Result<()> {
-        self.edit(json!({"kind": "ungroup", "id": id}), |s| {
-            let group = s.groups.iter().find(|g| g.id == id);
-            let parent = group
-                .ok_or_else(|| anyhow::anyhow!("Missing folder"))?
-                .parent;
-            let children: Vec<_> = s
-                .groups
-                .iter()
-                .filter(|g| g.parent == Some(id))
-                .map(|g| g.id)
-                .chain(
-                    s.scan_groups
-                        .iter()
-                        .filter(|(_, g)| **g == id)
-                        .map(|(scan, _)| *scan),
-                )
-                .collect();
-            for child in children {
-                place(s, child, parent);
+    /// Removes folders in one edit; the contents of each move up one level
+    /// and keep their place. Folders inside one another may be given together.
+    pub fn ungroup(&mut self, ids: &[Uuid]) -> Result<()> {
+        self.edit(json!({"kind": "ungroup", "ids": ids}), |s| {
+            for &id in ids {
+                let group = s.groups.iter().find(|g| g.id == id);
+                let parent = group
+                    .ok_or_else(|| anyhow::anyhow!("Missing folder"))?
+                    .parent;
+                let children: Vec<_> = s
+                    .groups
+                    .iter()
+                    .filter(|g| g.parent == Some(id))
+                    .map(|g| g.id)
+                    .chain(
+                        s.scan_groups
+                            .iter()
+                            .filter(|(_, g)| **g == id)
+                            .map(|(scan, _)| *scan),
+                    )
+                    .collect();
+                for child in children {
+                    place(s, child, parent);
+                }
+                s.groups.retain(|g| g.id != id);
+                s.transforms.remove(&id);
+                s.registrations.remove(&id);
             }
-            s.groups.retain(|g| g.id != id);
-            s.transforms.remove(&id);
-            s.registrations.remove(&id);
             Ok(())
         })
     }
@@ -215,13 +231,80 @@ impl Project {
     /// so undo can bring them back.
     pub fn remove_scans(&mut self, ids: &[Uuid]) -> Result<()> {
         self.edit(json!({"kind": "remove_scans", "scans": ids}), |s| {
-            for id in ids {
-                ensure!(s.scans.contains(id), "Missing scan");
-                s.scan_groups.remove(id);
-                s.transforms.remove(id);
-                s.registrations.remove(id);
+            remove_scans(s, ids)
+        })
+    }
+    /// Takes scans and folders out of the working state in one edit, the
+    /// folders with everything in them. Scan data stays until cleanup, so
+    /// undo can bring it all back.
+    pub fn remove_items(&mut self, ids: &[Uuid]) -> Result<()> {
+        let state = self.current();
+        for id in ids {
+            ensure!(
+                state.scans.contains(id) || state.groups.iter().any(|g| g.id == *id),
+                "Missing scan or folder"
+            );
+        }
+        let folders: Vec<Uuid> = state
+            .groups
+            .iter()
+            .filter(|g| ids.iter().any(|id| is_within(state, g.id, *id)))
+            .map(|g| g.id)
+            .collect();
+        let scans: Vec<Uuid> = state
+            .scans
+            .iter()
+            .copied()
+            .filter(|scan| ids.iter().any(|id| is_within(state, *scan, *id)))
+            .collect();
+        self.edit(
+            json!({"kind": "remove_items", "items": ids, "scans": scans}),
+            |s| {
+                remove_scans(s, &scans)?;
+                s.groups.retain(|g| !folders.contains(&g.id));
+                for id in &folders {
+                    s.transforms.remove(id);
+                    s.registrations.remove(id);
+                }
+                Ok(())
+            },
+        )
+    }
+    /// A scan's name: the one it was renamed to, else its imported one.
+    pub fn scan_name<'a>(&'a self, scan: &'a Scan) -> &'a str {
+        self.current()
+            .scan_names
+            .get(&scan.id)
+            .map_or(&scan.name, |name| name)
+    }
+    /// Renames scans in one edit. Names are trimmed; a scan given its
+    /// imported name again keeps no rename.
+    pub fn rename_scans(&mut self, names: &[(Uuid, String)]) -> Result<()> {
+        let mut renamed = serde_json::Map::new();
+        let mut changes = vec![];
+        for (id, name) in names {
+            let name = name.trim();
+            ensure!(!name.is_empty(), "Empty scan name");
+            let scan = self
+                .scan(*id)
+                .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
+            if self.scan_name(scan) == name {
+                continue;
             }
-            s.scans.retain(|id| !ids.contains(id));
+            renamed.insert(id.to_string(), json!(name));
+            // None returns the scan to its imported name.
+            changes.push((*id, (scan.name != name).then(|| name.to_owned())));
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.edit(json!({"kind": "rename_scans", "names": renamed}), |s| {
+            for (id, name) in changes {
+                match name {
+                    Some(name) => s.scan_names.insert(id, name),
+                    None => s.scan_names.remove(&id),
+                };
+            }
             Ok(())
         })
     }

@@ -1,6 +1,10 @@
 //! Modal dialogs. At most one is open; `Workbench::dialog` holds its state.
 use super::{
-    Settings, Workbench, layers::destination_combo, revisions::RevisionsState, selection::Tool,
+    Settings, Workbench,
+    layers::destination_combo,
+    revisions::RevisionsState,
+    selection::Tool,
+    tree::{RenameRow, pasted_names, rename_table},
 };
 use crate::i18n::Strings;
 use eframe::egui;
@@ -37,9 +41,14 @@ pub(super) enum Dialog {
     AlignPending {
         next: AlignNext,
     },
-    RenameGroup {
+    /// Renames a scan or folder.
+    Rename {
         id: Uuid,
         name: String,
+    },
+    /// Renames the scans whose new name is filled in.
+    BulkRename {
+        rows: Vec<RenameRow>,
     },
     /// Names a new layer (`code` none) or renames one.
     RenameLayer {
@@ -169,7 +178,8 @@ enum Outcome {
     },
     Cleanup,
     Scatter,
-    RenameGroup(Uuid, String),
+    Rename(Uuid, String),
+    BulkRename(Vec<(Uuid, String)>),
     RenameLayer(Option<u8>, String),
     Filter(Filter, Option<u8>),
     Export {
@@ -336,7 +346,7 @@ impl Workbench {
                         outcome = Outcome::Close;
                     }
                 }
-                Dialog::RenameGroup { id, name } => {
+                Dialog::Rename { id, name } => {
                     ui.heading(format!("{} {}", icon::PENCIL_SIMPLE, t.rename));
                     let edit = ui.add(egui::TextEdit::singleline(name).desired_width(320.));
                     // Requesting focus interrupts IME composition, so only take it
@@ -347,7 +357,100 @@ impl Workbench {
                     let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                     if buttons(ui, t.cancel, |ui| {
                         if ui.button(t.apply).clicked() || enter {
-                            outcome = Outcome::RenameGroup(*id, name.clone());
+                            outcome = Outcome::Rename(*id, name.clone());
+                        }
+                    }) {
+                        outcome = Outcome::Close;
+                    }
+                }
+                Dialog::BulkRename { rows } => {
+                    ui.heading(format!(
+                        "{} {}",
+                        icon::PENCIL_SIMPLE_LINE,
+                        (t.bulk_rename_title)(rows.len())
+                    ));
+                    ui.label(t.bulk_rename_hint);
+                    let header = [t.bulk_rename_folder, t.bulk_rename_old, t.bulk_rename_new];
+                    let cell = |i: usize| egui::Id::new(("bulk rename", i));
+                    // Several pasted cells fill the rows from the one with
+                    // focus down, as in a spreadsheet, instead of one cell.
+                    let focused = (0..rows.len()).find(|i| ui.memory(|m| m.has_focus(cell(*i))));
+                    let pasted = ui.ctx().input_mut(|i| {
+                        let mut found = None;
+                        i.events.retain(|e| match e {
+                            egui::Event::Paste(text) if text.contains(['\n', '\t']) => {
+                                found = Some(text.clone());
+                                false
+                            }
+                            _ => true,
+                        });
+                        found
+                    });
+                    if let Some(text) = pasted {
+                        let start = focused.unwrap_or(0);
+                        for (row, name) in rows[start..].iter_mut().zip(pasted_names(&text, header))
+                        {
+                            row.new = name;
+                        }
+                    }
+                    let widths = [140., 170., 190.];
+                    let height = ui.spacing().interact_size.y;
+                    // A left-aligned cell `width` wide, like a spreadsheet's.
+                    let left = |ui: &mut egui::Ui, width: f32, label: egui::Label| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, height),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.set_min_width(width);
+                                ui.add(label.truncate());
+                            },
+                        );
+                    };
+                    ui.add_space(4.);
+                    ui.horizontal(|ui| {
+                        for (label, width) in header.iter().zip(widths) {
+                            left(
+                                ui,
+                                width,
+                                egui::Label::new(egui::RichText::new(*label).strong()),
+                            );
+                        }
+                    });
+                    egui::ScrollArea::vertical()
+                        .max_height(400.)
+                        .auto_shrink([false, true])
+                        .show_rows(ui, height, rows.len(), |ui, range| {
+                            for i in range {
+                                let row = &mut rows[i];
+                                ui.horizontal(|ui| {
+                                    left(ui, widths[0], egui::Label::new(&row.folder));
+                                    left(ui, widths[1], egui::Label::new(&row.old));
+                                    ui.add_sized(
+                                        [widths[2], height],
+                                        egui::TextEdit::singleline(&mut row.new).id(cell(i)),
+                                    );
+                                });
+                            }
+                        });
+                    let names: Vec<(Uuid, String)> = rows
+                        .iter()
+                        .filter(|r| !r.new.trim().is_empty() && r.new.trim() != r.old)
+                        .map(|r| (r.id, r.new.trim().to_owned()))
+                        .collect();
+                    ui.add_space(4.);
+                    ui.weak((t.bulk_rename_count)(names.len()));
+                    if buttons(ui, t.cancel, |ui| {
+                        if ui
+                            .add_enabled(!names.is_empty(), egui::Button::new(t.apply))
+                            .clicked()
+                        {
+                            outcome = Outcome::BulkRename(names.clone());
+                        }
+                        if ui
+                            .button(format!("{} {}", icon::COPY, t.bulk_rename_copy))
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(rename_table(rows, header));
                         }
                     }) {
                         outcome = Outcome::Close;
@@ -702,9 +805,17 @@ impl Workbench {
                     self.status = t.scatter_done.into();
                 }
             }
-            Outcome::RenameGroup(id, name) => {
+            Outcome::Rename(id, name) => {
                 self.dialog = None;
-                self.apply_edit(|p| p.rename_group(id, name));
+                if self.project.as_ref().is_some_and(|p| p.scan(id).is_some()) {
+                    self.apply_edit(|p| p.rename_scans(&[(id, name)]));
+                } else {
+                    self.apply_edit(|p| p.rename_group(id, name));
+                }
+            }
+            Outcome::BulkRename(names) => {
+                self.dialog = None;
+                self.apply_edit(|p| p.rename_scans(&names));
             }
             Outcome::RenameLayer(code, name) => {
                 self.dialog = None;

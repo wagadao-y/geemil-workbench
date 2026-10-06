@@ -235,21 +235,13 @@ pub(crate) fn for_each_ordered<T: Sync, R: Send>(
         for index in 0..items.len() {
             let result = {
                 let mut s = state.lock().unwrap();
+                // Items start in order, so every item before a failed one has
+                // started and arrives; waiting for each in turn consumes all
+                // of them and then reports the earliest error, however the
+                // workers' timing falls.
                 loop {
                     if let Some(result) = s.ready.remove(&index) {
                         break result;
-                    }
-                    if s.failed {
-                        // Items after a failure may never start; report the
-                        // earliest error that did happen.
-                        let first = s
-                            .ready
-                            .iter()
-                            .filter(|(_, r)| r.is_err())
-                            .map(|(i, _)| *i)
-                            .min()
-                            .expect("a failed item");
-                        break s.ready.remove(&first).unwrap();
                     }
                     s = changed.wait(s).unwrap();
                 }
@@ -308,6 +300,11 @@ mod tests {
             4,
             &job,
             |i, _| {
+                // The item before the failure is still running when it
+                // fails; it is consumed all the same.
+                if i == 499 {
+                    thread::sleep(Duration::from_millis(20));
+                }
                 if i == 500 {
                     Err(anyhow!("work"))
                 } else {

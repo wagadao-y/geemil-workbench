@@ -317,7 +317,7 @@ impl Workbench {
                 let name = t.default_folder_name.to_owned();
                 if let Some(id) = self.apply_edit(|p| p.create_group(name, parent)) {
                     self.select_tree_item(Some(id));
-                    self.dialog = Some(Dialog::RenameGroup {
+                    self.dialog = Some(Dialog::Rename {
                         id,
                         name: t.default_folder_name.into(),
                     });

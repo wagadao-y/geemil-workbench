@@ -21,7 +21,11 @@ enum TreeAction {
     Move(Vec<Uuid>, Option<Uuid>),
     NewFolder(Option<Uuid>),
     Rename(Uuid, String),
-    Ungroup(Uuid),
+    /// Rename these scans together.
+    BulkRename(Vec<Uuid>),
+    /// Dissolve these folders together.
+    Ungroup(Vec<Uuid>),
+    /// Take these scans and folders out, the folders with their contents.
     Remove(Vec<Uuid>),
 }
 
@@ -256,6 +260,18 @@ impl Workbench {
             })
             .collect()
     }
+    /// The folders of the selection when it holds `item`, folders inside
+    /// selected ones too, else `item` alone.
+    fn context_folders(&self, p: &Project, item: Uuid) -> Vec<Uuid> {
+        if !self.tree_selection.items.contains(&item) {
+            return vec![item];
+        }
+        p.groups()
+            .iter()
+            .map(|g| g.id)
+            .filter(|id| self.tree_selection.items.contains(id))
+            .collect()
+    }
     fn context_scans(&self, p: &Project, item: Uuid) -> Vec<Uuid> {
         self.context_items(p, item)
             .into_iter()
@@ -395,10 +411,14 @@ impl Workbench {
                                 .button(format!("{} {}", icon::FOLDER_NOTCH_OPEN, t.ungroup))
                                 .clicked()
                             {
-                                actions.push(TreeAction::Ungroup(group.id));
+                                actions
+                                    .push(TreeAction::Ungroup(self.context_folders(p, group.id)));
                             }
+                            self.bulk_rename_menu(ui, p, group.id, actions);
                             ui.separator();
                             self.visibility_menu(ui, self.context_scans(p, group.id), actions);
+                            ui.separator();
+                            self.remove_menu(ui, p, group.id, actions);
                             ui.separator();
                             if ui
                                 .button(format!("{} {}", icon::INFO, t.properties))
@@ -444,20 +464,23 @@ impl Workbench {
                         shown,
                     ));
                 }
-                let label = format!("{} {}", icon::CUBE_TRANSPARENT, scan.name);
+                let label = format!("{} {}", icon::CUBE_TRANSPARENT, p.scan_name(scan));
                 let row = self.tree_row(ui, p, scan.id, label, actions);
                 row.on_hover_text((t.scan_points)(&t.count(scan.records)))
                     .context_menu(|ui| {
+                        if self.context_items(p, scan.id) == [scan.id]
+                            && ui
+                                .button(format!("{} {}", icon::PENCIL_SIMPLE, t.rename))
+                                .clicked()
+                        {
+                            actions.push(TreeAction::Rename(scan.id, p.scan_name(scan).into()));
+                        }
+                        self.bulk_rename_menu(ui, p, scan.id, actions);
                         self.move_menu(ui, p, scan.id, actions);
                         ui.separator();
                         self.visibility_menu(ui, self.context_scans(p, scan.id), actions);
                         ui.separator();
-                        if ui
-                            .button(format!("{} {}", icon::TRASH, t.remove_scans))
-                            .clicked()
-                        {
-                            actions.push(TreeAction::Remove(self.context_scans(p, scan.id)));
-                        }
+                        self.remove_menu(ui, p, scan.id, actions);
                         ui.separator();
                         if ui
                             .button(format!("{} {}", icon::INFO, t.properties))
@@ -549,6 +572,43 @@ impl Workbench {
         }
         false
     }
+    /// Renaming the scans of the selection (or of `item`) together, when
+    /// there are several.
+    fn bulk_rename_menu(
+        &self,
+        ui: &mut egui::Ui,
+        p: &Project,
+        item: Uuid,
+        actions: &mut Vec<TreeAction>,
+    ) {
+        let scans = self.context_scans(p, item);
+        if scans.len() > 1
+            && ui
+                .button(format!(
+                    "{} {}",
+                    icon::PENCIL_SIMPLE_LINE,
+                    self.t.bulk_rename
+                ))
+                .clicked()
+        {
+            actions.push(TreeAction::BulkRename(scans));
+        }
+    }
+    /// Taking the selection (or `item`) out of the project.
+    fn remove_menu(
+        &self,
+        ui: &mut egui::Ui,
+        p: &Project,
+        item: Uuid,
+        actions: &mut Vec<TreeAction>,
+    ) {
+        if ui
+            .button(format!("{} {}", icon::TRASH, self.t.remove_scans))
+            .clicked()
+        {
+            actions.push(TreeAction::Remove(self.context_items(p, item)));
+        }
+    }
     fn move_menu(&self, ui: &mut egui::Ui, p: &Project, item: Uuid, actions: &mut Vec<TreeAction>) {
         let t = self.t;
         let items = self.context_items(p, item);
@@ -634,15 +694,21 @@ impl Workbench {
                 let name = self.t.default_folder_name.to_owned();
                 if let Some(id) = self.apply_edit(|p| p.create_group(name.clone(), parent)) {
                     self.select_tree_item(Some(id));
-                    self.dialog = Some(Dialog::RenameGroup { id, name });
+                    self.dialog = Some(Dialog::Rename { id, name });
                 }
             }
-            TreeAction::Rename(id, name) => self.dialog = Some(Dialog::RenameGroup { id, name }),
-            TreeAction::Ungroup(id) => {
-                self.apply_edit(|p| p.ungroup(id));
+            TreeAction::Rename(id, name) => self.dialog = Some(Dialog::Rename { id, name }),
+            TreeAction::Ungroup(ids) => {
+                self.apply_edit(|p| p.ungroup(&ids));
+            }
+            TreeAction::BulkRename(scans) => {
+                if let Some(p) = &self.project {
+                    let rows = rename_rows(p, &scans);
+                    self.dialog = Some(Dialog::BulkRename { rows });
+                }
             }
             TreeAction::Remove(ids) => {
-                self.apply_edit(|p| p.remove_scans(&ids));
+                self.apply_edit(|p| p.remove_items(&ids));
             }
         }
     }
@@ -693,7 +759,16 @@ impl Workbench {
                 .num_columns(2)
                 .show(ui, |ui| {
                     ui.label(t.prop_name);
-                    ui.label(&scan.name);
+                    ui.horizontal(|ui| {
+                        ui.label(p.scan_name(scan));
+                        if ui
+                            .small_button(icon::PENCIL_SIMPLE)
+                            .on_hover_text(t.rename)
+                            .clicked()
+                        {
+                            actions.push(TreeAction::Rename(id, p.scan_name(scan).into()));
+                        }
+                    });
                     ui.end_row();
                     ui.label(t.prop_source);
                     ui.label(&scan.source_name);
@@ -851,5 +926,105 @@ impl Workbench {
         let edit = &self.transform_edit;
         (edit.loaded == Some((id, project.current().id)) && edit.changed())
             .then(|| (id, edit.pose()))
+    }
+}
+
+/// A scan in the bulk rename table: its folder, current name and the new
+/// name typed for it, empty to keep the current one.
+pub(super) struct RenameRow {
+    pub(super) id: Uuid,
+    pub(super) folder: String,
+    pub(super) old: String,
+    pub(super) new: String,
+}
+
+/// Rows for `scans` in the order the tree shows them.
+pub(super) fn rename_rows(p: &Project, scans: &[Uuid]) -> Vec<RenameRow> {
+    let mut order = vec![];
+    tree_scans(p, None, &mut order);
+    order
+        .into_iter()
+        .filter(|id| scans.contains(id))
+        .filter_map(|id| p.scan(id))
+        .map(|scan| RenameRow {
+            id: scan.id,
+            folder: p
+                .parent_of(scan.id)
+                .and_then(|id| p.groups().iter().find(|g| g.id == id))
+                .map_or(String::new(), |g| g.name.clone()),
+            old: p.scan_name(scan).to_owned(),
+            new: String::new(),
+        })
+        .collect()
+}
+
+/// The scans below `parent` as the tree shows them: each folder's contents
+/// first, then the scans at this level.
+fn tree_scans(p: &Project, parent: Option<Uuid>, order: &mut Vec<Uuid>) {
+    let (groups, scans) = p.children(parent);
+    for group in groups {
+        tree_scans(p, Some(group.id), order);
+    }
+    order.extend(scans.iter().map(|s| s.id));
+}
+
+/// The rows as tab-separated lines under `header`, which spreadsheets paste
+/// as columns.
+pub(super) fn rename_table(rows: &[RenameRow], header: [&str; 3]) -> String {
+    let cell = |text: &str| text.replace(['\t', '\n', '\r'], " ");
+    let mut table = header.join("\t");
+    for row in rows {
+        table.push('\n');
+        table.push_str(&[cell(&row.folder), cell(&row.old), cell(&row.new)].join("\t"));
+    }
+    table
+}
+
+/// New names from pasted spreadsheet cells, one per line: the last column of
+/// each, so either the new-name column alone or whole rows of the table.
+/// A first line that is the table's header is left out.
+pub(super) fn pasted_names(text: &str, header: [&str; 3]) -> Vec<String> {
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines
+        .first()
+        .is_some_and(|l| l.split('\t').map(str::trim).eq(header))
+    {
+        lines.remove(0);
+    }
+    lines
+        .iter()
+        .map(|line| line.rsplit('\t').next().unwrap_or("").trim().to_owned())
+        .collect()
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::{RenameRow, pasted_names, rename_table};
+    use uuid::Uuid;
+
+    const HEADER: [&str; 3] = ["Folder", "Before", "After"];
+
+    #[test]
+    fn tables_copy_as_columns_and_pastes_take_the_last_column() {
+        let rows =
+            [("B1F", "scan01", ""), ("B1F", "scan\t02", "North")].map(|(f, o, n)| RenameRow {
+                id: Uuid::new_v4(),
+                folder: f.into(),
+                old: o.into(),
+                new: n.into(),
+            });
+        let table = rename_table(&rows, HEADER);
+        assert_eq!(
+            table,
+            "Folder\tBefore\tAfter\nB1F\tscan01\t\nB1F\tscan 02\tNorth"
+        );
+        // Whole rows back from a spreadsheet, header included.
+        assert_eq!(pasted_names(&format!("{table}\r\n"), HEADER), ["", "North"]);
+        // One column, with Windows line ends.
+        assert_eq!(pasted_names("A \r\nB\r\n", HEADER), ["A", "B"]);
+        assert!(pasted_names("", HEADER).is_empty());
     }
 }

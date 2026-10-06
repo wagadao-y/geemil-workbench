@@ -126,7 +126,7 @@ fn tree_rows(p: &Project) -> Vec<(usize, Uuid, String, bool)> {
             walk(p, Some(g.id), depth + 1, rows);
         }
         for s in scans {
-            rows.push((depth, s.id, s.name.clone(), false));
+            rows.push((depth, s.id, p.scan_name(s).to_owned(), false));
         }
     }
     let mut rows = vec![];
@@ -212,8 +212,10 @@ impl Workbench {
                     egui::CollapsingHeader::new(t.align_global_last)
                         .default_open(true)
                         .show(ui, |ui| {
-                            let name =
-                                |id: &Uuid| p.scan(*id).map_or("?".into(), |s| s.name.clone());
+                            let name = |id: &Uuid| {
+                                p.scan(*id)
+                                    .map_or("?".into(), |s| p.scan_name(s).to_owned())
+                            };
                             let names =
                                 |ids: &[Uuid]| ids.iter().map(name).collect::<Vec<_>>().join("、");
                             if let Some(last) = g.steps.last() {
@@ -403,7 +405,10 @@ impl Workbench {
             };
         }
         if let Some(g) = &self.align.last_global {
-            let name = |id: &Uuid| p.scan(*id).map_or(String::new(), |s| s.name.clone());
+            let name = |id: &Uuid| {
+                p.scan(*id)
+                    .map_or(String::new(), |s| p.scan_name(s).to_owned())
+            };
             let _ = writeln!(csv);
             let _ = writeln!(csv, "{}", t.align_csv_pair_columns.join(","));
             for after in &g.after {

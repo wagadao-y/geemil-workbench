@@ -57,6 +57,13 @@ pub(crate) fn validate_state(manifest: &Manifest, state: &Revision) -> Result<()
             "Scan folder refers to a missing scan or folder"
         );
     }
+    for (scan, name) in &state.scan_names {
+        ensure!(
+            state.scans.contains(scan),
+            "Scan name refers to a missing scan"
+        );
+        ensure!(!name.trim().is_empty(), "Empty scan name");
+    }
     Ok(())
 }
 

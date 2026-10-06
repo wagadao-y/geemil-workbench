@@ -336,6 +336,10 @@ pub struct Revision {
     pub groups: Vec<Group>,
     /// The folder of each scan in `groups`; absent scans are at the top level.
     pub scan_groups: BTreeMap<Uuid, Uuid>,
+    /// Names given to scans, by id; other scans keep their imported name.
+    /// Scan metadata never changes once written, so renames live here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub scan_names: BTreeMap<Uuid, String>,
     /// Unix seconds when the user saved this revision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_at: Option<u64>,
@@ -427,7 +431,7 @@ struct RevisionRef {
 #[serde(untagged)]
 enum StoredRevision {
     File(RevisionRef),
-    Inline(Revision),
+    Inline(Box<Revision>),
 }
 /// Where a saved revision lives.
 pub(crate) fn revision_path(id: Uuid) -> String {
@@ -496,6 +500,7 @@ impl Project {
                     scan_groups: BTreeMap::new(),
                     saved_at: Some(crate::history::now()),
                     registrations: BTreeMap::new(),
+                    scan_names: BTreeMap::new(),
                 }],
                 current: id,
                 draft: None,
@@ -563,7 +568,7 @@ impl Project {
         let mut revisions = vec![];
         for stored in file.revisions {
             let revision = match stored {
-                StoredRevision::Inline(revision) => revision,
+                StoredRevision::Inline(revision) => *revision,
                 StoredRevision::File(r) => {
                     ensure!(r.file == revision_path(r.id), "Misplaced revision");
                     let saved: Revision = serde_json::from_slice(&read(&r.file)?)

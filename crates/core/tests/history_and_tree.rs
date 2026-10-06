@@ -185,7 +185,7 @@ fn multi_scan_import_creates_a_folder_and_folder_transforms_compose() {
     assert_eq!(p.scans_within(scans[1]), vec![scans[1]]);
 
     // Dissolving a folder keeps its contents in place too.
-    p.ungroup(outer).unwrap();
+    p.ungroup(&[outer]).unwrap();
     assert_eq!(p.parent_of(folder), None);
     for (i, id) in scans.iter().enumerate() {
         assert!(world(&p, *id).abs_diff_eq(placed[i], 1e-9));
@@ -465,4 +465,114 @@ fn scattering_turns_scans_about_z_gathers_their_anchors_and_meets_their_floors()
     exclude_everything(&mut p);
     assert!(p.scans().all(|s| p.scan_anchor(s).unwrap().is_none()));
     assert!(p.scatter_scans(42).is_err());
+}
+
+#[test]
+fn renamed_scans_keep_their_names_through_saves_and_exports() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    let scans: Vec<_> = p.scans().cloned().collect();
+    let imported_names: Vec<_> = scans.iter().map(|s| s.name.clone()).collect();
+    let state = p.current().id;
+    // Several scans in one edit, with names trimmed.
+    p.rename_scans(&[
+        (scans[0].id, "  North  ".into()),
+        (scans[1].id, "South".into()),
+    ])
+    .unwrap();
+    assert_ne!(p.current().id, state);
+    assert_eq!(p.scan_name(&scans[0]), "North");
+    assert_eq!(p.scan_name(&scans[1]), "South");
+    // The scan metadata keeps the imported name.
+    assert_eq!(p.scans().next().unwrap().name, imported_names[0]);
+    assert!(p.rename_scans(&[(scans[0].id, " ".into())]).is_err());
+    // Renaming to the current names changes nothing.
+    let renamed = p.current().id;
+    p.rename_scans(&[(scans[1].id, "South".into())]).unwrap();
+    assert_eq!(p.current().id, renamed);
+
+    let reopened = Project::load(&p.root).unwrap();
+    assert_eq!(reopened.scan_name(&scans[0]), "North");
+    let output = dir.path().join("renamed.e57");
+    p.export_e57(&output, &JobControl::default()).unwrap();
+    let reader = e57::E57Reader::from_file(&output).unwrap();
+    let names: Vec<_> = reader
+        .pointclouds()
+        .iter()
+        .map(|pc| pc.name.clone())
+        .collect();
+    assert_eq!(names, [Some("North".into()), Some("South".into())]);
+    let las = dir.path().join("las");
+    std::fs::create_dir(&las).unwrap();
+    let files = p
+        .export_las_per_scan(&las, false, &JobControl::default())
+        .unwrap();
+    let stems: Vec<_> = files
+        .iter()
+        .map(|f| f.file_stem().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(stems, ["North", "South"]);
+
+    // The imported name again drops the rename; removed scans take theirs along.
+    p.rename_scans(&[(scans[0].id, imported_names[0].clone())])
+        .unwrap();
+    assert_eq!(p.current().scan_names.len(), 1);
+    p.remove_scans(&[scans[1].id]).unwrap();
+    assert!(p.current().scan_names.is_empty());
+}
+
+#[test]
+fn removing_folders_takes_everything_in_them_in_one_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    let folder = p.children(None).0[0].id;
+    let scans: Vec<_> = p.scans_within(folder);
+    let outer = p.create_group("Building".into(), None).unwrap();
+    let inner = p.create_group("Floor".into(), Some(outer)).unwrap();
+    let empty = p.create_group("Empty".into(), None).unwrap();
+    p.move_to_group(&[scans[0]], Some(inner)).unwrap();
+    p.set_transform(inner, shift(2.)).unwrap();
+    let before = p.current().clone();
+
+    p.remove_items(&[outer, empty]).unwrap();
+    let state = p.current();
+    let groups: Vec<_> = state.groups.iter().map(|g| g.id).collect();
+    assert_eq!(groups, [folder]);
+    assert_eq!(state.scans, [scans[1]]);
+    assert!(!state.transforms.contains_key(&inner));
+    assert!(Project::load(&p.root).is_ok());
+    // One edit: restoring the state before brings it all back.
+    p.restore_working_state(Some(before)).unwrap();
+    assert_eq!(p.scans().count(), 2);
+    assert_eq!(p.scans_within(outer), [scans[0]]);
+
+    // Scans and folders mixed; a scan inside a removed folder counts once.
+    p.remove_items(&[folder, scans[1], scans[0]]).unwrap();
+    assert_eq!(p.scans().count(), 0);
+    assert!(p.remove_items(&[uuid::Uuid::new_v4()]).is_err());
+}
+
+#[test]
+fn dissolving_folders_together_keeps_every_scan_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = imported(dir.path());
+    let folder = p.children(None).0[0].id;
+    let scans = p.scans_within(folder);
+    let outer = p.create_group("Building".into(), None).unwrap();
+    p.move_to_group(&[folder], Some(outer)).unwrap();
+    p.set_transform(outer, shift(3.)).unwrap();
+    p.set_transform(folder, shift(-1.)).unwrap();
+    let world = |p: &Project, id| p.world_matrix(p.scan(id).unwrap());
+    let placed: Vec<_> = scans.iter().map(|id| world(&p, *id)).collect();
+    let state = p.current().id;
+
+    // A folder and the one inside it, in one edit.
+    p.ungroup(&[outer, folder]).unwrap();
+    assert_ne!(p.current().id, state);
+    assert!(p.groups().is_empty());
+    assert_eq!(p.children(None).1.len(), 2);
+    for (id, before) in scans.iter().zip(&placed) {
+        assert!(world(&p, *id).abs_diff_eq(*before, 1e-9));
+    }
+    assert!(p.ungroup(&[outer]).is_err());
 }

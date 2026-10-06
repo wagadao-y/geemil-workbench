@@ -144,7 +144,7 @@ manitouでは、ずれを与えても与えなくても同じ解（差は約1cm�
 | `--smoke-budget N` | 描画点数を変える |
 | `--smoke-colors` | 既知の12色を表示し、スクリーンショットのpixel値を入力と照合する |
 | `--smoke-select MODE` | 起動1秒後に画面中央を矩形選択し、赤表示の点数と基準点を出力する。`inside`（奥行き0.5m）、`inside-all`（奥行き無制限）、`outside`（範囲外） |
-| `--smoke-dialog NAME` | ダイアログを開いた状態を保存する。`revisions`・`properties`・`shortcuts`・`new-project`・`cleanup`・`scatter`・`save-as`・`export`・`export-las`・`subsample`・`noise`・`moving` |
+| `--smoke-dialog NAME` | ダイアログを開いた状態を保存する。`revisions`・`properties`・`shortcuts`・`new-project`・`cleanup`・`scatter`・`bulk-rename`・`save-as`・`export`・`export-las`・`subsample`・`noise`・`moving` |
 | `--smoke-script STEPS` | 操作を順に実行する（下表） |
 
 ```powershell

@@ -412,7 +412,7 @@ impl Workbench {
             .iter()
             .find(|g| g.id == id)
             .map(|g| g.name.clone())
-            .or_else(|| p.scan(id).map(|s| s.name.clone()))
+            .or_else(|| p.scan(id).map(|s| p.scan_name(s).to_owned()))
             .unwrap_or_default()
     }
     pub(super) fn align_apply(&mut self) {
@@ -520,7 +520,11 @@ impl Workbench {
                     .iter()
                     .find(|g| g.id == item)
                     .map(|g| g.name.clone())
-                    .or_else(|| p.scans().find(|s| s.id == item).map(|s| s.name.clone()))
+                    .or_else(|| {
+                        p.scans()
+                            .find(|s| s.id == item)
+                            .map(|s| p.scan_name(s).to_owned())
+                    })
                     .unwrap_or_default();
                 let (_, reference) = self.align_scans(&p);
                 egui::Grid::new("align roles")
@@ -689,7 +693,7 @@ impl Workbench {
                 let (scans, fixed) = self.global_scans(&p);
                 let fixed_names: Vec<String> = fixed
                     .iter()
-                    .filter_map(|id| p.scan(*id).map(|s| s.name.clone()))
+                    .filter_map(|id| p.scan(*id).map(|s| p.scan_name(s).to_owned()))
                     .collect();
                 egui::Grid::new("global options")
                     .num_columns(2)
