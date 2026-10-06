@@ -59,6 +59,8 @@ impl Workbench {
     /// orbit centre along. A finished selection keeps the camera it was drawn
     /// with; one being drawn is dropped.
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
+        self.flying =
+            response.is_pointer_button_down_on() && ctx.input(|i| i.pointer.secondary_down());
         if self.crop.dragging() {
             return;
         }
@@ -135,28 +137,28 @@ impl Workbench {
             self.selection.camera_moved();
         }
     }
-    /// Flying with the keys in every tool: arrows move along the view and
-    /// sideways, PageUp and PageDown up and down, carrying the orbit centre
-    /// along at the orbit distance a second; Shift is four times faster and
-    /// Ctrl four times slower.
+    /// Flying with the keys in every tool while the right button is held on
+    /// the viewport: W/S along the view, A/D sideways and E/Q up and down.
+    /// The orbit centre moves along at the orbit distance a second; Shift is
+    /// four times faster and Ctrl four times slower.
     pub(super) fn fly_input(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() || self.dialog.is_some() {
+        if !self.flying || ctx.egui_wants_keyboard_input() || self.dialog.is_some() {
+            self.fly_last = None;
             return;
         }
-        let (step, modifiers, dt) = ctx.input(|i| {
-            let axis = |plus, minus| i.key_down(plus) as i32 - i.key_down(minus) as i32;
-            let step = [
-                axis(egui::Key::ArrowRight, egui::Key::ArrowLeft),
-                axis(egui::Key::ArrowUp, egui::Key::ArrowDown),
-                axis(egui::Key::PageUp, egui::Key::PageDown),
-            ];
-            (step, i.modifiers, i.stable_dt)
-        });
+        let (step, modifiers) = ctx.input(|i| (fly_step(|key| i.key_down(key)), i.modifiers));
         if step == [0; 3] {
+            self.fly_last = None;
             return;
         }
-        // A long first frame after idling would jump.
-        let dt = (dt as f64).min(0.1);
+        // Timed from the previous moving frame; the first moves one frame's
+        // worth rather than however long the app idled.
+        let now = Instant::now();
+        let dt = self
+            .fly_last
+            .map_or(1. / 60., |last| now.duration_since(last).as_secs_f64())
+            .min(0.1);
+        self.fly_last = Some(now);
         self.camera = fly(self.camera, step, modifiers, dt);
         self.flight = None;
         self.dirty = true;
@@ -279,6 +281,18 @@ impl Workbench {
     }
 }
 
+/// The step [`fly`] takes for the keys `held`: W/S, A/D and E/Q. Opposite
+/// keys cancel out.
+fn fly_step(held: impl Fn(egui::Key) -> bool) -> [i32; 3] {
+    use egui::Key;
+    let axis = |plus, minus| held(plus) as i32 - held(minus) as i32;
+    [
+        axis(Key::D, Key::A),
+        axis(Key::W, Key::S),
+        axis(Key::E, Key::Q),
+    ]
+}
+
 /// `camera` moved for `dt` seconds by `step` (right, forward, up; each -1,
 /// 0 or 1) at its orbit distance a second, four times faster with Shift and
 /// slower with Ctrl. The orbit centre moves along.
@@ -332,7 +346,7 @@ fn framed_camera(camera: Camera, corners: &[DVec3]) -> Camera {
 
 #[cfg(test)]
 mod tests {
-    use super::{fly, framed_camera, view_basis};
+    use super::{fly, fly_step, framed_camera, view_basis};
     use geemil_core::{Bounds, Camera};
     use glam::{DMat4, DVec3};
 
@@ -421,5 +435,16 @@ mod tests {
         assert!(moved.abs_diff_eq((DVec3::Z - right) * 20., 1e-9));
         let slow = fly(camera, [0, 0, -1], eframe::egui::Modifiers::COMMAND, 1.);
         assert!((slow.target[2] - (camera.target[2] - 2.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn letters_fly_and_opposites_cancel() {
+        use eframe::egui::Key;
+        let held = |keys: &'static [Key]| move |key| keys.contains(&key);
+        assert_eq!(fly_step(held(&[Key::W, Key::D, Key::E])), [1, 1, 1]);
+        assert_eq!(fly_step(held(&[Key::S, Key::A, Key::Q])), [-1, -1, -1]);
+        assert_eq!(fly_step(held(&[Key::W, Key::S, Key::D])), [1, 0, 0]);
+        // Arrows and PageUp/PageDown do not fly.
+        assert_eq!(fly_step(held(&[Key::ArrowUp, Key::PageUp])), [0, 0, 0]);
     }
 }

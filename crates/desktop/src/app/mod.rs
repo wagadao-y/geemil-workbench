@@ -174,6 +174,11 @@ pub struct Workbench {
     last_motion: Instant,
     refine_pending: bool,
     flight: Option<navigation::Flight>,
+    /// Whether the right button is held on the viewport, which lets WASD and
+    /// Q/E fly and holds back single-key shortcuts.
+    flying: bool,
+    /// When the last frame that moved by the keys was, to time the next.
+    fly_last: Option<Instant>,
 
     selection: selection::SelectionState,
     measure: measure::Measure,
@@ -240,6 +245,8 @@ impl Workbench {
             last_motion: Instant::now(),
             refine_pending: false,
             flight: None,
+            flying: false,
+            fly_last: None,
             selection: Default::default(),
             measure: Default::default(),
             align: Default::default(),
@@ -357,7 +364,10 @@ impl eframe::App for Workbench {
         self.poll_job();
         self.poll_view();
         self.align_update();
-        if self.dialog.is_none() {
+        // While the right button flies, its keys are not shortcuts. Releasing
+        // it ends flying at once, even where no viewport is drawn.
+        self.flying &= ctx.input(|i| i.pointer.secondary_down());
+        if self.dialog.is_none() && !self.flying {
             self.keyboard(&ctx);
         }
         if self.project.is_some() {
