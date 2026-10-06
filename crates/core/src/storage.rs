@@ -1,4 +1,4 @@
-use crate::codec::{MAX_BLOCK_BYTES, pack, read_block};
+use crate::codec::{MAX_BLOCK_BYTES, pack, read_block, read_block_columns};
 use crate::parallel::OrderedPool;
 use crate::{BlockCodec, Bounds, Chunk, CoreError, Node, Project, Scan, Stage};
 use anyhow::{Result, ensure};
@@ -1454,6 +1454,38 @@ pub(crate) fn index(
 
 impl Project {
     pub fn read_chunk(&self, scan: &Scan, id: u32) -> Result<Vec<u8>> {
+        let (mut f, c, size) = self.open_chunk(scan, id)?;
+        read_block(&mut f, c.codec, c.stored_bytes as usize, size, scan.stride)
+    }
+    /// Each valid point's position of a chunk, or none for an invalid one,
+    /// decoding only the records' first bytes.
+    pub(crate) fn chunk_positions(&self, scan: &Scan, id: u32) -> Result<Vec<Option<[f64; 3]>>> {
+        // Position (three f64) and the valid flag lead each record.
+        const COLUMNS: usize = 29;
+        let (mut f, c, size) = self.open_chunk(scan, id)?;
+        let columns = read_block_columns(
+            &mut f,
+            c.codec,
+            c.stored_bytes as usize,
+            size,
+            scan.stride,
+            COLUMNS,
+        )?;
+        let rows = c.count as usize;
+        let column = |k: usize| &columns[k * rows..(k + 1) * rows];
+        let valid = column(28);
+        Ok((0..rows)
+            .map(|i| {
+                (valid[i] != 0).then(|| {
+                    std::array::from_fn(|axis| {
+                        f64::from_le_bytes(std::array::from_fn(|b| column(axis * 8 + b)[i]))
+                    })
+                })
+            })
+            .collect())
+    }
+    /// The point file opened at a chunk, the chunk and its decoded size.
+    fn open_chunk<'a>(&self, scan: &'a Scan, id: u32) -> Result<(File, &'a Chunk, usize)> {
         let c = scan
             .chunks
             .get(id as usize)
@@ -1471,7 +1503,7 @@ impl Project {
             "Truncated point data"
         );
         f.seek(SeekFrom::Start(c.offset))?;
-        read_block(&mut f, c.codec, stored, size, scan.stride)
+        Ok((f, c, size))
     }
     /// The points of a display octree node, in scan coordinates.
     pub fn read_view(&self, scan: &Scan, node: u32) -> Result<Vec<Sample>> {

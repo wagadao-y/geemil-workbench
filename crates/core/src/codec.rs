@@ -55,6 +55,46 @@ pub(crate) fn read_block(
     }
 }
 
+/// The first `columns` byte columns of a block's records, column after
+/// column: for each, one byte per record. Decodes no further than they reach,
+/// so the frame's checksum, at its end, goes unchecked.
+pub(crate) fn read_block_columns(
+    reader: &mut impl Read,
+    codec: BlockCodec,
+    stored: usize,
+    expected: usize,
+    stride: usize,
+    columns: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        stride > 0
+            && columns <= stride
+            && expected.is_multiple_of(stride)
+            && expected <= MAX_BLOCK_BYTES,
+        "Invalid block layout/size"
+    );
+    let rows = expected / stride;
+    match codec {
+        BlockCodec::Raw => {
+            let records = read_block(reader, codec, stored, expected, stride)?;
+            let mut result = transpose(&records, rows, stride);
+            result.truncate(rows * columns);
+            Ok(result)
+        }
+        BlockCodec::ZstdShuffle => {
+            ensure!(
+                stored > 0 && stored <= zstd::zstd_safe::compress_bound(expected),
+                "Invalid compressed block size"
+            );
+            let mut bytes = vec![0; stored];
+            reader.read_exact(&mut bytes)?;
+            let mut result = vec![0; rows * columns];
+            zstd::stream::read::Decoder::with_buffer(bytes.as_slice())?.read_exact(&mut result)?;
+            Ok(result)
+        }
+    }
+}
+
 /// `data`, `rows` rows of `columns` bytes, written column by column.
 fn transpose(data: &[u8], rows: usize, columns: usize) -> Vec<u8> {
     // Square tiles keep the rows read and the rows written in cache; going
@@ -140,6 +180,38 @@ mod tests {
                 }
             }
             assert_eq!(transpose(&shuffled, columns, rows), data);
+        }
+    }
+    #[test]
+    fn leading_columns_decode_alone_from_both_codecs() {
+        let (rows, stride, columns): (usize, usize, usize) = (3000, 40, 29);
+        // Repeating records compress; noise does not and is stored raw.
+        let repeating: Vec<u8> = (0..rows * stride).map(|i| (i % stride) as u8).collect();
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let noise: Vec<u8> = (0..rows * stride)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 56) as u8
+            })
+            .collect();
+        for (data, codec) in [
+            (repeating, BlockCodec::ZstdShuffle),
+            (noise, BlockCodec::Raw),
+        ] {
+            let (packed_codec, packed) = pack(&data, stride).unwrap();
+            assert_eq!(packed_codec, codec);
+            let leading = read_block_columns(
+                &mut packed.as_slice(),
+                codec,
+                packed.len(),
+                data.len(),
+                stride,
+                columns,
+            )
+            .unwrap();
+            assert_eq!(leading, transpose(&data, rows, stride)[..rows * columns]);
         }
     }
 }

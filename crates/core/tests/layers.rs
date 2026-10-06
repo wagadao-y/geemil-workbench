@@ -376,4 +376,36 @@ fn a_scans_visible_bounds_leave_out_points_in_hidden_layers() {
     p.set_layer_visible(code, true).unwrap();
     let shown = p.visible_bounds(&scan).unwrap().unwrap();
     assert_eq!(format!("{shown:?}"), format!("{all:?}"));
+    // The patches keep each layer's bounds, so the moved points alone come
+    // out of them too.
+    assert!(
+        p.manifest
+            .patches
+            .iter()
+            .flat_map(|patch| &patch.blocks)
+            .all(|b| b.bounds.is_some())
+    );
+    p.set_layer_visible(DEFAULT_LAYER, false).unwrap();
+    let moved = p.visible_bounds(&scan).unwrap().unwrap();
+    assert_eq!(
+        format!("{moved:?}"),
+        format!("{:?}", exact_bounds(&p, &scan))
+    );
+    // Patches written without bounds are read instead.
+    p.set_layer_visible(DEFAULT_LAYER, true).unwrap();
+    p.set_layer_visible(code, false).unwrap();
+    let mut old = p.clone();
+    for block in old.manifest.patches.iter_mut().flat_map(|p| &mut p.blocks) {
+        block.bounds = None;
+    }
+    old.set_layer_visible(code, true).unwrap();
+    old.set_layer_visible(code, false).unwrap();
+    assert_eq!(
+        format!("{:?}", old.visible_bounds(&scan).unwrap().unwrap()),
+        format!("{strip:?}")
+    );
+    // Deleting the layer joins its bounds to the default layer's.
+    p.delete_layer(code, &job).unwrap();
+    let back = p.visible_bounds(&scan).unwrap().unwrap();
+    assert_eq!(format!("{back:?}"), format!("{all:?}"));
 }

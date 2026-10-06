@@ -250,6 +250,12 @@ pub struct LabelBlock {
     pub bytes: u32,
     /// Points per layer other than the default one, by ascending code.
     pub counts: Vec<(u8, u64)>,
+    /// Bounds of each layer's valid points in scan coordinates, by ascending
+    /// code and the default layer included, so a scan's visible bounds need
+    /// no points. None in patches written before they were recorded, whose
+    /// chunks are read instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounds: Option<Vec<(u8, Bounds)>>,
 }
 /// The labels of the chunks one operation changed. Never changes once
 /// written; a state lists the patches it applies, and for each chunk the

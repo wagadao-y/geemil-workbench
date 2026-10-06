@@ -6,15 +6,15 @@
 //! one scan keeps points that a single scan's ghosts seem to pass, such as
 //! the mirror image a polished floor shows below itself.
 use crate::filter::{ChunkCache, Progress, each_chunk, filter_workers};
+use crate::layers::LabelWriter;
 use crate::layers::is_set;
-use crate::layers::{LabelWriter, relabel};
 use crate::parallel::for_each_unordered;
 use crate::storage::{position, valid};
 use crate::{CoreError, JobControl, LayerTarget, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     f64::consts::{FRAC_PI_2, PI, TAU},
 };
 use uuid::Uuid;
@@ -227,20 +227,30 @@ impl Project {
                 },
             )?;
         }
-        let mut labels = LabelWriter::new(self, target)?;
-        let moving = labels.target();
-        for ((si, chunk), counts) in passed {
-            job.check()?;
-            let mut mask = vec![0u8; counts.len().div_ceil(8)];
-            for (index, &count) in counts.iter().enumerate() {
-                if count as u32 >= min_scans {
-                    mask[index / 8] |= 1 << (index % 8);
+        let masks: HashMap<(Uuid, u32), (Vec<u8>, u64)> = passed
+            .into_iter()
+            .map(|((si, chunk), counts)| {
+                let mut mask = vec![0u8; counts.len().div_ceil(8)];
+                let mut taken = 0;
+                for (index, &count) in counts.iter().enumerate() {
+                    if count as u32 >= min_scans {
+                        mask[index / 8] |= 1 << (index % 8);
+                        taken += 1;
+                    }
                 }
-            }
-            if let Some(moved) = relabel(self, moving, scans[si], chunk, &mask)? {
-                labels.add(moved)?;
-            }
-        }
+                ((scans[si].id, chunk), (mask, taken))
+            })
+            .collect();
+        let mut chunks: Vec<(&Scan, u32)> = scans
+            .iter()
+            .flat_map(|s| (0..s.chunks.len() as u32).map(move |c| (*s, c)))
+            .filter(|(s, c)| masks.get(&(s.id, *c)).is_some_and(|(_, n)| *n > 0))
+            .collect();
+        chunks.sort_by_key(|(s, c)| (s.id, *c));
+        let mut labels = LabelWriter::new(self, target)?;
+        labels.push_parallel(self, &chunks, Stage::MovingObjects, job, |scan, chunk| {
+            Ok(masks[&(scan.id, chunk)].clone())
+        })?;
         job.check()?;
         labels.commit(
             self,

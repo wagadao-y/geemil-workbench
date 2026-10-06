@@ -63,13 +63,18 @@ impl LabelIndex {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct LabelIndexCache(Arc<Mutex<Option<Arc<LabelIndex>>>>);
 
-/// The bounds [`Project::visible_bounds`] found for each scan in the state
-/// last asked about. Clones of a project share it, and a different state's
-/// question empties it.
+/// The bounds [`Project::visible_bounds`] found for each scan with the
+/// labels and layer visibility last asked about. Clones of a project share
+/// it, and a question with other labels or visibility empties it; other
+/// edits, such as transforms or folders, keep it.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VisibleBoundsCache(Arc<Mutex<VisibleBounds>>);
-/// A state and each scan's visible bounds in it.
-type VisibleBounds = (Uuid, HashMap<Uuid, Option<Bounds>>);
+#[derive(Debug, Default)]
+struct VisibleBounds {
+    /// The state's patches and [`Project::hidden_codes`] the bounds hold for.
+    key: Option<(Vec<Uuid>, [bool; 256])>,
+    scans: HashMap<Uuid, Option<Bounds>>,
+}
 
 /// Whether `outer` holds all of `inner`.
 fn holds(outer: &Bounds, inner: &Bounds) -> bool {
@@ -244,35 +249,56 @@ impl Project {
         Ok(workers.min(capacity))
     }
     /// The bounds, in scan coordinates, of the scan's points in visible
-    /// layers; none when none is visible. A chunk wholly visible counts with
-    /// its bounds and one wholly hidden not at all, both without reading it;
-    /// a chunk with both is read only when it reaches outside the bounds
-    /// found so far, so points moved out of the work, such as distant
-    /// noise, stop widening the scan's box at little cost. Kept per state.
+    /// layers; none when none is visible, so points moved out of the work,
+    /// such as distant noise, stop widening the scan's box. Found from the
+    /// metadata alone: a chunk no patch lists counts with its bounds while
+    /// the default layer is visible, one a patch lists with the bounds the
+    /// patch keeps of its visible layers. Only chunks of patches written
+    /// without those bounds that hold both visible and hidden points are
+    /// read, and only when they reach outside the bounds found so far. Kept
+    /// while the state's patches and layer visibility stay the same.
     pub fn visible_bounds(&self, scan: &Scan) -> Result<Option<Bounds>> {
-        let state = self.current().id;
+        let hidden = self.hidden_codes();
+        let key = (self.current().labels.clone(), hidden);
         {
             let cache = self.visible_bounds.0.lock().unwrap();
-            if cache.0 == state
-                && let Some(bounds) = cache.1.get(&scan.id)
+            if cache.key.as_ref() == Some(&key)
+                && let Some(bounds) = cache.scans.get(&scan.id)
             {
                 return Ok(*bounds);
             }
         }
-        let hidden = self.hidden_counts(&[scan]).remove(0);
         let mut bounds: Option<Bounds> = None;
+        let mut add = |b: &Bounds| match &mut bounds {
+            Some(bounds) => {
+                bounds.include(b.min);
+                bounds.include(b.max);
+            }
+            None => bounds = Some(*b),
+        };
         let mut mixed = vec![];
-        for (chunk, (c, hidden)) in scan.chunks.iter().zip(hidden).enumerate() {
-            if hidden == 0 {
-                match &mut bounds {
-                    Some(b) => {
-                        b.include(c.bounds.min);
-                        b.include(c.bounds.max);
+        let blocks = self.chunk_blocks(&[scan]).remove(0);
+        for (chunk, (c, block)) in scan.chunks.iter().zip(blocks).enumerate() {
+            match block.map(|b| (b, &b.bounds)) {
+                None if !hidden[DEFAULT_LAYER as usize] => add(&c.bounds),
+                None => {}
+                Some((_, Some(layers))) => {
+                    for (_, b) in layers.iter().filter(|(code, _)| !hidden[*code as usize]) {
+                        add(b);
                     }
-                    None => bounds = Some(c.bounds),
                 }
-            } else if hidden < c.count as u64 {
-                mixed.push(chunk as u32);
+                Some((block, None)) => {
+                    let hidden: u64 = layer_points(c.count, Some(block))
+                        .iter()
+                        .filter(|(code, _)| hidden[*code as usize])
+                        .map(|(_, n)| n)
+                        .sum();
+                    if hidden == 0 {
+                        add(&c.bounds);
+                    } else if hidden < c.count as u64 {
+                        mixed.push(chunk as u32);
+                    }
+                }
             }
         }
         for chunk in mixed {
@@ -287,10 +313,13 @@ impl Project {
             }
         }
         let mut cache = self.visible_bounds.0.lock().unwrap();
-        if cache.0 != state {
-            *cache = (state, HashMap::new());
+        if cache.key.as_ref() != Some(&key) {
+            *cache = VisibleBounds {
+                key: Some(key),
+                scans: HashMap::new(),
+            };
         }
-        cache.1.insert(scan.id, bounds);
+        cache.scans.insert(scan.id, bounds);
         Ok(bounds)
     }
     /// Points per layer over the scans of the current state, for every layer.
@@ -387,14 +416,23 @@ pub(crate) struct ChunkLabels {
     /// Empty when every point is in the default layer.
     packed: Vec<u8>,
     counts: Vec<(u8, u64)>,
+    bounds: Vec<(u8, Bounds)>,
     moved: u64,
 }
 impl ChunkLabels {
-    /// None when the move changed nothing.
-    fn new(scan: Uuid, chunk: u32, labels: &[u8], moved: u64) -> Result<Option<Self>> {
+    /// None when the move changed nothing. `bounds` gives each layer's
+    /// bounds after the move, as [`LabelBlock::bounds`].
+    fn new(
+        scan: Uuid,
+        chunk: u32,
+        labels: &[u8],
+        moved: u64,
+        bounds: impl FnOnce() -> Result<Vec<(u8, Bounds)>>,
+    ) -> Result<Option<Self>> {
         if moved == 0 {
             return Ok(None);
         }
+        let bounds = bounds()?;
         let mut counts = BTreeMap::new();
         for label in labels.iter().filter(|l| **l != DEFAULT_LAYER) {
             *counts.entry(*label).or_insert(0u64) += 1;
@@ -409,9 +447,46 @@ impl ChunkLabels {
             chunk,
             packed,
             counts: counts.into_iter().collect(),
+            bounds,
             moved,
         }))
     }
+}
+
+/// The bounds of each layer's valid points of a chunk with `labels`, by
+/// ascending code. Reads the chunk's positions.
+fn layer_bounds(
+    project: &Project,
+    scan: &Scan,
+    chunk: u32,
+    labels: &[u8],
+) -> Result<Vec<(u8, Bounds)>> {
+    let positions = project.chunk_positions(scan, chunk)?;
+    let mut bounds = BTreeMap::new();
+    for (p, label) in positions.into_iter().zip(labels) {
+        let Some(p) = p else { continue };
+        bounds
+            .entry(*label)
+            .and_modify(|b: &mut Bounds| b.include(p))
+            .or_insert_with(|| Bounds::at(p));
+    }
+    Ok(bounds.into_iter().collect())
+}
+
+/// Layer bounds as [`LabelBlock::bounds`] with layer `from` moved into `to`.
+fn merged_bounds(bounds: &[(u8, Bounds)], from: u8, to: u8) -> Vec<(u8, Bounds)> {
+    let mut merged: BTreeMap<u8, Bounds> = BTreeMap::new();
+    for (code, b) in bounds {
+        let code = if *code == from { to } else { *code };
+        merged
+            .entry(code)
+            .and_modify(|m| {
+                m.include(b.min);
+                m.include(b.max);
+            })
+            .or_insert(*b);
+    }
+    merged.into_iter().collect()
 }
 
 /// A chunk's labels with the points set in `mask` moved to `target`.
@@ -430,7 +505,9 @@ pub(crate) fn relabel(
             moved += 1;
         }
     }
-    ChunkLabels::new(scan.id, chunk, &labels, moved)
+    ChunkLabels::new(scan.id, chunk, &labels, moved, || {
+        layer_bounds(project, scan, chunk, &labels)
+    })
 }
 
 /// Writes the labels of the chunks an operation changes to staging, then
@@ -535,7 +612,17 @@ impl LabelWriter {
                     *label = self.target;
                     moved += 1;
                 }
-                if let Some(labels) = ChunkLabels::new(scan.id, chunk, &labels, moved)? {
+                // The layer's bounds join the target's, without reading the
+                // chunk when its block keeps them.
+                let target = self.target;
+                let bounds = || {
+                    let before = project.label_block(scan.id, chunk).map(|(_, b)| b.bounds);
+                    match before {
+                        Some(Some(before)) => Ok(merged_bounds(&before, from, target)),
+                        _ => layer_bounds(project, scan, chunk, &labels),
+                    }
+                };
+                if let Some(labels) = ChunkLabels::new(scan.id, chunk, &labels, moved, bounds)? {
                     self.add(labels)?;
                 }
             }
@@ -553,6 +640,7 @@ impl LabelWriter {
             chunk,
             packed,
             counts,
+            bounds,
             moved,
         } = labels;
         self.file.write_all(&packed)?;
@@ -562,6 +650,7 @@ impl LabelWriter {
             offset: self.offset,
             bytes: packed.len() as u32,
             counts,
+            bounds: Some(bounds),
         });
         self.offset += packed.len() as u64;
         self.moved += moved;
