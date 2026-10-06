@@ -42,6 +42,8 @@ project/
 
 元の属性はSingleをf32、Doubleをf64、IntegerおよびScaledIntegerをi64で保存する。ScaledIntegerはscale適用前の整数を保存し、scale/offsetはE57 templateから復元する。属性の削除・量子化は行わない。球面座標は描画用XYZに変換しても、元の球面属性を別に保持する。座標無効レコードは表示しないが、表示中のレイヤーにあれば書き出す。
 
+計算用XYZを保存せず元の属性から求める形への変更を予定している。方針と見積もりは[design.md](design.md)の「計算用座標の持ち方（今後）」を参照する。
+
 チャンクはファイルのbyte offsetと点数で参照する。一度作った原解像度点は編集で更新せず、`PointRef = (dataset UUID, chunk index, index in chunk)`を暗黙の識別子として使用する。
 
 LAS/LAZではXYZ・強度・RGBからE57用schemaを作る。その数値レコードの後ろに、取り込み元のLAS point formatでシリアライズした属性レコード（非圧縮・Extra Bytesを含む）を追加する。`Scan.las.record_offset`が開始位置、`point_format`と`extra_bytes`がレコード長を決める。取り込み元の座標整数も含むが、表示・編集・出力の座標には前方のf64 XYZとスキャン変換を使う。E57書き出しはschema分だけを読む。`Scan.las`は任意で、ない旧プロジェクトも読めるが、旧版で省略した属性は復元できない。
