@@ -164,11 +164,8 @@ fn original_resolution_depth_selection_masks_forks_and_revision_switches() {
     for scan in project.scans() {
         let world = project.world_matrix(scan);
         for c in 0..scan.chunks.len() {
-            let data = project.read_chunk(scan, c as u32).unwrap();
-            for p in data.chunks_exact(scan.stride) {
-                let pos = std::array::from_fn(|i| {
-                    f64::from_le_bytes(p[i * 8..i * 8 + 8].try_into().unwrap())
-                });
+            for sample in project.points(scan, c as u32).unwrap() {
+                let pos = sample.position;
                 if let Some(depth) = selection.contains(world.transform_point3(DVec3::from(pos))) {
                     all_depths.push(depth);
                 }
@@ -345,6 +342,11 @@ fn spherical_scaled_integer_and_invalid_records_survive_roundtrip() {
     let scan = p.scans().next().unwrap();
     assert_eq!(scan.records, 2);
     assert_eq!(scan.valid_points, 1);
+    // Without Cartesian values the computed coordinates are kept.
+    assert!(matches!(
+        scan.coordinates,
+        geemil_core::Coordinates::Stored { .. }
+    ));
     let samples = p.read_view(scan, 0).unwrap();
     assert_eq!(samples.len(), 1);
     assert!((samples[0].position[0] - 1.234 * 0.5f64.cos() * (0.2f32 as f64).cos()).abs() < 1e-12);
@@ -493,12 +495,8 @@ fn cropping_excludes_everything_outside_the_polygon_at_any_depth() {
     for scan in project.scans() {
         let world = project.world_matrix(scan);
         for c in 0..scan.chunks.len() {
-            let data = project.read_chunk(scan, c as u32).unwrap();
-            for p in data.chunks_exact(scan.stride).filter(|p| p[28] != 0) {
-                let pos = std::array::from_fn(|i| {
-                    f64::from_le_bytes(p[i * 8..i * 8 + 8].try_into().unwrap())
-                });
-                let p = world.transform_point3(DVec3::from(pos));
+            for sample in project.points(scan, c as u32).unwrap() {
+                let p = world.transform_point3(DVec3::from(sample.position));
                 total += 1;
                 if !test.covers(p) {
                     outside += 1;
@@ -759,4 +757,105 @@ fn uncoloured_e57_shows_intensity_as_grey() {
             (2, [255, 255, 255, 255])
         ]
     );
+}
+
+#[test]
+fn las_coordinates_stay_the_file_integers_through_display_and_e57() {
+    use e57::RecordDataType as T;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("site.las");
+    let mut builder = las::Builder::from((1, 2));
+    builder.point_format = las::point::Format::new(0).unwrap();
+    builder.transforms.x = las::Transform {
+        scale: 0.001,
+        offset: 500000.,
+    };
+    builder.transforms.y = las::Transform {
+        scale: 0.0005,
+        offset: 4000000.,
+    };
+    let mut writer = las::Writer::from_path(&source, builder.into_header().unwrap()).unwrap();
+    for i in 0..3000 {
+        writer
+            .write_point(las::Point {
+                x: 500000. + (i % 60) as f64 * 0.037,
+                y: 4000000. + (i / 60) as f64 * 0.0115,
+                z: (i % 7) as f64 * 0.21,
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    writer.close().unwrap();
+    drop(writer);
+    // What las computes for each point.
+    let mut reader = las::Reader::from_path(&source).unwrap();
+    let n = reader.header().number_of_points();
+    let expected: Vec<[u64; 3]> = reader
+        .read_points(n)
+        .unwrap()
+        .points()
+        .map(|p| {
+            let p = p.unwrap();
+            [p.x, p.y, p.z].map(f64::to_bits)
+        })
+        .collect();
+    drop(reader);
+
+    let mut p = Project::create(&dir.path().join("p"), "Test").unwrap();
+    let options = ImportOptions {
+        chunk_points: 512,
+        ..Default::default()
+    };
+    p.import_file(&source, options, &JobControl::default())
+        .unwrap();
+    let scan = p.scans().next().unwrap().clone();
+    let geemil_core::Coordinates::Cartesian { fields } = scan.coordinates else {
+        panic!("LAS coordinates should derive from the file's integers");
+    };
+    assert_eq!(
+        fields[1].encoding,
+        geemil_core::FieldEncoding::Integer {
+            scale: 0.0005,
+            offset: 4000000.
+        }
+    );
+    let mut original = std::collections::HashMap::new();
+    for chunk in 0..scan.chunks.len() as u32 {
+        for s in p.points(&scan, chunk).unwrap() {
+            original.insert((s.chunk, s.index), s.position.map(f64::to_bits));
+        }
+    }
+    let mut imported: Vec<_> = original.values().copied().collect();
+    let mut wanted = expected.clone();
+    imported.sort_unstable();
+    wanted.sort_unstable();
+    assert_eq!(imported, wanted);
+    for node in 0..scan.nodes.len() as u32 {
+        for s in p.read_view(&scan, node).unwrap() {
+            assert_eq!(original[&(s.chunk, s.index)], s.position.map(f64::to_bits));
+        }
+    }
+
+    // E57 keeps them as scaled integers with the file's scale and offset.
+    let output = dir.path().join("site.e57");
+    p.export_e57(&output, &JobControl::default()).unwrap();
+    let mut reader = e57::E57Reader::from_file(&output).unwrap();
+    let pc = reader.pointclouds()[0].clone();
+    assert!(matches!(
+        pc.prototype[0].data_type,
+        T::ScaledInteger { scale, offset, .. } if scale == 0.001 && offset == 500000.
+    ));
+    let mut exported: Vec<[u64; 3]> = reader
+        .pointcloud_simple(&pc)
+        .unwrap()
+        .map(|point| {
+            let point = point.unwrap();
+            let e57::CartesianCoordinate::Valid { x, y, z } = point.cartesian else {
+                panic!("valid point expected");
+            };
+            [x, y, z].map(f64::to_bits)
+        })
+        .collect();
+    exported.sort_unstable();
+    assert_eq!(exported, wanted);
 }

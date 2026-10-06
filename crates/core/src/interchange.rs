@@ -1,7 +1,8 @@
 //! Numeric E57 point attributes stay in their original types. A small E57 template
 //! stores scan metadata and image blobs, without a second copy of the point cloud.
+use crate::coords::{CoordinateField, Coordinates, FieldEncoding, HEAD, push_head};
 use crate::parallel::OrderedPool;
-use crate::storage::{SpoolWriter, index, make_record, push_record_head};
+use crate::storage::{SpoolWriter, index};
 use crate::{Bounds, CoreError, ImageInfo, ImportOptions, JobControl, Pose, Project, Scan, Stage};
 use anyhow::{Context, Result, ensure};
 use e57::{
@@ -94,19 +95,18 @@ fn geometry(
     ];
     let mut p = [0.; 3];
     let mut ok = false;
-    if let [Some(x), Some(y), Some(z)] = cart
-        && value(RecordName::CartesianInvalidState)?.unwrap_or(0.) == 0.
-    {
-        p = [x, y, z];
-        ok = true;
-    }
-    if !ok
-        && let (Some(r), Some(a), Some(e)) = (
-            value(RecordName::SphericalRange)?,
-            value(RecordName::SphericalAzimuth)?,
-            value(RecordName::SphericalElevation)?,
-        )
-        && value(RecordName::SphericalInvalidState)?.unwrap_or(0.) == 0.
+    // Scans with Cartesian values take their coordinates from them alone
+    // (see `e57_coordinates`), so only scans without fall back on spherical.
+    if let [Some(x), Some(y), Some(z)] = cart {
+        if value(RecordName::CartesianInvalidState)?.unwrap_or(0.) == 0. {
+            p = [x, y, z];
+            ok = true;
+        }
+    } else if let (Some(r), Some(a), Some(e)) = (
+        value(RecordName::SphericalRange)?,
+        value(RecordName::SphericalAzimuth)?,
+        value(RecordName::SphericalElevation)?,
+    ) && value(RecordName::SphericalInvalidState)?.unwrap_or(0.) == 0.
     {
         p = [r * e.cos() * a.cos(), r * e.cos() * a.sin(), r * e.sin()];
         ok = true;
@@ -373,6 +373,46 @@ fn intensity_range<T: Read + std::io::Seek>(
     Ok((high > low).then_some((low, high)))
 }
 
+/// Where the coordinates of an E57 point cloud's records are: its Cartesian
+/// values when it has all three, else f64 coordinates after its values.
+fn e57_coordinates(pc: &PointCloud) -> Coordinates {
+    let mut offset = HEAD;
+    let mut fields = [None; 3];
+    for record in &pc.prototype {
+        let axis = match record.name {
+            RecordName::CartesianX => Some(0),
+            RecordName::CartesianY => Some(1),
+            RecordName::CartesianZ => Some(2),
+            _ => None,
+        };
+        let encoding = match record.data_type {
+            RecordDataType::Single { .. } => FieldEncoding::F32,
+            RecordDataType::Double { .. } => FieldEncoding::F64,
+            RecordDataType::ScaledInteger { scale, offset, .. } => {
+                FieldEncoding::Integer { scale, offset }
+            }
+            RecordDataType::Integer { .. } => FieldEncoding::Integer {
+                scale: 1.,
+                offset: 0.,
+            },
+        };
+        if let Some(axis) = axis {
+            fields[axis] = Some(CoordinateField { offset, encoding });
+        }
+        offset += raw_size(std::slice::from_ref(record));
+    }
+    match fields {
+        [Some(x), Some(y), Some(z)] => Coordinates::Cartesian { fields: [x, y, z] },
+        _ => Coordinates::Stored { offset },
+    }
+}
+
+/// The record size of an E57 point cloud's points.
+fn e57_stride(pc: &PointCloud, coords: Coordinates) -> usize {
+    let stored = matches!(coords, Coordinates::Stored { .. });
+    HEAD + raw_size(&pc.prototype) + if stored { 24 } else { 0 }
+}
+
 struct GeometryBatch {
     data: Vec<u8>,
     bounds: Bounds,
@@ -382,11 +422,12 @@ struct GeometryBatch {
 
 fn convert_e57_batch(
     pc: &PointCloud,
+    coords: Coordinates,
     values: Vec<Vec<RecordValue>>,
     grey: Option<(f64, f64)>,
     job: &JobControl,
 ) -> Result<GeometryBatch> {
-    let stride = 32 + raw_size(&pc.prototype);
+    let stride = e57_stride(pc, coords);
     let mut data = Vec::with_capacity(values.len() * stride);
     let mut bounds: Option<Bounds> = None;
     let mut valid = 0;
@@ -396,7 +437,13 @@ fn convert_e57_batch(
             job.check()?;
         }
         let (p, color, ok) = geometry(pc, &values, grey)?;
-        data.extend(make_record(p, color, ok, &encode(&values)));
+        push_head(&mut data, color, ok);
+        data.extend(encode(&values));
+        if let Coordinates::Stored { .. } = coords {
+            for x in p {
+                data.extend(x.to_le_bytes());
+            }
+        }
         match &mut bounds {
             Some(b) => b.include(p),
             None => bounds = Some(Bounds::at(p)),
@@ -466,7 +513,8 @@ fn import_e57(
             template: "metadata.e57".into(),
             template_index: i,
             original_pose: pc.transform.as_ref().map(Pose::from_e57),
-            stride: 32 + raw_size(&pc.prototype),
+            stride: e57_stride(pc, e57_coordinates(pc)),
+            coordinates: e57_coordinates(pc),
             records: pc.records,
             valid_points: 0,
             omitted_attributes: vec![],
@@ -500,9 +548,10 @@ fn import_e57(
         let grey = intensity_range(&mut reader, pc)?;
         let worker_pc = pc.clone();
         let worker_job = job.clone();
+        let coords = scan.coordinates;
         let mut pool =
             OrderedPool::new(workers, options.worker_memory_bytes, job, move |values| {
-                convert_e57_batch(&worker_pc, values, grey, &worker_job)
+                convert_e57_batch(&worker_pc, coords, values, grey, &worker_job)
             })?;
         let mut batch = Vec::with_capacity(batch_points);
         let mut read_count = 0;
@@ -565,9 +614,10 @@ fn import_e57(
 }
 
 /// Converts LAS records, `len` bytes each in `format`, to point records
-/// into `out`: position, colour (8 bits, or a light grey without) and the
-/// values X, Y, Z, intensity and with colour red, green and blue, followed by
-/// the source record in `source_format`. Returns their bounds.
+/// into `out`: colour (8 bits, or a light grey without) and the values X, Y
+/// and Z (the LAS integers, as scaled integers), intensity and with colour
+/// red, green and blue, followed by the source record in `source_format`.
+/// Returns their bounds.
 fn las_records(
     raw: &[u8],
     len: usize,
@@ -579,7 +629,9 @@ fn las_records(
     out.clear();
     let mut bounds: Option<Bounds> = None;
     for record in raw.chunks_exact(len) {
-        let point = las::Point::new(las::raw::Point::read_from(record, format)?, transforms);
+        let raw = las::raw::Point::read_from(record, format)?;
+        let integers = [raw.x, raw.y, raw.z];
+        let point = las::Point::new(raw, transforms);
         let p = [point.x, point.y, point.z];
         ensure!(
             p.iter().all(|v: &f64| v.is_finite()),
@@ -592,10 +644,10 @@ fn las_records(
         let color = rgb.map_or([180, 195, 210, 255], |[r, g, b]| {
             [(r >> 8) as u8, (g >> 8) as u8, (b >> 8) as u8, 255]
         });
-        push_record_head(out, p, color, true);
-        // The values as `encode` writes Double and Integer ones.
-        for v in p {
-            out.extend(v.to_le_bytes());
+        push_head(out, color, true);
+        // The values as `encode` writes ScaledInteger and Integer ones.
+        for v in integers {
+            out.extend((v as i64).to_le_bytes());
         }
         out.extend((point.intensity as i64).to_le_bytes());
         for v in rgb.into_iter().flatten() {
@@ -628,24 +680,39 @@ fn import_las(
     let source_builder = las::Builder::from(header.clone());
     let mut source_format = *header.point_format();
     source_format.is_compressed = false;
-    let mut schema = vec![
-        Record {
-            name: RecordName::CartesianX,
-            data_type: RecordDataType::F64,
-        },
-        Record {
-            name: RecordName::CartesianY,
-            data_type: RecordDataType::F64,
-        },
-        Record {
-            name: RecordName::CartesianZ,
-            data_type: RecordDataType::F64,
-        },
-        Record {
-            name: RecordName::Intensity,
-            data_type: RecordDataType::Integer { min: 0, max: 65535 },
-        },
+    // Coordinates as the LAS integers with the file's scale and offset, so
+    // they stay exact in E57 exports and points derive them like LAS does.
+    let transforms = *header.transforms();
+    let axes = [
+        (RecordName::CartesianX, transforms.x),
+        (RecordName::CartesianY, transforms.y),
+        (RecordName::CartesianZ, transforms.z),
     ];
+    let mut schema: Vec<Record> = axes
+        .iter()
+        .map(|(name, t)| Record {
+            name: name.clone(),
+            data_type: RecordDataType::ScaledInteger {
+                min: i32::MIN as i64,
+                max: i32::MAX as i64,
+                scale: t.scale,
+                offset: t.offset,
+            },
+        })
+        .collect();
+    schema.push(Record {
+        name: RecordName::Intensity,
+        data_type: RecordDataType::Integer { min: 0, max: 65535 },
+    });
+    let coordinates = Coordinates::Cartesian {
+        fields: std::array::from_fn(|axis| CoordinateField {
+            offset: HEAD + axis * 8,
+            encoding: FieldEncoding::Integer {
+                scale: axes[axis].1.scale,
+                offset: axes[axis].1.offset,
+            },
+        }),
+    };
     if header.point_format().has_color {
         for name in [
             RecordName::ColorRed,
@@ -693,14 +760,15 @@ fn import_las(
         template: "metadata.e57".into(),
         template_index: 0,
         original_pose: None,
-        stride: 32 + raw_size(&schema) + source_format.len() as usize,
+        stride: HEAD + raw_size(&schema) + source_format.len() as usize,
+        coordinates,
         records: header.number_of_points(),
         valid_points: 0,
         omitted_attributes: vec![],
         las: Some(crate::LasMetadata {
             point_format: source_format.to_u8()?,
             extra_bytes: source_format.extra_bytes,
-            record_offset: 32 + raw_size(&schema),
+            record_offset: HEAD + raw_size(&schema),
             version: (source_builder.version.major, source_builder.version.minor),
             gps_standard: source_builder.gps_time_type.is_standard(),
             has_wkt_crs: source_builder.has_wkt_crs,
@@ -920,7 +988,7 @@ impl Project {
                         }
                         if !crate::layers::is_set(&hidden, i) {
                             out.add_point(decode(
-                                &record[32..32 + raw_size(&pc.prototype)],
+                                &record[HEAD..HEAD + raw_size(&pc.prototype)],
                                 &pc.prototype,
                             )?)?;
                         }

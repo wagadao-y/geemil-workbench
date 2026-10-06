@@ -4,9 +4,10 @@
 //! looks, so the result does not depend on where chunks split the scan. They
 //! judge the points of visible layers and move the points they pick to
 //! another layer instead of rewriting points.
+use crate::coords::valid;
 use crate::layers::{ChunkLabels, LabelWriter, is_set, relabel};
 use crate::parallel::{for_each_ordered, for_each_unordered};
-use crate::storage::{TempFile, create_scratch, position, valid};
+use crate::storage::{TempFile, create_scratch};
 use crate::{Bounds, CropBox, JobControl, LayerTarget, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3};
@@ -175,7 +176,9 @@ impl<'a> ChunkCache<'a> {
             }
             if valid(p) && !is_set(&hidden, i) {
                 points.indices.push(i as u32);
-                points.positions.push(DVec3::from(position(p)));
+                points
+                    .positions
+                    .push(DVec3::from(self.scan.coordinates.position(p)));
             }
         }
         // Drop decode buffers before installing the reusable point array.
@@ -1484,7 +1487,7 @@ impl Project {
                     if valid(p)
                         && !is_set(&hidden, i)
                         && to_box
-                            .transform_point3(DVec3::from(position(p)))
+                            .transform_point3(DVec3::from(scan.coordinates.position(p)))
                             .abs()
                             .cmple(DVec3::ONE)
                             .all()

@@ -1,4 +1,5 @@
 use crate::codec::{MAX_BLOCK_BYTES, pack, read_block, read_block_columns};
+use crate::coords::{Coordinates, point_color, valid};
 use crate::parallel::OrderedPool;
 use crate::{BlockCodec, Bounds, Chunk, CoreError, Node, Project, Scan, Stage};
 use anyhow::{Result, ensure};
@@ -14,6 +15,8 @@ use std::{
 };
 use uuid::Uuid;
 
+/// Bytes of a display point in import's spool files, with f64 coordinates;
+/// also the most a display point takes in the view file ([`view_stride`]).
 pub const SAMPLE_BYTES: usize = 36;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
@@ -161,29 +164,6 @@ pub(crate) fn create_scratch(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-pub(crate) fn position(record: &[u8]) -> [f64; 3] {
-    std::array::from_fn(|i| f64::from_le_bytes(record[i * 8..i * 8 + 8].try_into().unwrap()))
-}
-pub(crate) fn point_color(record: &[u8]) -> [u8; 4] {
-    record[24..28].try_into().unwrap()
-}
-pub(crate) fn valid(record: &[u8]) -> bool {
-    record[28] != 0
-}
-pub(crate) fn make_record(p: [f64; 3], color: [u8; 4], is_valid: bool, raw: &[u8]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(32 + raw.len());
-    push_record_head(&mut v, p, color, is_valid);
-    v.extend(raw);
-    v
-}
-/// The first 32 bytes of a point record, before its source values.
-pub(crate) fn push_record_head(out: &mut Vec<u8>, p: [f64; 3], color: [u8; 4], is_valid: bool) {
-    for x in p {
-        out.extend(x.to_le_bytes());
-    }
-    out.extend(color);
-    out.extend([is_valid as u8, 0, 0, 0]);
-}
 fn read_sample(r: &mut impl Read) -> Result<Sample> {
     let mut b = [0u8; SAMPLE_BYTES];
     r.read_exact(&mut b)?;
@@ -355,8 +335,23 @@ fn sample_bytes(samples: &[Sample]) -> Vec<u8> {
     data
 }
 
-fn pack_view(samples: &[Sample]) -> Result<(BlockCodec, Vec<u8>)> {
-    pack(&sample_bytes(samples), SAMPLE_BYTES)
+/// Bytes of a display point as the view file keeps it: its chunk and index,
+/// its coordinates in the scan's representation and its colour.
+pub(crate) fn view_stride(coords: Coordinates) -> usize {
+    8 + coords.view_bytes() + 4
+}
+
+/// A display node's points as the view file keeps them.
+fn pack_view(samples: &[Sample], coords: Coordinates) -> Result<(BlockCodec, Vec<u8>)> {
+    let stride = view_stride(coords);
+    let mut data = Vec::with_capacity(samples.len() * stride);
+    for s in samples {
+        data.extend(s.chunk.to_le_bytes());
+        data.extend(s.index.to_le_bytes());
+        coords.encode_view(s.position, &mut data)?;
+        data.extend(s.color);
+    }
+    pack(&data, stride)
 }
 
 /// One node of a display subtree under construction.
@@ -430,6 +425,7 @@ fn subtree(
 fn pack_leaf(
     task: LeafTask,
     stride: usize,
+    coords: Coordinates,
     options: ImportOptions,
     job: &JobControl,
 ) -> Result<PackedLeaf> {
@@ -442,7 +438,7 @@ fn pack_leaf(
         .map(|(i, b)| Sample {
             chunk: task.chunk,
             index: i as u32,
-            position: position(b),
+            position: coords.position(b),
             color: point_color(b),
         })
         .collect();
@@ -458,7 +454,7 @@ fn pack_leaf(
             children: node.children,
             count: node.samples.len() as u32,
             chunks: chunk_counts(&node.samples),
-            block: pack_view(&node.samples)?,
+            block: pack_view(&node.samples, coords)?,
         });
     }
     let points = pack(&data, stride)?;
@@ -671,6 +667,7 @@ enum MemoryTree {
 fn memory_tree(
     data: &[u8],
     stride: usize,
+    coords: Coordinates,
     chunk_points: usize,
     indices: Vec<u32>,
     bounds: Bounds,
@@ -687,7 +684,7 @@ fn memory_tree(
         let mut parts: [Vec<u32>; 8] = Default::default();
         let mut boxes: [Option<Bounds>; 8] = [None; 8];
         for &i in indices {
-            let p = position(&data[i as usize * stride..]);
+            let p = coords.position(&data[i as usize * stride..(i as usize + 1) * stride]);
             let c = (p[0] >= mid[0]) as usize
                 | (((p[1] >= mid[1]) as usize) << 1)
                 | (((p[2] >= mid[2]) as usize) << 2);
@@ -750,7 +747,17 @@ fn memory_tree(
                 .into_iter()
                 .map(|(part, b)| {
                     scope.spawn(move || {
-                        memory_tree(data, stride, chunk_points, part, b, depth + 1, share, job)
+                        memory_tree(
+                            data,
+                            stride,
+                            coords,
+                            chunk_points,
+                            part,
+                            b,
+                            depth + 1,
+                            share,
+                            job,
+                        )
                     })
                 })
                 .collect();
@@ -766,7 +773,17 @@ fn memory_tree(
         parts
             .into_iter()
             .map(|(part, b)| {
-                memory_tree(data, stride, chunk_points, part, b, depth + 1, threads, job)
+                memory_tree(
+                    data,
+                    stride,
+                    coords,
+                    chunk_points,
+                    part,
+                    b,
+                    depth + 1,
+                    threads,
+                    job,
+                )
             })
             .collect::<Result<Vec<_>>>()?
     };
@@ -820,6 +837,7 @@ impl Builder<'_> {
     /// Reads a region and splits it in memory on another thread.
     fn load(&self, region: Region, depth: u32) -> Loading {
         let stride = self.scan.stride;
+        let coords = self.scan.coordinates;
         let chunk_points = self.options.chunk_points as usize;
         let workers = self.workers;
         let job = self.job.clone();
@@ -845,6 +863,7 @@ impl Builder<'_> {
             let tree = memory_tree(
                 &data,
                 stride,
+                coords,
                 chunk_points,
                 indices,
                 bounds,
@@ -867,6 +886,7 @@ impl Builder<'_> {
     /// then copying each point once to the part of the grid it belongs to.
     fn split_region(&mut self, region: Region, depth: u32) -> Result<u32> {
         let stride = self.scan.stride;
+        let coords = self.scan.coordinates;
         let n = 1usize << GRID_LEVELS;
         let min = region.bounds.min;
         let extent: [f64; 3] = std::array::from_fn(|i| region.bounds.max[i] - min[i]);
@@ -885,7 +905,7 @@ impl Builder<'_> {
         let mut seen = 0;
         read_region(&region, stride, self.job, |block| {
             for r in block.chunks_exact(stride) {
-                counts[cell(position(r))] += 1;
+                counts[cell(coords.position(r))] += 1;
             }
             seen += (block.len() / stride) as u64;
             self.job.report(Stage::Partitioning, seen / 2, total);
@@ -952,7 +972,7 @@ impl Builder<'_> {
         };
         read_region(&region, stride, self.job, |block| {
             for r in block.chunks_exact(stride) {
-                let p = position(r);
+                let p = coords.position(r);
                 let i = lookup[cell(p)] as usize;
                 match &mut boxes[i] {
                     Some(b) => b.include(p),
@@ -1130,7 +1150,7 @@ impl Builder<'_> {
     }
     /// Writes a node's final points to the view file.
     fn store_view(&mut self, id: usize, samples: &[Sample]) -> Result<()> {
-        let (codec, bytes) = pack_view(samples)?;
+        let (codec, bytes) = pack_view(samples, self.scan.coordinates)?;
         self.view.write_all(&bytes)?;
         let n = &mut self.scan.nodes[id];
         n.count = samples.len() as u32;
@@ -1223,10 +1243,11 @@ impl Builder<'_> {
         }
         let spool_path = self.spool_path.clone();
         let grid = self.options.view_grid;
+        let coords = self.scan.coordinates;
         let worker_job = self.job.clone();
         let budget = self.options.worker_memory_bytes;
         let mut pool = OrderedPool::new(self.workers, budget, self.job, move |task| {
-            pick_parent(task, &spool_path, grid, &worker_job)
+            pick_parent(task, &spool_path, grid, coords, &worker_job)
         })?;
         let mut done = 0;
         for level in levels {
@@ -1331,6 +1352,7 @@ fn pick_parent(
     task: ParentTask,
     spool: &Path,
     grid: u32,
+    coords: Coordinates,
     job: &JobControl,
 ) -> Result<PickedParent> {
     let mut reader = File::open(spool)?;
@@ -1366,7 +1388,7 @@ fn pick_parent(
                 id: child,
                 count: samples.len() as u32,
                 chunks: chunk_counts(&samples),
-                block: pack_view(&samples)?,
+                block: pack_view(&samples, coords)?,
             })
         })
         .collect::<Result<_>>()?;
@@ -1407,9 +1429,10 @@ pub(crate) fn index(
         ..options
     };
     let stride = scan.stride;
+    let coords = scan.coordinates;
     let worker_job = job.clone();
     let pool = OrderedPool::new(workers, options.worker_memory_bytes, job, move |task| {
-        pack_leaf(task, stride, options, &worker_job)
+        pack_leaf(task, stride, coords, options, &worker_job)
     })?;
     let spool_path = root.join(format!("{}-waiting.bin", Uuid::new_v4()));
     let mut b = Builder {
@@ -1460,8 +1483,8 @@ impl Project {
     /// Each valid point's position of a chunk, or none for an invalid one,
     /// decoding only the records' first bytes.
     pub(crate) fn chunk_positions(&self, scan: &Scan, id: u32) -> Result<Vec<Option<[f64; 3]>>> {
-        // Position (three f64) and the valid flag lead each record.
-        const COLUMNS: usize = 29;
+        // The head's validity and the coordinates lead each record.
+        let leading = scan.coordinates.leading_bytes();
         let (mut f, c, size) = self.open_chunk(scan, id)?;
         let columns = read_block_columns(
             &mut f,
@@ -1469,18 +1492,16 @@ impl Project {
             c.stored_bytes as usize,
             size,
             scan.stride,
-            COLUMNS,
+            leading,
         )?;
         let rows = c.count as usize;
-        let column = |k: usize| &columns[k * rows..(k + 1) * rows];
-        let valid = column(28);
+        let mut record = vec![0u8; leading];
         Ok((0..rows)
             .map(|i| {
-                (valid[i] != 0).then(|| {
-                    std::array::from_fn(|axis| {
-                        f64::from_le_bytes(std::array::from_fn(|b| column(axis * 8 + b)[i]))
-                    })
-                })
+                for (k, byte) in record.iter_mut().enumerate() {
+                    *byte = columns[k * rows + i];
+                }
+                valid(&record).then(|| scan.coordinates.position(&record))
             })
             .collect())
     }
@@ -1511,7 +1532,8 @@ impl Project {
             .nodes
             .get(node as usize)
             .ok_or_else(|| anyhow::anyhow!("Invalid node"))?;
-        let expected = n.count as usize * SAMPLE_BYTES;
+        let stride = view_stride(scan.coordinates);
+        let expected = n.count as usize * stride;
         ensure!(
             expected <= MAX_BLOCK_BYTES,
             "View node exceeds format budget"
@@ -1525,8 +1547,16 @@ impl Project {
             "Truncated view data"
         );
         f.seek(SeekFrom::Start(n.offset))?;
-        let data = read_block(&mut f, n.codec, stored, expected, SAMPLE_BYTES)?;
-        let mut reader = data.as_slice();
-        (0..n.count).map(|_| read_sample(&mut reader)).collect()
+        let data = read_block(&mut f, n.codec, stored, expected, stride)?;
+        let color = stride - 4;
+        Ok(data
+            .chunks_exact(stride)
+            .map(|b| Sample {
+                chunk: u32::from_le_bytes(b[0..4].try_into().unwrap()),
+                index: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+                position: scan.coordinates.decode_view(&b[8..color]),
+                color: b[color..].try_into().unwrap(),
+            })
+            .collect())
     }
 }

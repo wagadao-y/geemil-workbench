@@ -428,6 +428,16 @@ fn display_octree_holds_every_valid_point_once() {
         }
         assert_eq!(seen.len(), valid);
         assert_eq!(valid as u64, scan.valid_points);
+        // Display points have the original points' coordinates bit for bit.
+        let original: std::collections::HashMap<_, _> = (0..scan.chunks.len() as u32)
+            .flat_map(|c| p.points(scan, c).unwrap())
+            .map(|s| ((s.chunk, s.index), s.position.map(f64::to_bits)))
+            .collect();
+        for i in 0..scan.nodes.len() as u32 {
+            for s in p.read_view(scan, i).unwrap() {
+                assert_eq!(original[&(s.chunk, s.index)], s.position.map(f64::to_bits));
+            }
+        }
         // Below the chunks: more nodes than chunks, and the root is sparse.
         assert!(scan.nodes.len() > scan.chunks.len());
         assert!((scan.nodes[0].count as u64) < scan.valid_points / 4);

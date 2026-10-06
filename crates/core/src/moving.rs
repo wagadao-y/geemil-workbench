@@ -5,11 +5,11 @@
 //! that lie well in front of enough of them are taken. Asking for more than
 //! one scan keeps points that a single scan's ghosts seem to pass, such as
 //! the mirror image a polished floor shows below itself.
+use crate::coords::valid;
 use crate::filter::{ChunkCache, Progress, each_chunk, filter_workers};
 use crate::layers::LabelWriter;
 use crate::layers::is_set;
 use crate::parallel::for_each_unordered;
-use crate::storage::{position, valid};
 use crate::{CoreError, JobControl, LayerTarget, Project, Scan, Stage};
 use anyhow::{Result, ensure};
 use glam::{DMat4, DVec3};
@@ -284,7 +284,7 @@ impl Project {
                     .chunks_exact(scan.stride)
                     .enumerate()
                     .filter(|(i, p)| valid(p) && !is_set(&hidden, *i))
-                    .filter_map(|(_, p)| sphere.locate(DVec3::from(position(p))))
+                    .filter_map(|(_, p)| sphere.locate(DVec3::from(scan.coordinates.position(p))))
                     .map(|(cell, range)| (cell as u32, range as f32))
                     .collect();
                 progress.step(job);

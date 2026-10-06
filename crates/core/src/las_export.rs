@@ -4,9 +4,9 @@
 //! Source LAS attributes and VLR/EVLR definitions survive LAS/LAZ output. E57
 //! intensity and colour are rescaled to 16 bits. The output point format is the
 //! union of supported fields; users may explicitly omit incompatible fields.
+use crate::coords::{point_color, valid};
 use crate::interchange::{decode, raw_size};
 use crate::layers::is_set;
-use crate::storage::{point_color, position, valid};
 use crate::{CoreError, JobControl, LasVlr, Project, Scan, Stage};
 use anyhow::{Context, Result, ensure};
 use e57::{E57Reader, PointCloud, RecordDataType, RecordName, RecordValue};
@@ -528,7 +528,7 @@ impl Project {
                     if !valid(record) || is_set(&hidden, i) {
                         continue;
                     }
-                    let p = world.transform_point3(DVec3::from(position(record)));
+                    let p = world.transform_point3(DVec3::from(scan.coordinates.position(record)));
                     if let Some(meta) = &scan.las {
                         let raw = las::raw::Point::read_from(
                             &record[meta.record_offset..],
@@ -559,7 +559,8 @@ impl Project {
                         continue;
                     }
                     let values = decode(
-                        &record[32..32 + raw_size(&attributes.prototype)],
+                        &record[crate::coords::HEAD
+                            ..crate::coords::HEAD + raw_size(&attributes.prototype)],
                         &attributes.prototype,
                     )?;
                     let intensity = match attributes.intensity {

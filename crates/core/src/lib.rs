@@ -2,6 +2,7 @@
 
 mod align;
 mod codec;
+mod coords;
 mod edit;
 mod error;
 mod filter;
@@ -20,6 +21,7 @@ mod tree;
 mod view_cache;
 
 pub use align::{IcpOptions, IcpResult, IcpStep, rigid_fit};
+pub use coords::{CoordinateField, Coordinates, FieldEncoding};
 pub use edit::{
     Camera, LoadedNode, LoadedView, NodePoints, PreparedSelection, Projector, Selection,
     SelectionMode, SpacingCache, ViewPick, ViewPoint,

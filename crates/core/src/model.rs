@@ -137,6 +137,8 @@ pub struct Scan {
     pub template_index: usize,
     pub original_pose: Option<Pose>,
     pub stride: usize,
+    /// Where the coordinates are in the point records.
+    pub coordinates: crate::Coordinates,
     pub records: u64,
     pub valid_points: u64,
     pub omitted_attributes: Vec<String>,
@@ -609,12 +611,19 @@ impl Project {
             filter_options: crate::FilterOptions::default(),
         };
         for s in &p.manifest.scans {
-            ensure!((32..=1_048_576).contains(&s.stride), "Invalid point stride");
+            ensure!(
+                (crate::coords::HEAD..=1_048_576).contains(&s.stride),
+                "Invalid point stride"
+            );
+            ensure!(
+                s.coordinates.leading_bytes() <= s.stride,
+                "Coordinates lie outside the point record"
+            );
             if let Some(las) = &s.las {
                 let format = las.format()?;
                 ensure!(
                     !format.has_waveform
-                        && las.record_offset >= 32
+                        && las.record_offset >= crate::coords::HEAD
                         && las.record_offset.checked_add(format.len() as usize) == Some(s.stride),
                     "Invalid LAS record layout"
                 );

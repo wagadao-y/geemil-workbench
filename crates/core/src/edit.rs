@@ -1,6 +1,6 @@
+use crate::coords::{point_color, valid};
 use crate::layers::{LabelWriter, is_set};
 use crate::parallel::{OrderedPool, for_each_unordered};
-use crate::storage::{position, valid};
 use crate::view_cache::NodeEstimates;
 use crate::{Bounds, JobControl, LayerTarget, Pose, Project, Sample, Scan, Stage, ViewCache};
 use anyhow::{Result, ensure};
@@ -440,8 +440,8 @@ impl Project {
             .map(|(i, p)| Sample {
                 chunk,
                 index: i as u32,
-                position: position(p),
-                color: crate::storage::point_color(p),
+                position: scan.coordinates.position(p),
+                color: point_color(p),
             })
             .collect())
     }
@@ -501,8 +501,9 @@ impl Project {
                     }
                     if valid(p)
                         && !is_set(&hidden, i)
-                        && let Some(depth) =
-                            test.contains(world.transform_point3(DVec3::from(position(p))))
+                        && let Some(depth) = test.contains(
+                            world.transform_point3(DVec3::from(scan.coordinates.position(p))),
+                        )
                     {
                         nearest = nearest.min(depth);
                     }
@@ -576,7 +577,10 @@ impl Project {
                 }
                 if valid(p)
                     && !is_set(&hidden, i)
-                    && test.excludes(world.transform_point3(DVec3::from(position(p))), limit)
+                    && test.excludes(
+                        world.transform_point3(DVec3::from(scan.coordinates.position(p))),
+                        limit,
+                    )
                 {
                     mask[i / 8] |= 1 << (i % 8);
                     count += 1;
