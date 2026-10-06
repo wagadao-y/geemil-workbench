@@ -32,3 +32,8 @@ inherits = "release"
 lto = false
 incremental = true
 codegen-units = 256
+
+# The brute-force checks in the filter tests and the ICP tests are slow
+# unoptimized; opt-level 1 keeps debug assertions and overflow checks.
+[profile.test]
+opt-level = 1
