@@ -192,7 +192,7 @@ impl Workbench {
     pub(super) fn pick_point(&self, click: [f64; 2]) -> Option<Picked> {
         let reach = (self.settings.point_size / 2. + 6.) * self.pixels_per_point;
         let (node, index) = self.renderer.as_ref()?.pick(click, reach.ceil() as u32)?;
-        let node = self.nodes.get(node)?;
+        let node = self.drawn.get(node)?;
         let local = (index < node.points.len()).then(|| node.points.position(index))?;
         let world = self
             .scan_worlds(true)

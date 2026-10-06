@@ -157,6 +157,9 @@ pub struct Workbench {
     view: ViewLoader,
     /// The display octree nodes shown, in scan coordinates.
     nodes: Vec<LoadedNode>,
+    /// `nodes` as last drawn, which picks name by index: input runs before
+    /// the frame is drawn, after `nodes` may have changed.
+    drawn: Vec<LoadedNode>,
     /// With adaptive point size, each shown point's spacing, by node.
     spacings: Vec<Arc<[f32]>>,
     /// Increases whenever `nodes` changes.
@@ -232,6 +235,7 @@ impl Workbench {
             cleanup_report: None,
             view: ViewLoader::spawn(cc.egui_ctx.clone()),
             nodes: vec![],
+            drawn: vec![],
             spacings: vec![],
             points_generation: 0,
             height_range: None,

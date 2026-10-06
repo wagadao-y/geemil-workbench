@@ -294,6 +294,8 @@ impl Workbench {
     /// from, whose files jobs never change or remove.
     pub(super) fn request_view(&mut self) {
         if self.smoke.colors {
+            // The colour fixture has nothing to load.
+            self.dirty = false;
             return;
         }
         if self.camera != self.last_camera {

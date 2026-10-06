@@ -5,11 +5,25 @@ use crate::render::{DrawOptions, Edl};
 use eframe::egui;
 
 impl Workbench {
+    /// Handles the viewport's input first and then draws it, so a camera
+    /// move shows in the frame it was made in rather than the next.
     pub(super) fn viewport(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let ctx = &ui.ctx().clone();
         egui::CentralPanel::no_frame().show(ui, |ui| {
             self.advance_flight(ctx);
             let size = ui.available_size().max(egui::vec2(1., 1.));
+            let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+            // Picks read the last frame drawn, which is what was clicked.
+            if self.job.is_none() {
+                self.gizmo_input(&response);
+                self.crop_input(&response);
+            }
+            self.camera_input(ctx, &response);
+            if self.job.is_none() {
+                self.selection_input(&response);
+                self.measure_input(&response);
+                self.align_input(&response);
+            }
             let aspect = (size.x / size.y) as f64;
             if (self.camera.aspect - aspect).abs() > 1e-6 {
                 self.camera.aspect = aspect;
@@ -51,29 +65,20 @@ impl Workbench {
             );
             let points = nodes.iter().map(|n| n.points.len()).sum();
             drop(nodes);
+            self.drawn = self.nodes.clone();
             self.smoke.view_rendered(renderer.pending(), points);
             self.renderer = Some(renderer);
-            let response =
-                ui.add(egui::Image::new((id, size)).sense(egui::Sense::click_and_drag()));
-            self.smoke_probes(response.rect);
-            if self.job.is_none() {
-                self.gizmo_input(&response);
-                self.crop_input(&response);
-            }
-            self.camera_input(ctx, &response);
-            if self.job.is_none() {
-                self.selection_input(&response);
-                self.measure_input(&response);
-                self.align_input(&response);
-            }
+            let uv = egui::Rect::from_min_max(egui::pos2(0., 0.), egui::pos2(1., 1.));
+            ui.painter().image(id, rect, uv, egui::Color32::WHITE);
+            self.smoke_probes(rect);
             self.draw_selection(ui, &response);
-            self.draw_measure(ui, response.rect);
-            self.draw_align(ui, response.rect);
-            self.draw_box(ui, response.rect);
-            self.draw_gizmo(ui, response.rect);
+            self.draw_measure(ui, rect);
+            self.draw_align(ui, rect);
+            self.draw_box(ui, rect);
+            self.draw_gizmo(ui, rect);
             self.draw_pivot(ui, &response);
-            self.draw_orientation(ui, response.rect);
-            self.empty_hint(ui, response.rect);
+            self.draw_orientation(ui, rect);
+            self.empty_hint(ui, rect);
         });
     }
     /// Tells how to add points while the project has none.
