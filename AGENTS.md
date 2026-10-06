@@ -1,1 +1,3 @@
-ユーザーからのチャットには必ず日本語で応答する
+- ユーザーからのチャットには必ず日本語で応答する
+- 作業中のテストは関係するものに絞る（例：`cargo test -p geemil-core --test filters`）。`cargo test --workspace`とclippyは最後に1回
+- GUIの動作確認は`--profile smoke`でビルドする。`--release`は性能計測と配布用

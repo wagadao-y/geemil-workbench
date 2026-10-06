@@ -135,6 +135,8 @@ manitouでは、ずれを与えても与えなくても同じ解（差は約1cm�
 
 `--smoke-test PNG`で起動し、表示の読み込みを待ってから画面をPNGに保存して終了する。プロジェクトを指定しなければ起動画面を保存する。
 
+動作確認には`smoke`プロファイル（最適化あり・LTOなし・インクリメンタル）を使う。1ファイルの変更後の再ビルドが`release`の約46秒から約6秒になる。速度を比べるベンチマークと長時間計測は、配布物と同じ`--release`で行う。
+
 | オプション | 動作 |
 | --- | --- |
 | `--smoke-orbit` | 2秒間カメラを回転・平行移動し、移動中にもノードの更新が完了することを確認する |
@@ -146,11 +148,11 @@ manitouでは、ずれを与えても与えなくても同じ解（差は約1cm�
 | `--smoke-script STEPS` | 操作を順に実行する（下表） |
 
 ```powershell
-cargo run -p geemil-desktop --release -- work-data/trimble --smoke-test work-data/preview.png --smoke-orbit
-cargo run -p geemil-desktop --release -- --smoke-test work-data/colors.png --smoke-colors
-cargo run -p geemil-desktop --release -- work-data/trimble --smoke-test work-data/select.png --smoke-select outside
-cargo run -p geemil-desktop --release -- work-data/manitou --smoke-test work-data/revisions.png --smoke-dialog revisions
-cargo run -p geemil-desktop --release -- work-data/manitou-copy --smoke-test work-data/flow.png --smoke-select inside-all --smoke-script exclude,undo,redo,folder,save,remove,measure
+cargo run -p geemil-desktop --profile smoke -- work-data/trimble --smoke-test work-data/preview.png --smoke-orbit
+cargo run -p geemil-desktop --profile smoke -- --smoke-test work-data/colors.png --smoke-colors
+cargo run -p geemil-desktop --profile smoke -- work-data/trimble --smoke-test work-data/select.png --smoke-select outside
+cargo run -p geemil-desktop --profile smoke -- work-data/manitou --smoke-test work-data/revisions.png --smoke-dialog revisions
+cargo run -p geemil-desktop --profile smoke -- work-data/manitou-copy --smoke-test work-data/flow.png --smoke-select inside-all --smoke-script exclude,undo,redo,folder,save,remove,measure
 ```
 
 ### --smoke-script の操作

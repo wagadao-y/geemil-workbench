@@ -24,3 +24,11 @@ zstd = "0.14.0"
 
 [profile.release]
 lto = "thin"
+
+# Optimized build for smoke tests during development: skips LTO and keeps
+# incremental compilation so a one-file change relinks quickly.
+[profile.smoke]
+inherits = "release"
+lto = false
+incremental = true
+codegen-units = 256
