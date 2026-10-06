@@ -346,6 +346,7 @@ impl Workbench {
         if !smoke.requested
             && smoke.script.is_empty()
             && self.job.is_none()
+            && !self.selection.preview_pending()
             && (!self.nodes.is_empty() || empty)
             && !self.renderer.as_ref().is_some_and(|r| r.pending())
             && smoke.started.elapsed() > smoke.orbit_duration + Duration::from_secs(1)

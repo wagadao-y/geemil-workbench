@@ -11,7 +11,7 @@ use super::{
     layers::{destination, destination_combo},
 };
 use eframe::egui;
-use geemil_core::{Camera, JobControl, NodePoints, Project, Selection, SelectionMode};
+use geemil_core::{Camera, JobControl, LoadedNode, NodePoints, Project, Selection, SelectionMode};
 use glam::DMat4;
 use std::{
     collections::HashMap,
@@ -143,20 +143,32 @@ impl SelectionState {
     pub(super) fn preview_summary(&self) -> Option<String> {
         let preview = &self.preview;
         preview.marks_for.as_ref().map(|_| {
-            let displayed: usize = preview.marks.iter().map(|m| m.points.len()).sum();
+            let displayed: usize = preview.marks.values().map(|m| m.points.len()).sum();
             format!(
                 "{} of {displayed} displayed points marked, nearest {:?}",
                 preview.marked, preview.nearest
             )
         })
     }
-    /// The points to highlight of each displayed node, if any.
-    pub(super) fn marks<'a>(&'a self) -> Option<impl Fn(usize) -> Option<&'a Arc<[bool]>> + 'a> {
+    /// Whether the preview is still being worked out in the background.
+    pub(super) fn preview_pending(&self) -> bool {
+        self.preview.computing.is_some() || self.preview.search.is_some()
+    }
+    /// The points to highlight of a displayed node, by its points, if any.
+    /// Nodes loaded since the marks were worked out have none until the
+    /// next ones arrive.
+    pub(super) fn marks<'a>(
+        &'a self,
+    ) -> Option<impl Fn(&Arc<NodePoints>) -> Option<&'a Arc<[bool]>> + 'a> {
         let preview = &self.preview;
-        preview
-            .marks_for
-            .as_ref()
-            .map(|_| |i: usize| preview.marks.get(i).and_then(|m| m.marks.as_ref()))
+        preview.marks_for.as_ref().map(|_| {
+            |points: &Arc<NodePoints>| {
+                preview
+                    .marks
+                    .get(&address(points))
+                    .and_then(|m| m.marks.as_ref())
+            }
+        })
     }
     fn selection(&self) -> Option<Selection> {
         if self.polygon.len() < 3 {
@@ -182,11 +194,36 @@ struct Preview {
     nearest_for: Option<NearestInput>,
     nearest: Nearest,
     search: Option<NearestSearch>,
-    /// Inputs of `marks`; a change recomputes them.
+    /// Inputs of `marks`.
     marks_for: Option<MarksInput>,
-    /// Parallel to the displayed nodes.
-    marks: Vec<NodeMarks>,
+    /// By the address of the node's points.
+    marks: HashMap<usize, NodeMarks>,
     marked: usize,
+    /// Inputs of the marks being worked out, or of `marks` when none are; a
+    /// change starts over.
+    requested: Option<MarksInput>,
+    computing: Option<MarksJob>,
+}
+/// Marks being worked out on another thread.
+struct MarksJob {
+    cancel: Arc<AtomicBool>,
+    rx: mpsc::Receiver<MarksResult>,
+}
+impl Drop for MarksJob {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+struct MarksResult {
+    /// The inputs, with the nearest depth the marks were judged with.
+    input: MarksInput,
+    /// The nearest depth among the displayed points, when asked to find it.
+    nearest: Option<Nearest>,
+    marks: Vec<NodeMarks>,
+}
+/// The address that identifies a displayed node's points.
+fn address(points: &Arc<NodePoints>) -> usize {
+    Arc::as_ptr(points) as usize
 }
 /// The points of a displayed node a move takes.
 #[derive(Clone)]
@@ -315,11 +352,16 @@ impl Workbench {
             }
         }
         let preview = &self.selection.preview;
-        if self.selection.is_ready() && preview.marks_for.is_some() {
+        let pending = self.selection.preview_pending();
+        if self.selection.is_ready() && (preview.marks_for.is_some() || pending) {
             ui.separator();
-            ui.label((t.preview_count)(&t.count(preview.marked as u64)));
-            if preview.search.is_some() {
+            if preview.marks_for.is_some() {
+                ui.label((t.preview_count)(&t.count(preview.marked as u64)));
+            }
+            if pending {
                 ui.spinner();
+            }
+            if preview.search.is_some() {
                 ui.small(t.preview_searching);
             }
         } else {
@@ -390,23 +432,25 @@ impl Workbench {
             }
         }
     }
-    /// Brings the preview up to date with the selection and the displayed points.
+    /// Brings the preview up to date with the selection and the displayed
+    /// points. The marks are worked out on another thread, so a large view
+    /// does not hold up frames; until they arrive the previous ones stay on
+    /// the nodes still shown.
     pub(super) fn update_preview(&mut self, ctx: &egui::Context) {
         let selection = self
             .selection
             .selection()
             .filter(|_| self.job.is_none() && self.selection.drag_start.is_none());
         let (Some(selection), Some(project)) = (selection, self.project.clone()) else {
-            if self.selection.preview.marks_for.is_some() {
+            if self.selection.preview.requested.is_some() {
                 self.selection.preview = Preview::default();
             }
             return;
         };
-        let worlds = self.scan_worlds(false);
         let s = &mut self.selection;
         let preview = &mut s.preview;
-        let test = selection.prepare();
-        if test.depth_limited() {
+        let depth_limited = selection.prepare().depth_limited();
+        if depth_limited {
             let input = NearestInput {
                 polygon: s.polygon.clone(),
                 camera: selection.camera,
@@ -415,7 +459,7 @@ impl Workbench {
                 revision: project.current().id,
             };
             if preview.nearest_for.as_ref() != Some(&input) {
-                preview.nearest = displayed_nearest(&selection, &self.nodes, &worlds);
+                preview.nearest = Nearest::Unknown;
                 preview.search = Some(start_search(ctx, project, &selection, &input.visible));
                 preview.nearest_for = Some(input);
             }
@@ -430,6 +474,25 @@ impl Workbench {
                 Err(e) => self.error = Some(Notice::new(self.t, &e)),
             }
         }
+        if let Some(job) = &preview.computing
+            && let Ok(result) = job.rx.try_recv()
+        {
+            preview.computing = None;
+            // The search may have finished meanwhile; its depth is exact.
+            if let Some(nearest) = result.nearest
+                && !matches!(preview.nearest, Nearest::Exact(_))
+            {
+                preview.nearest = nearest;
+            }
+            preview.marked = result.marks.iter().map(|m| m.marked).sum();
+            preview.marks = result
+                .marks
+                .into_iter()
+                .map(|m| (address(&m.points), m))
+                .collect();
+            preview.requested = Some(result.input.clone());
+            preview.marks_for = Some(result.input);
+        }
         let input = MarksInput {
             polygon: s.polygon.clone(),
             camera: selection.camera,
@@ -438,54 +501,35 @@ impl Workbench {
             nearest: preview.nearest,
             points: self.points_generation,
         };
-        if preview.marks_for.as_ref() != Some(&input) {
-            let limit = match (selection.depth_meters, preview.nearest) {
-                _ if !test.depth_limited() => f64::INFINITY,
-                (Some(depth), Nearest::Displayed(d) | Nearest::Exact(Some(d))) => d + depth,
-                // Nothing inside the polygon: nothing to move.
-                _ => f64::NEG_INFINITY,
-            };
-            // When only the displayed nodes changed, those still shown where
-            // they were keep their marks, which the renderer then keeps too.
-            let same_test = preview.marks_for.as_ref().is_some_and(|old| {
-                *old == MarksInput {
-                    points: old.points,
-                    ..input.clone()
-                }
-            });
-            let address = |points: &Arc<NodePoints>| Arc::as_ptr(points) as usize;
-            let previous: HashMap<usize, NodeMarks> = if same_test {
-                std::mem::take(&mut preview.marks)
-                    .into_iter()
-                    .map(|m| (address(&m.points), m))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
-            // Points of hidden scans stay unmarked.
-            preview.marks = super::view::par_map(&self.nodes, |node| {
-                let world = worlds.get(&node.scan).copied();
-                if let Some(kept) = previous.get(&address(&node.points))
-                    && kept.world == world
-                {
-                    return kept.clone();
-                }
-                let marks: Vec<bool> = node
-                    .points
-                    .positions()
-                    .map(|p| world.is_some_and(|w| test.excludes(w.transform_point3(p), limit)))
-                    .collect();
-                let marked = marks.iter().filter(|m| **m).count();
-                NodeMarks {
-                    points: node.points.clone(),
-                    world,
-                    marks: (marked > 0).then(|| marks.into()),
-                    marked,
-                }
-            });
-            preview.marked = preview.marks.iter().map(|m| m.marked).sum();
-            preview.marks_for = Some(input);
+        if preview.requested.as_ref() == Some(&input) {
+            return;
         }
+        // When only the displayed nodes changed, those still shown where
+        // they were keep their marks, which the renderer then keeps too.
+        let same_test = preview.marks_for.as_ref().is_some_and(|old| {
+            *old == MarksInput {
+                points: old.points,
+                ..input.clone()
+            }
+        });
+        let previous = if same_test {
+            preview.marks.clone()
+        } else {
+            HashMap::new()
+        };
+        // Until the search answers, the displayed points stand in.
+        let find_nearest = depth_limited && preview.nearest == Nearest::Unknown;
+        let work = MarksWork {
+            nodes: self.nodes.clone(),
+            worlds: self.scan_worlds(false),
+            selection,
+            find_nearest,
+            previous,
+            input: input.clone(),
+        };
+        let preview = &mut self.selection.preview;
+        preview.computing = Some(work.spawn(ctx));
+        preview.requested = Some(input);
     }
     pub(super) fn draw_selection(&self, ui: &egui::Ui, response: &egui::Response) {
         let s = &self.selection;
@@ -538,16 +582,99 @@ impl Workbench {
     }
 }
 
+/// What working out the marks takes, moved to its thread.
+struct MarksWork {
+    nodes: Vec<LoadedNode>,
+    /// Where the scans are as applied; hidden scans are left out.
+    worlds: HashMap<Uuid, DMat4>,
+    selection: Selection,
+    /// Find the nearest depth among the displayed points first and judge
+    /// with it, rather than with `input.nearest`.
+    find_nearest: bool,
+    /// Marks to keep for nodes still shown where they were.
+    previous: HashMap<usize, NodeMarks>,
+    input: MarksInput,
+}
+impl MarksWork {
+    fn spawn(self, ctx: &egui::Context) -> MarksJob {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::sync_channel(1);
+        let (flag, ctx) = (cancel.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            if let Some(result) = self.run(&flag) {
+                let _ = tx.send(result);
+                ctx.request_repaint();
+            }
+        });
+        MarksJob { cancel, rx }
+    }
+    /// The marks, or none when cancelled.
+    fn run(self, cancel: &AtomicBool) -> Option<MarksResult> {
+        let Self {
+            nodes,
+            worlds,
+            selection,
+            find_nearest,
+            previous,
+            mut input,
+        } = self;
+        let found = find_nearest.then(|| displayed_nearest(&selection, &nodes, &worlds, cancel));
+        if let Some(nearest) = found {
+            input.nearest = nearest;
+        }
+        let test = selection.prepare();
+        let limit = match (selection.depth_meters, input.nearest) {
+            _ if !test.depth_limited() => f64::INFINITY,
+            (Some(depth), Nearest::Displayed(d) | Nearest::Exact(Some(d))) => d + depth,
+            // Nothing inside the polygon: nothing to move.
+            _ => f64::NEG_INFINITY,
+        };
+        // Points of hidden scans stay unmarked.
+        let marks = super::view::par_map(&nodes, |node| {
+            let world = worlds.get(&node.scan).copied();
+            if let Some(kept) = previous.get(&address(&node.points))
+                && kept.world == world
+            {
+                return kept.clone();
+            }
+            let marks: Vec<bool> = if cancel.load(Ordering::Relaxed) {
+                vec![]
+            } else {
+                node.points
+                    .positions()
+                    .map(|p| world.is_some_and(|w| test.excludes(w.transform_point3(p), limit)))
+                    .collect()
+            };
+            let marked = marks.iter().filter(|m| **m).count();
+            NodeMarks {
+                points: node.points.clone(),
+                world,
+                marks: (marked > 0).then(|| marks.into()),
+                marked,
+            }
+        });
+        (!cancel.load(Ordering::Relaxed)).then_some(MarksResult {
+            input,
+            nearest: found,
+            marks,
+        })
+    }
+}
+
 fn displayed_nearest(
     selection: &Selection,
-    nodes: &[geemil_core::LoadedNode],
+    nodes: &[LoadedNode],
     worlds: &HashMap<Uuid, DMat4>,
+    cancel: &AtomicBool,
 ) -> Nearest {
     let test = selection.prepare();
     let nearest = super::view::par_map(nodes, |node| {
         let Some(world) = worlds.get(&node.scan) else {
             return f64::INFINITY;
         };
+        if cancel.load(Ordering::Relaxed) {
+            return f64::INFINITY;
+        }
         node.points
             .positions()
             .filter_map(|p| test.contains(world.transform_point3(p)))

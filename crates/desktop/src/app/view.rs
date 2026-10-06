@@ -425,7 +425,7 @@ impl Workbench {
                 points: &node.points,
                 world: *world,
                 tint,
-                marks: marks.as_ref().and_then(|m| m(i)),
+                marks: marks.as_ref().and_then(|m| m(&node.points)),
                 spacings: self
                     .spacings
                     .get(i)
