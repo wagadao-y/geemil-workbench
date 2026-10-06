@@ -3,6 +3,11 @@ use anyhow::{Result, ensure};
 use std::io::Read;
 
 pub(crate) const MAX_BLOCK_BYTES: usize = 32 * 1024 * 1024;
+/// Zstd level of every block. Level 1 looks too short a way back to find a
+/// transposed block's repeated columns, such as the coordinates a LAS scan
+/// keeps both as computed and as source values, 2 MB apart in a full chunk;
+/// level 3 finds them at about the same speed and decodes faster.
+const ZSTD_LEVEL: i32 = 3;
 
 /// Byte-column transposition preserves every bit, including IEEE floating-point
 /// representations and the original order used by PointRef/point labels.
@@ -13,7 +18,7 @@ pub(crate) fn pack(data: &[u8], stride: usize) -> Result<(BlockCodec, Vec<u8>)> 
     );
     ensure!(data.len() <= MAX_BLOCK_BYTES, "Block exceeds budget");
     let shuffled = transpose(data, data.len() / stride, stride);
-    let mut compressor = zstd::bulk::Compressor::new(1)?;
+    let mut compressor = zstd::bulk::Compressor::new(ZSTD_LEVEL)?;
     compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
     let compressed = compressor.compress(&shuffled)?;
     if compressed.len() >= data.len() {
@@ -120,7 +125,7 @@ fn transpose(data: &[u8], rows: usize, columns: usize) -> Vec<u8> {
 /// One Zstd frame of point labels; long runs of one layer shrink to almost nothing.
 pub(crate) fn pack_labels(labels: &[u8]) -> Result<Vec<u8>> {
     ensure!(labels.len() <= MAX_BLOCK_BYTES, "Block exceeds budget");
-    let mut compressor = zstd::bulk::Compressor::new(3)?;
+    let mut compressor = zstd::bulk::Compressor::new(ZSTD_LEVEL)?;
     compressor.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
     Ok(compressor.compress(labels)?)
 }

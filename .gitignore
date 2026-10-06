@@ -2,3 +2,5 @@
 /work-data/
 *.tmp
 /*.e57
+/*.las
+/*.laz
