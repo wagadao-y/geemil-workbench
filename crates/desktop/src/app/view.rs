@@ -290,8 +290,10 @@ fn load(
 }
 
 impl Workbench {
+    /// Also while a job runs: the view keeps showing the state the job started
+    /// from, whose files jobs never change or remove.
     pub(super) fn request_view(&mut self) {
-        if self.job.is_some() || self.smoke.colors {
+        if self.smoke.colors {
             return;
         }
         if self.camera != self.last_camera {
