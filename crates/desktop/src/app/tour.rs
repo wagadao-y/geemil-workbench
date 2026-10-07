@@ -75,10 +75,12 @@ fn draw_marker(painter: &egui::Painter, at: egui::Pos2, name: &str, hovered: boo
 }
 
 impl Workbench {
-    /// Placed panoramas and where they are in the project frame.
+    /// Placed panoramas whose markers are not hidden in the tree, and where
+    /// they are in the project frame.
     fn placed_panoramas(&self, p: &Project) -> Vec<(Uuid, DMat4)> {
         p.panoramas()
             .filter(|pano| p.registration(pano.id).is_some())
+            .filter(|pano| !self.hidden_panoramas.contains(&pano.id))
             .map(|pano| (pano.id, p.correction(pano.id)))
             .collect()
     }

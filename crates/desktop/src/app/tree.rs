@@ -274,6 +274,19 @@ impl Workbench {
             .filter(|id| self.tree_selection.items.contains(id))
             .collect()
     }
+    /// The scans and panoramas of the selection when it holds `item`, else
+    /// of `item`, inside selected folders too: what visibility and the bulk
+    /// rename apply to.
+    fn context_shown(&self, p: &Project, item: Uuid) -> Vec<Uuid> {
+        let mut ids = self.context_scans(p, item);
+        let items = self.context_items(p, item);
+        ids.extend(
+            p.panoramas()
+                .map(|pano| pano.id)
+                .filter(|id| items.iter().any(|item| within(p, *id, *item))),
+        );
+        ids
+    }
     fn context_scans(&self, p: &Project, item: Uuid) -> Vec<Uuid> {
         self.context_items(p, item)
             .into_iter()
@@ -419,12 +432,22 @@ impl Workbench {
             let (_, header, body) = state
                 .show_header(ui, |ui| {
                     let (inside, points) = self.folder_summary.get(group.id);
-                    let shown = inside.iter().filter(|s| self.visible.contains(s)).count();
-                    let mut all = !inside.is_empty() && shown == inside.len();
-                    let checkbox = egui::Checkbox::new(&mut all, "")
-                        .indeterminate(shown > 0 && shown < inside.len());
+                    let panoramas: Vec<Uuid> = p
+                        .panoramas()
+                        .map(|pano| pano.id)
+                        .filter(|id| within(p, *id, group.id))
+                        .collect();
+                    let shown = inside.iter().filter(|s| self.visible.contains(s)).count()
+                        + panoramas
+                            .iter()
+                            .filter(|id| !self.hidden_panoramas.contains(id))
+                            .count();
+                    let total = inside.len() + panoramas.len();
+                    let mut all = total > 0 && shown == total;
+                    let checkbox =
+                        egui::Checkbox::new(&mut all, "").indeterminate(shown > 0 && shown < total);
                     if ui.add(checkbox).changed() {
-                        actions.push(TreeAction::SetVisible(self.context_scans(p, group.id), all));
+                        actions.push(TreeAction::SetVisible(self.context_shown(p, group.id), all));
                     }
                     let label = format!("{} {}", icon::FOLDER, group.name);
                     let row = self.tree_row(ui, p, group.id, label, actions);
@@ -452,7 +475,7 @@ impl Workbench {
                             }
                             self.bulk_rename_menu(ui, p, group.id, actions);
                             ui.separator();
-                            self.visibility_menu(ui, self.context_scans(p, group.id), actions);
+                            self.visibility_menu(ui, self.context_shown(p, group.id), actions);
                             ui.separator();
                             self.remove_menu(ui, p, group.id, actions);
                             ui.separator();
@@ -496,7 +519,7 @@ impl Workbench {
                 let mut shown = self.visible.contains(&scan.id);
                 if ui.checkbox(&mut shown, "").changed() {
                     actions.push(TreeAction::SetVisible(
-                        self.context_scans(p, scan.id),
+                        self.context_shown(p, scan.id),
                         shown,
                     ));
                 }
@@ -514,7 +537,7 @@ impl Workbench {
                         self.bulk_rename_menu(ui, p, scan.id, actions);
                         self.move_menu(ui, p, scan.id, actions);
                         ui.separator();
-                        self.visibility_menu(ui, self.context_scans(p, scan.id), actions);
+                        self.visibility_menu(ui, self.context_shown(p, scan.id), actions);
                         ui.separator();
                         self.remove_menu(ui, p, scan.id, actions);
                         ui.separator();
@@ -532,8 +555,11 @@ impl Workbench {
             let id = panorama.id;
             order.push(id);
             ui.horizontal(|ui| {
-                // In line with the scans after their checkboxes.
-                ui.add_space(ui.spacing().icon_width + ui.spacing().item_spacing.x);
+                // Shows or hides its marker.
+                let mut shown = !self.hidden_panoramas.contains(&id);
+                if ui.checkbox(&mut shown, "").changed() {
+                    actions.push(TreeAction::SetVisible(self.context_shown(p, id), shown));
+                }
                 let label = format!("{} {}", icon::PANORAMA, p.panorama_name(panorama));
                 let row = self.tree_row(ui, p, id, label, actions);
                 let hover = format!(
@@ -556,6 +582,8 @@ impl Workbench {
                     }
                     self.bulk_rename_menu(ui, p, id, actions);
                     self.move_menu(ui, p, id, actions);
+                    ui.separator();
+                    self.visibility_menu(ui, self.context_shown(p, id), actions);
                     ui.separator();
                     self.remove_menu(ui, p, id, actions);
                     ui.separator();
@@ -658,14 +686,7 @@ impl Workbench {
         item: Uuid,
         actions: &mut Vec<TreeAction>,
     ) {
-        let mut scans = self.context_scans(p, item);
-        // Panoramas of the selection, inside selected folders too.
-        let items = self.context_items(p, item);
-        scans.extend(
-            p.panoramas()
-                .map(|pano| pano.id)
-                .filter(|id| items.iter().any(|item| within(p, *id, *item))),
-        );
+        let scans = self.context_shown(p, item);
         if scans.len() > 1
             && ui
                 .button(format!(
@@ -766,23 +787,40 @@ impl Workbench {
                 self.transform_edit = TransformEdit::default();
             }
             TreeAction::SetVisible(ids, shown) => {
+                let panoramas = self.panorama_ids();
                 for id in ids {
-                    if shown {
-                        self.visible.insert(id);
+                    // Scans load their points; panoramas show their marker.
+                    let (set, add) = if panoramas.contains(&id) {
+                        (&mut self.hidden_panoramas, !shown)
                     } else {
-                        self.visible.remove(&id);
+                        (&mut self.visible, shown)
+                    };
+                    if add {
+                        set.insert(id);
+                    } else {
+                        set.remove(&id);
                     }
                 }
                 self.visibility_changed();
             }
             TreeAction::ShowOnly(ids) => {
-                self.visible = ids.into_iter().collect();
+                let panoramas = self.panorama_ids();
+                self.hidden_panoramas = panoramas
+                    .iter()
+                    .copied()
+                    .filter(|id| !ids.contains(id))
+                    .collect();
+                self.visible = ids
+                    .into_iter()
+                    .filter(|id| !panoramas.contains(id))
+                    .collect();
                 self.visibility_changed();
             }
             TreeAction::ShowAll => {
                 if let Some(p) = &self.project {
                     self.visible = p.scans().map(|s| s.id).collect();
                 }
+                self.hidden_panoramas.clear();
                 self.visibility_changed();
             }
             TreeAction::Move(ids, target) => {
@@ -809,6 +847,13 @@ impl Workbench {
                 self.apply_edit(|p| p.remove_items(&ids));
             }
         }
+    }
+    /// The panoramas of the current state.
+    fn panorama_ids(&self) -> BTreeSet<Uuid> {
+        self.project
+            .as_ref()
+            .map(|p| p.panoramas().map(|pano| pano.id).collect())
+            .unwrap_or_default()
     }
     fn visibility_changed(&mut self) {
         self.view.invalidate();

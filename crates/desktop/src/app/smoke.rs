@@ -49,7 +49,8 @@ pub struct SmokeOptions {
     /// panorama-apply, panorama-link (linked camera and overlay) and
     /// panorama-view:YAW:PITCH:FOV or panorama-view:flat (the photo viewer),
     /// tree-fold (fold the project tree), navigate (camera mode), tour
-    /// (view the first placed panorama) and tour-exit.
+    /// (view the first placed panorama), tour-exit and hide-panorama (hide
+    /// the first panorama's marker).
     pub script: Vec<String>,
 }
 
@@ -666,6 +667,16 @@ impl Workbench {
             }
             "tree-fold" => self.settings.tree_collapsed = true,
             "tour" => self.smoke_tour(),
+            "hide-panorama" => {
+                // The first panorama's marker, as its tree checkbox does.
+                if let Some(id) = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.panoramas().next().map(|pano| pano.id))
+                {
+                    self.hidden_panoramas.insert(id);
+                }
+            }
             "tour-exit" => self.exit_tour(),
             "navigate" => self.set_tool(super::selection::Tool::Navigate),
             "panorama-link" => {

@@ -144,6 +144,8 @@ pub struct Workbench {
     renderer: Option<PointRenderer>,
     camera: Camera,
     visible: BTreeSet<Uuid>,
+    /// Panoramas whose markers are hidden; new ones show.
+    hidden_panoramas: BTreeSet<Uuid>,
     /// The scan or folder selected in the tree.
     selected: Option<Uuid>,
     /// An item selected outside the tree, which the tree opens its folders
@@ -231,6 +233,7 @@ impl Workbench {
             renderer: Some(PointRenderer::new(rs.device.clone(), rs.queue.clone())),
             camera: Camera::default(),
             visible: BTreeSet::new(),
+            hidden_panoramas: BTreeSet::new(),
             selected: None,
             reveal: None,
             tree_selection: tree::TreeSelection::default(),
@@ -305,6 +308,9 @@ impl Workbench {
             .chain(project.panoramas().map(|p| p.id))
             .collect();
         carry_scan_state(&mut self.visible, previous.as_deref(), &scans);
+        if previous.is_none() {
+            self.hidden_panoramas.clear();
+        }
         if previous.is_none() {
             self.tree_selection = tree::TreeSelection::default();
             self.selected = None;
