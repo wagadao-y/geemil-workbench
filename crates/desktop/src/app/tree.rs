@@ -554,6 +554,7 @@ impl Workbench {
                     {
                         actions.push(TreeAction::Rename(id, p.panorama_name(panorama).into()));
                     }
+                    self.bulk_rename_menu(ui, p, id, actions);
                     self.move_menu(ui, p, id, actions);
                     ui.separator();
                     self.remove_menu(ui, p, id, actions);
@@ -657,7 +658,14 @@ impl Workbench {
         item: Uuid,
         actions: &mut Vec<TreeAction>,
     ) {
-        let scans = self.context_scans(p, item);
+        let mut scans = self.context_scans(p, item);
+        // Panoramas of the selection, inside selected folders too.
+        let items = self.context_items(p, item);
+        scans.extend(
+            p.panoramas()
+                .map(|pano| pano.id)
+                .filter(|id| items.iter().any(|item| within(p, *id, *item))),
+        );
         if scans.len() > 1
             && ui
                 .button(format!(
@@ -1062,34 +1070,41 @@ pub(super) struct RenameRow {
     pub(super) new: String,
 }
 
-/// Rows for `scans` in the order the tree shows them.
-pub(super) fn rename_rows(p: &Project, scans: &[Uuid]) -> Vec<RenameRow> {
+/// Rows for `items` (scans and panoramas) in the order the tree shows them.
+pub(super) fn rename_rows(p: &Project, items: &[Uuid]) -> Vec<RenameRow> {
     let mut order = vec![];
     tree_scans(p, None, &mut order);
     order
         .into_iter()
-        .filter(|id| scans.contains(id))
-        .filter_map(|id| p.scan(id))
-        .map(|scan| RenameRow {
-            id: scan.id,
-            folder: p
-                .parent_of(scan.id)
-                .and_then(|id| p.groups().iter().find(|g| g.id == id))
-                .map_or(String::new(), |g| g.name.clone()),
-            old: p.scan_name(scan).to_owned(),
-            new: String::new(),
+        .filter(|id| items.contains(id))
+        .filter_map(|id| {
+            let name = match (p.scan(id), p.panorama(id)) {
+                (Some(scan), _) => p.scan_name(scan),
+                (_, Some(panorama)) => p.panorama_name(panorama),
+                _ => return None,
+            };
+            Some(RenameRow {
+                id,
+                folder: p
+                    .parent_of(id)
+                    .and_then(|id| p.groups().iter().find(|g| g.id == id))
+                    .map_or(String::new(), |g| g.name.clone()),
+                old: name.to_owned(),
+                new: String::new(),
+            })
         })
         .collect()
 }
 
-/// The scans below `parent` as the tree shows them: each folder's contents
-/// first, then the scans at this level.
+/// The scans and panoramas below `parent` as the tree shows them: each
+/// folder's contents first, then the scans and the panoramas at this level.
 fn tree_scans(p: &Project, parent: Option<Uuid>, order: &mut Vec<Uuid>) {
     let (groups, scans) = p.children(parent);
     for group in groups {
         tree_scans(p, Some(group.id), order);
     }
     order.extend(scans.iter().map(|s| s.id));
+    order.extend(p.panoramas_in(parent).iter().map(|pano| pano.id));
 }
 
 /// The rows as tab-separated lines under `header`, which spreadsheets paste

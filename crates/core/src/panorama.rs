@@ -395,25 +395,8 @@ impl Project {
     }
     /// Renames a panorama. A name equal to the imported one keeps no rename.
     pub fn rename_panorama(&mut self, id: Uuid, name: &str) -> Result<()> {
-        let name = name.trim();
-        ensure!(!name.is_empty(), "Empty panorama name");
-        let panorama = self.panorama(id).context("Missing panorama")?;
-        if self.panorama_name(panorama) == name {
-            return Ok(());
-        }
-        let imported = panorama.name == name;
-        let name = name.to_owned();
-        self.edit(
-            json!({"kind": "rename_panorama", "id": id, "name": name}),
-            |s| {
-                if imported {
-                    s.scan_names.remove(&id);
-                } else {
-                    s.scan_names.insert(id, name);
-                }
-                Ok(())
-            },
-        )
+        ensure!(self.panorama(id).is_some(), "Missing panorama");
+        self.rename_scans(&[(id, name.to_owned())])
     }
     /// Places a panorama: sets its own transform to `own`, keeps the
     /// correspondences it was found with and records the fit. One edit.

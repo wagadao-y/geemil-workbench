@@ -305,23 +305,25 @@ impl Project {
             .get(&scan.id)
             .map_or(&scan.name, |name| name)
     }
-    /// Renames scans in one edit. Names are trimmed; a scan given its
-    /// imported name again keeps no rename.
+    /// Renames scans and panoramas in one edit. Names are trimmed; one given
+    /// its imported name again keeps no rename.
     pub fn rename_scans(&mut self, names: &[(Uuid, String)]) -> Result<()> {
         let mut renamed = serde_json::Map::new();
         let mut changes = vec![];
         for (id, name) in names {
             let name = name.trim();
             ensure!(!name.is_empty(), "Empty scan name");
-            let scan = self
-                .scan(*id)
-                .ok_or_else(|| anyhow::anyhow!("Missing scan"))?;
-            if self.scan_name(scan) == name {
+            let (current, imported) = match (self.scan(*id), self.panorama(*id)) {
+                (Some(scan), _) => (self.scan_name(scan), &scan.name),
+                (_, Some(panorama)) => (self.panorama_name(panorama), &panorama.name),
+                _ => anyhow::bail!("Missing scan"),
+            };
+            if current == name {
                 continue;
             }
             renamed.insert(id.to_string(), json!(name));
-            // None returns the scan to its imported name.
-            changes.push((*id, (scan.name != name).then(|| name.to_owned())));
+            // None returns it to its imported name.
+            changes.push((*id, (imported != name).then(|| name.to_owned())));
         }
         if changes.is_empty() {
             return Ok(());

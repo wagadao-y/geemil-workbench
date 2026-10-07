@@ -195,7 +195,11 @@ impl Workbench {
                 "cleanup" => Some(Dialog::Cleanup),
                 "scatter" => Some(Dialog::Scatter),
                 "bulk-rename" => self.project.as_ref().map(|p| {
-                    let scans: Vec<_> = p.scans().map(|s| s.id).collect();
+                    let scans: Vec<_> = p
+                        .scans()
+                        .map(|s| s.id)
+                        .chain(p.panoramas().map(|pano| pano.id))
+                        .collect();
                     Dialog::BulkRename {
                         rows: super::tree::rename_rows(p, &scans),
                     }

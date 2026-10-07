@@ -93,6 +93,14 @@ fn panoramas_are_placed_kept_in_folders_exported_and_cleaned_up() {
     p.set_transform(folder, lift).unwrap();
     let placed = lift.matrix() * truth;
     assert!(p.correction(id).abs_diff_eq(placed, 1e-6));
+    // Renamed with scans in one edit, and back to the imported name.
+    let first = p.scans().next().unwrap().id;
+    p.rename_scans(&[(first, "North".into()), (id, "Hall".into())])
+        .unwrap();
+    assert_eq!(p.panorama_name(p.panorama(id).unwrap()), "Hall");
+    assert_eq!(p.scan_name(p.scan(first).unwrap()), "North");
+    p.rename_scans(&[(id, "room".into())]).unwrap();
+    assert!(!p.current().scan_names.contains_key(&id));
     p.rename_panorama(id, " Living room ").unwrap();
     let reopened = Project::load(&p.root).unwrap();
     assert_eq!(
