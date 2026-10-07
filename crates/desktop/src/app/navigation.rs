@@ -61,7 +61,7 @@ impl Workbench {
     pub(super) fn camera_input(&mut self, ctx: &egui::Context, response: &egui::Response) {
         self.flying =
             response.is_pointer_button_down_on() && ctx.input(|i| i.pointer.secondary_down());
-        if self.crop.dragging() {
+        if self.crop.dragging() || self.panorama_look(ctx, response) {
             return;
         }
         let mut moved = false;

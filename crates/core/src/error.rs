@@ -77,6 +77,12 @@ pub enum CoreError {
     AlignmentUndetermined,
     /// Moving object removal needs scans that know where their scanner stood.
     NoScannerPositions,
+    /// Panoramas must be JPEG or PNG.
+    UnsupportedImageFormat,
+    /// Not twice as wide as high: width and height.
+    NotEquirectangular(u32, u32),
+    /// Placing a panorama needs at least this many correspondences.
+    TooFewPanoramaPairs(usize),
 }
 impl CoreError {
     pub fn find(error: &anyhow::Error) -> Option<&Self> {
@@ -113,6 +119,13 @@ impl fmt::Display for CoreError {
                 write!(f, "The overlap does not determine the alignment")
             }
             Self::NoScannerPositions => write!(f, "No scan has a scanner position"),
+            Self::UnsupportedImageFormat => write!(f, "Supported panorama formats: JPEG, PNG"),
+            Self::NotEquirectangular(w, h) => {
+                write!(f, "A {w} x {h} image is not equirectangular (2:1)")
+            }
+            Self::TooFewPanoramaPairs(n) => {
+                write!(f, "Placing a panorama needs {n} or more correspondences")
+            }
         }
     }
 }

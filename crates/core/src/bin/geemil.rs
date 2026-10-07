@@ -23,12 +23,23 @@ fn main() -> Result<()> {
                 )?
             };
             for file in &args[2..] {
-                project.import_file(Path::new(file), ImportOptions::default(), &job)?;
+                let file = Path::new(file);
+                let extension = file
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase();
+                if matches!(extension.as_str(), "jpg" | "jpeg" | "png") {
+                    project.import_panorama(file)?;
+                } else {
+                    project.import_file(file, ImportOptions::default(), &job)?;
+                }
             }
             println!(
-                "{} scans, {} images",
+                "{} scans, {} images, {} panoramas",
                 project.scans().count(),
-                project.manifest.images.len()
+                project.manifest.images.len(),
+                project.panoramas().count()
             );
         }
         Some("inspect") if args.len() == 2 => {
@@ -44,6 +55,19 @@ fn main() -> Result<()> {
                 );
             }
             println!("{} images", p.manifest.images.len());
+            for panorama in p.panoramas() {
+                let place = p
+                    .correction(panorama.id)
+                    .transform_point3(glam::DVec3::ZERO);
+                println!(
+                    "panorama {}: {} x {}, at {:.3?}, {} correspondences",
+                    p.panorama_name(panorama),
+                    panorama.width,
+                    panorama.height,
+                    place.to_array(),
+                    p.panorama_pairs(panorama.id).len()
+                );
+            }
             let counts = p.layer_counts();
             for layer in &p.current().layers {
                 println!(

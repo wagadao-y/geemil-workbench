@@ -809,6 +809,12 @@ impl Workbench {
                 self.dialog = None;
                 if self.project.as_ref().is_some_and(|p| p.scan(id).is_some()) {
                     self.apply_edit(|p| p.rename_scans(&[(id, name)]));
+                } else if self
+                    .project
+                    .as_ref()
+                    .is_some_and(|p| p.panorama(id).is_some())
+                {
+                    self.apply_edit(|p| p.rename_panorama(id, &name));
                 } else {
                     self.apply_edit(|p| p.rename_group(id, name));
                 }

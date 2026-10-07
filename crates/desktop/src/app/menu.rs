@@ -69,6 +69,8 @@ impl Workbench {
                     self.menu_item(ui, Action::NewFolder, &mut chosen);
                 });
                 ui.menu_button(t.menu_view, |ui| {
+                    self.menu_item(ui, Action::ToggleTree, &mut chosen);
+                    ui.separator();
                     self.menu_item(ui, Action::FitView, &mut chosen);
                     for preset in [
                         ViewPreset::Top,
@@ -251,6 +253,9 @@ impl Workbench {
                 }
                 Tool::Transform => {
                     ui.weak(t.hint_transform);
+                }
+                Tool::Panorama => {
+                    ui.weak(t.hint_panorama);
                 }
                 Tool::Measure => {
                     match self.measure.distance() {

@@ -23,6 +23,7 @@ impl Workbench {
                 self.selection_input(&response);
                 self.measure_input(&response);
                 self.align_input(&response);
+                self.panorama_input(&response);
             }
             let aspect = (size.x / size.y) as f64;
             if (self.camera.aspect - aspect).abs() > 1e-6 {
@@ -74,6 +75,7 @@ impl Workbench {
             self.draw_selection(ui, &response);
             self.draw_measure(ui, rect);
             self.draw_align(ui, rect);
+            self.draw_panorama(ui, rect);
             self.draw_box(ui, rect);
             self.draw_gizmo(ui, rect);
             self.draw_pivot(ui, &response);

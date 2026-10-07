@@ -604,7 +604,9 @@ impl Project {
             serde_json::json!({"kind": "transform", "id": id, "pose": pose}),
             |s| {
                 ensure!(
-                    s.scans.contains(&id) || s.groups.iter().any(|g| g.id == id),
+                    s.scans.contains(&id)
+                        || s.panoramas.contains(&id)
+                        || s.groups.iter().any(|g| g.id == id),
                     "Missing scan or folder"
                 );
                 if pose == Pose::default() {

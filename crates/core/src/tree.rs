@@ -61,13 +61,19 @@ fn is_within(state: &Revision, id: Uuid, ancestor: Uuid) -> bool {
 fn remove_scans(state: &mut Revision, ids: &[Uuid]) -> Result<()> {
     for id in ids {
         ensure!(state.scans.contains(id), "Missing scan");
-        state.scan_groups.remove(id);
-        state.transforms.remove(id);
-        state.registrations.remove(id);
-        state.scan_names.remove(id);
+        forget(state, *id);
     }
     state.scans.retain(|id| !ids.contains(id));
     Ok(())
+}
+
+/// Drops what `state` keeps about a scan or panorama besides membership.
+fn forget(state: &mut Revision, id: Uuid) {
+    state.scan_groups.remove(&id);
+    state.transforms.remove(&id);
+    state.registrations.remove(&id);
+    state.scan_names.remove(&id);
+    state.panorama_pairs.remove(&id);
 }
 
 /// Moves `id` into `target` and adjusts its own transform to keep its place.
@@ -110,6 +116,13 @@ impl Project {
     }
     pub fn groups(&self) -> &[Group] {
         &self.current().groups
+    }
+    /// Panoramas directly in `parent` (None: top level), in import order.
+    pub fn panoramas_in(&self, parent: Option<Uuid>) -> Vec<&crate::Panorama> {
+        let state = self.current();
+        self.panoramas()
+            .filter(|p| state.scan_groups.get(&p.id).copied() == parent)
+            .collect()
     }
     /// Folders and scans directly in `parent` (None: top level), in display order.
     pub fn children(&self, parent: Option<Uuid>) -> (Vec<&Group>, Vec<&Scan>) {
@@ -185,7 +198,10 @@ impl Project {
                 );
                 for &id in ids {
                     let is_group = s.groups.iter().any(|g| g.id == id);
-                    ensure!(is_group || s.scans.contains(&id), "Missing scan or folder");
+                    ensure!(
+                        is_group || s.scans.contains(&id) || s.panoramas.contains(&id),
+                        "Missing scan or folder"
+                    );
                     ensure!(
                         !is_group || target.is_none_or(|t| !is_within(s, t, id)),
                         "A folder cannot move into itself"
@@ -234,17 +250,25 @@ impl Project {
             remove_scans(s, ids)
         })
     }
-    /// Takes scans and folders out of the working state in one edit, the
-    /// folders with everything in them. Scan data stays until cleanup, so
-    /// undo can bring it all back.
+    /// Takes scans, panoramas and folders out of the working state in one
+    /// edit, the folders with everything in them. Their data stays until
+    /// cleanup, so undo can bring it all back.
     pub fn remove_items(&mut self, ids: &[Uuid]) -> Result<()> {
         let state = self.current();
         for id in ids {
             ensure!(
-                state.scans.contains(id) || state.groups.iter().any(|g| g.id == *id),
+                state.scans.contains(id)
+                    || state.panoramas.contains(id)
+                    || state.groups.iter().any(|g| g.id == *id),
                 "Missing scan or folder"
             );
         }
+        let panoramas: Vec<Uuid> = state
+            .panoramas
+            .iter()
+            .copied()
+            .filter(|p| ids.iter().any(|id| is_within(state, *p, *id)))
+            .collect();
         let folders: Vec<Uuid> = state
             .groups
             .iter()
@@ -261,6 +285,10 @@ impl Project {
             json!({"kind": "remove_items", "items": ids, "scans": scans}),
             |s| {
                 remove_scans(s, &scans)?;
+                for id in &panoramas {
+                    forget(s, *id);
+                }
+                s.panoramas.retain(|id| !panoramas.contains(id));
                 s.groups.retain(|g| !folders.contains(&g.id));
                 for id in &folders {
                     s.transforms.remove(id);

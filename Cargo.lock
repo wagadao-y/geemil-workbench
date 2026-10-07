@@ -819,6 +819,7 @@ dependencies = [
  "bytemuck",
  "e57",
  "glam",
+ "image",
  "las",
  "serde",
  "serde_json",
@@ -1034,6 +1035,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

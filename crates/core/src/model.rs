@@ -224,6 +224,41 @@ pub struct ImageInfo {
     pub pose: Option<Pose>,
     pub projection: String,
 }
+/// The file format of a panorama.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PanoramaFormat {
+    Jpeg,
+    Png,
+}
+/// An equirectangular photo placed in the project, taken apart from any
+/// scan. Its own transform, kept in `Revision::transforms` under its id like
+/// a scan's, places it: in the panorama's frame the image centre looks along
+/// +X with +Z up, and azimuth grows to the left, as E57 spherical images
+/// have it. Never changes once written.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Panorama {
+    pub id: Uuid,
+    /// For E57 export.
+    pub guid: String,
+    pub name: String,
+    pub source_name: String,
+    /// The imported file as it was, project-relative.
+    pub file: String,
+    pub format: PanoramaFormat,
+    pub width: u32,
+    pub height: u32,
+}
+/// A correspondence between a panorama and the points: a pixel of the
+/// photo and the scan point seen there.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PanoramaPair {
+    /// Image coordinates with (0, 0) the top left corner of the top left pixel.
+    pub pixel: [f64; 2],
+    pub scan: Uuid,
+    /// In scan coordinates, which stay valid however the scan moves.
+    pub local: [f64; 3],
+}
 /// The layer every point starts in. It cannot be removed.
 pub const DEFAULT_LAYER: u8 = 0;
 
@@ -336,10 +371,11 @@ pub struct Revision {
     /// Additional rigid transforms of scans and groups.
     pub transforms: BTreeMap<Uuid, Pose>,
     pub groups: Vec<Group>,
-    /// The folder of each scan in `groups`; absent scans are at the top level.
+    /// The folder of each scan and panorama in `groups`; absent ones are at
+    /// the top level.
     pub scan_groups: BTreeMap<Uuid, Uuid>,
-    /// Names given to scans, by id; other scans keep their imported name.
-    /// Scan metadata never changes once written, so renames live here.
+    /// Names given to scans and panoramas, by id; others keep their imported
+    /// name. Their metadata never changes once written, so renames live here.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scan_names: BTreeMap<Uuid, String>,
     /// Unix seconds when the user saved this revision.
@@ -348,6 +384,12 @@ pub struct Revision {
     /// How scans and folders were last aligned, by id.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub registrations: BTreeMap<Uuid, Registration>,
+    /// Panoramas in this state, in import order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub panoramas: Vec<Uuid>,
+    /// The correspondences each panorama was last placed with.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub panorama_pairs: BTreeMap<Uuid, Vec<PanoramaPair>>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -357,12 +399,15 @@ pub enum RegistrationMethod {
     Icp,
     /// All scans adjusted together.
     Global,
+    /// A panorama placed by pixels and the points seen there.
+    Panorama,
 }
 /// How well an alignment fits its reference.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct AlignmentFit {
     pub method: RegistrationMethod,
-    /// RMS in metres: of the picked pairs, else to the reference surface.
+    /// RMS in metres: of the picked pairs, else to the reference surface;
+    /// for a panorama the RMS angle in degrees.
     pub rms: f64,
     /// Fraction of the item's samples near the reference; not for pairs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -393,6 +438,7 @@ pub struct Manifest {
     pub name: String,
     pub scans: Vec<Scan>,
     pub images: Vec<ImageInfo>,
+    pub panoramas: Vec<Panorama>,
     pub patches: Vec<LabelPatch>,
     pub revisions: Vec<Revision>,
     /// The saved revision the project shows, or the working state is based on.
@@ -411,6 +457,8 @@ struct ManifestFile {
     name: String,
     scans: Vec<String>,
     images: Vec<ImageInfo>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    panoramas: Vec<Panorama>,
     labels: Vec<String>,
     revisions: Vec<StoredRevision>,
     current: Uuid,
@@ -484,6 +532,7 @@ impl Project {
                 name: name.into(),
                 scans: vec![],
                 images: vec![],
+                panoramas: vec![],
                 patches: vec![],
                 revisions: vec![Revision {
                     id,
@@ -503,6 +552,8 @@ impl Project {
                     saved_at: Some(crate::history::now()),
                     registrations: BTreeMap::new(),
                     scan_names: BTreeMap::new(),
+                    panoramas: vec![],
+                    panorama_pairs: BTreeMap::new(),
                 }],
                 current: id,
                 draft: None,
@@ -590,6 +641,7 @@ impl Project {
             name: file.name,
             scans,
             images: file.images,
+            panoramas: file.panoramas,
             patches,
             revisions,
             current: file.current,
@@ -634,6 +686,9 @@ impl Project {
         }
         for patch in &p.manifest.patches {
             p.path(&patch.file)?;
+        }
+        for panorama in &p.manifest.panoramas {
+            p.path(&panorama.file)?;
         }
         Ok(p)
     }
@@ -683,6 +738,7 @@ impl Project {
             name: m.name.clone(),
             scans,
             images: m.images.clone(),
+            panoramas: m.panoramas.clone(),
             labels,
             revisions,
             current: m.current,

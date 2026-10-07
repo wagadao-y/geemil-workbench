@@ -1012,6 +1012,10 @@ impl Project {
                 })?;
             }
             fs::remove_dir(&stage)?;
+            for panorama in self.panoramas() {
+                job.check()?;
+                write_panorama(self, panorama, &mut writer)?;
+            }
             writer.finalize()?;
             drop(writer);
             fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
@@ -1028,6 +1032,36 @@ impl Project {
         }
         result
     }
+}
+
+/// Writes a panorama as an E57 spherical image, posed where it is placed,
+/// with the imported file as its blob.
+fn write_panorama(
+    project: &Project,
+    panorama: &crate::Panorama,
+    writer: &mut E57Writer<File>,
+) -> Result<()> {
+    let mut out = writer.add_image(&panorama.guid)?;
+    out.set_name(project.panorama_name(panorama));
+    out.set_transform(Pose::from_matrix(project.correction(panorama.id)).to_e57());
+    let format = match panorama.format {
+        crate::PanoramaFormat::Jpeg => e57::ImageFormat::Jpeg,
+        crate::PanoramaFormat::Png => e57::ImageFormat::Png,
+    };
+    let mut file = BufReader::new(File::open(project.path(&panorama.file)?)?);
+    out.add_spherical(
+        format,
+        &mut file,
+        e57::SphericalImageProperties {
+            width: panorama.width,
+            height: panorama.height,
+            pixel_width: 2. * std::f64::consts::PI / panorama.width as f64,
+            pixel_height: std::f64::consts::PI / panorama.height as f64,
+        },
+        None,
+    )?;
+    out.finalize()?;
+    Ok(())
 }
 
 /// A tiny structured two-scan E57 with two independently posed images per scan.

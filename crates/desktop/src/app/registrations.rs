@@ -46,6 +46,7 @@ fn method_name(t: &Strings, method: RegistrationMethod) -> &'static str {
         RegistrationMethod::Pairs => t.registration_methods[0],
         RegistrationMethod::Icp => t.registration_methods[1],
         RegistrationMethod::Global => t.registration_methods[2],
+        RegistrationMethod::Panorama => t.registration_methods[3],
     }
 }
 fn time(at: u64) -> String {
@@ -60,6 +61,14 @@ fn time(at: u64) -> String {
 /// Several lines on an alignment, for a tooltip.
 fn describe(t: &Strings, p: &Project, state: &RegistrationState, item: Uuid) -> String {
     let fit = state.registration.fit;
+    if fit.method == RegistrationMethod::Panorama {
+        let mut text = (t.registration_panorama)(fit.rms, fit.references);
+        let _ = write!(text, "\n{}", time(state.registration.at));
+        if state.moved {
+            let _ = write!(text, "\n{}", t.panorama_moved);
+        }
+        return text;
+    }
     let mut text = (t.registration_summary)(
         method_name(t, fit.method),
         fit.rms,

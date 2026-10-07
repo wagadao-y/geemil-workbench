@@ -27,6 +27,8 @@ enum TreeAction {
     Ungroup(Vec<Uuid>),
     /// Take these scans and folders out, the folders with their contents.
     Remove(Vec<Uuid>),
+    /// Place this panorama with the panorama tool.
+    PlacePanorama(Uuid),
 }
 
 #[cfg(test)]
@@ -280,13 +282,40 @@ impl Workbench {
             .into_iter()
             .collect()
     }
+    /// The project tree, or a strip with a button to open it when folded.
     pub(super) fn side_panel(&mut self, ui: &mut egui::Ui) {
         let t = self.t;
-        egui::Panel::left("project")
-            .resizable(true)
-            .default_size(300.)
-            .show(ui, |ui| {
+        let mut expanded = !self.settings.tree_collapsed;
+        let mut toggle = false;
+        egui::Panel::show_switched(
+            ui,
+            &mut expanded,
+            egui::Panel::left("project folded")
+                .resizable(false)
+                .exact_size(32.),
+            egui::Panel::left("project")
+                .resizable(true)
+                .default_size(300.),
+            |ui, open| {
+                if !open {
+                    ui.add_space(4.);
+                    toggle = ui
+                        .small_button(icon::CARET_DOUBLE_RIGHT)
+                        .on_hover_text(t.tree_expand)
+                        .clicked();
+                    ui.add_space(4.);
+                    ui.label(icon::TREE_STRUCTURE).on_hover_text(t.tree_expand);
+                    return;
+                }
                 let Some(p) = self.project.clone() else {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            toggle = ui
+                                .small_button(icon::CARET_DOUBLE_LEFT)
+                                .on_hover_text(t.tree_collapse)
+                                .clicked();
+                        });
+                    });
                     ui.add_space(8.);
                     ui.label(t.no_project_hint);
                     return;
@@ -297,6 +326,10 @@ impl Workbench {
                 ui.horizontal(|ui| {
                     ui.strong(format!("{} {}", icon::TREE_STRUCTURE, p.manifest.name));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        toggle = ui
+                            .small_button(icon::CARET_DOUBLE_LEFT)
+                            .on_hover_text(t.tree_collapse)
+                            .clicked();
                         if ui
                             .small_button(icon::FOLDER_SIMPLE_PLUS)
                             .on_hover_text(t.new_folder)
@@ -355,7 +388,10 @@ impl Workbench {
                 for action in layer_actions {
                     self.layer_action(&ctx, action);
                 }
-            });
+            },
+        );
+        // Dragging the edge past its limit folds the tree as well.
+        self.settings.tree_collapsed = !(expanded ^ toggle);
     }
 
     fn tree_level(
@@ -490,6 +526,46 @@ impl Workbench {
                         }
                     });
                 self.registration_mark(ui, p, scan.id);
+            });
+        }
+        for panorama in p.panoramas_in(parent) {
+            let id = panorama.id;
+            order.push(id);
+            ui.horizontal(|ui| {
+                // In line with the scans after their checkboxes.
+                ui.add_space(ui.spacing().icon_width + ui.spacing().item_spacing.x);
+                let label = format!("{} {}", icon::PANORAMA, p.panorama_name(panorama));
+                let row = self.tree_row(ui, p, id, label, actions);
+                let hover = format!(
+                    "{} × {}・{}",
+                    panorama.width, panorama.height, panorama.source_name
+                );
+                row.on_hover_text(hover).context_menu(|ui| {
+                    if ui
+                        .button(format!("{} {}", icon::PANORAMA, t.panorama_place))
+                        .clicked()
+                    {
+                        actions.push(TreeAction::PlacePanorama(id));
+                    }
+                    if self.context_items(p, id) == [id]
+                        && ui
+                            .button(format!("{} {}", icon::PENCIL_SIMPLE, t.rename))
+                            .clicked()
+                    {
+                        actions.push(TreeAction::Rename(id, p.panorama_name(panorama).into()));
+                    }
+                    self.move_menu(ui, p, id, actions);
+                    ui.separator();
+                    self.remove_menu(ui, p, id, actions);
+                    ui.separator();
+                    if ui
+                        .button(format!("{} {}", icon::INFO, t.properties))
+                        .clicked()
+                    {
+                        actions.push(TreeAction::Properties(id));
+                    }
+                });
+                self.registration_mark(ui, p, id);
             });
         }
     }
@@ -652,7 +728,21 @@ impl Workbench {
     }
     fn tree_action(&mut self, action: TreeAction) {
         match action {
-            TreeAction::Focus(id) => self.focus_tree_item(id),
+            TreeAction::Focus(id) => {
+                if self
+                    .project
+                    .as_ref()
+                    .is_some_and(|p| p.panorama(id).is_some())
+                {
+                    self.set_tool(super::selection::Tool::Panorama);
+                } else {
+                    self.focus_tree_item(id);
+                }
+            }
+            TreeAction::PlacePanorama(id) => {
+                self.select_tree_item(Some(id));
+                self.set_tool(super::selection::Tool::Panorama);
+            }
             TreeAction::Select(id, modifiers) => {
                 self.tree_selection.select(id, modifiers);
                 self.selected = self
@@ -810,6 +900,40 @@ impl Workbench {
                     }
                 });
             }
+        } else if let Some(panorama) = p.panorama(id) {
+            egui::Grid::new("panorama properties")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    ui.label(t.prop_name);
+                    ui.horizontal(|ui| {
+                        ui.label(p.panorama_name(panorama));
+                        if ui
+                            .small_button(icon::PENCIL_SIMPLE)
+                            .on_hover_text(t.rename)
+                            .clicked()
+                        {
+                            actions.push(TreeAction::Rename(id, p.panorama_name(panorama).into()));
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(t.prop_source);
+                    ui.label(&panorama.source_name);
+                    ui.end_row();
+                    ui.label(t.panorama_size);
+                    ui.label(format!("{} × {}", panorama.width, panorama.height));
+                    ui.end_row();
+                    ui.label(t.panorama_pairs);
+                    ui.label(p.panorama_pairs(id).len().to_string());
+                    ui.end_row();
+                    ui.label(t.panorama_position);
+                    if p.registration(id).is_some() {
+                        let at = p.correction(id).transform_point3(glam::DVec3::ZERO);
+                        ui.label(format!("{:.3}, {:.3}, {:.3}", at.x, at.y, at.z));
+                    } else {
+                        ui.weak(t.panorama_unplaced);
+                    }
+                    ui.end_row();
+                });
         } else if let Some(group) = p.groups().iter().find(|g| g.id == id) {
             self.folder_summary.update(p);
             let (inside, points) = self.folder_summary.get(id);

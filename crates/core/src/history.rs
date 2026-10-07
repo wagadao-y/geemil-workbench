@@ -51,18 +51,33 @@ pub(crate) fn validate_state(manifest: &Manifest, state: &Revision) -> Result<()
             steps += 1;
         }
     }
+    let panoramas: BTreeSet<_> = state.panoramas.iter().collect();
+    ensure!(
+        panoramas.len() == state.panoramas.len(),
+        "Duplicate panorama"
+    );
+    for id in &state.panoramas {
+        ensure!(
+            manifest.panoramas.iter().any(|p| p.id == *id),
+            "State refers to a missing panorama"
+        );
+    }
+    let item = |id: &Uuid| state.scans.contains(id) || panoramas.contains(id);
     for (scan, group) in &state.scan_groups {
         ensure!(
-            state.scans.contains(scan) && groups.contains(group),
+            item(scan) && groups.contains(group),
             "Scan folder refers to a missing scan or folder"
         );
     }
     for (scan, name) in &state.scan_names {
-        ensure!(
-            state.scans.contains(scan),
-            "Scan name refers to a missing scan"
-        );
+        ensure!(item(scan), "Scan name refers to a missing scan");
         ensure!(!name.trim().is_empty(), "Empty scan name");
+    }
+    for id in state.panorama_pairs.keys() {
+        ensure!(
+            panoramas.contains(id),
+            "Correspondences refer to a missing panorama"
+        );
     }
     Ok(())
 }
@@ -73,6 +88,7 @@ pub struct CleanupReport {
     pub scans: usize,
     /// Label patches no longer used.
     pub labels: usize,
+    pub panoramas: usize,
     pub files: usize,
     pub bytes: u64,
 }
@@ -238,6 +254,7 @@ impl Project {
             .collect();
         let scans: BTreeSet<_> = states.iter().flat_map(|s| &s.scans).copied().collect();
         let labels: BTreeSet<_> = states.iter().flat_map(|s| &s.labels).copied().collect();
+        let panoramas: BTreeSet<_> = states.iter().flat_map(|s| &s.panoramas).copied().collect();
         // Metadata first, so an interruption leaves only unreferenced files.
         let mut next = self.clone();
         next.manifest.scans.retain(|s| scans.contains(&s.id));
@@ -245,9 +262,13 @@ impl Project {
             .images
             .retain(|i| i.scan_id.is_none_or(|id| scans.contains(&id)));
         next.manifest.patches.retain(|p| labels.contains(&p.id));
+        next.manifest
+            .panoramas
+            .retain(|p| panoramas.contains(&p.id));
         let mut report = CleanupReport {
             scans: self.manifest.scans.len() - next.manifest.scans.len(),
             labels: self.manifest.patches.len() - next.manifest.patches.len(),
+            panoramas: self.manifest.panoramas.len() - next.manifest.panoramas.len(),
             ..Default::default()
         };
         next.save()?;
@@ -257,6 +278,9 @@ impl Project {
         for s in &self.manifest.scans {
             referenced.extend([&s.template, &s.points_file, &s.view_file].map(|p| p.clone()));
             referenced.insert(crate::model::scan_metadata_path(s));
+        }
+        for p in &self.manifest.panoramas {
+            referenced.insert(p.file.clone());
         }
         for p in &self.manifest.patches {
             referenced.insert(p.file.clone());

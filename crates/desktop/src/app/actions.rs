@@ -12,6 +12,16 @@ use egui_phosphor::regular as icon;
 use geemil_core::{ImportOptions, LasExportPolicy, Project};
 use std::{f64::consts::FRAC_PI_2, path::PathBuf};
 
+/// Whether a file is a photo, imported as a panorama.
+pub(super) fn is_photo(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    matches!(ext.as_str(), "jpg" | "jpeg" | "png")
+}
+
 /// The steepest camera pitch; exactly vertical has no defined screen "up".
 pub(super) const MAX_PITCH: f64 = FRAC_PI_2 - 1e-3;
 
@@ -40,6 +50,7 @@ pub(super) enum Action {
     View(ViewPreset),
     ToggleEdl,
     ToggleOrtho,
+    ToggleTree,
     Save,
     Revisions,
     Discard,
@@ -75,6 +86,7 @@ impl Action {
             Self::View(ViewPreset::Iso) => icon::CUBE,
             Self::ToggleEdl => icon::CIRCLE_HALF,
             Self::ToggleOrtho => icon::PERSPECTIVE,
+            Self::ToggleTree => icon::SIDEBAR_SIMPLE,
             Self::Save => icon::FLOPPY_DISK,
             Self::Revisions => icon::GIT_BRANCH,
             Self::Discard => icon::ARROW_COUNTER_CLOCKWISE,
@@ -93,6 +105,7 @@ impl Action {
             Self::Tool(Tool::Align) => icon::CROSSHAIR,
             Self::Tool(Tool::Box) => icon::CUBE_FOCUS,
             Self::Tool(Tool::Transform) => icon::ARROWS_OUT_CARDINAL,
+            Self::Tool(Tool::Panorama) => icon::PANORAMA,
             Self::Shortcuts => icon::KEYBOARD,
             Self::About => icon::INFO,
         }
@@ -117,6 +130,7 @@ impl Action {
             Self::View(ViewPreset::Iso) => t.view_iso.into(),
             Self::ToggleEdl => t.edl.into(),
             Self::ToggleOrtho => t.ortho.into(),
+            Self::ToggleTree => t.toggle_tree.into(),
             Self::Save => t.save.into(),
             Self::Revisions => t.revisions.into(),
             Self::Discard => t.discard.into(),
@@ -135,6 +149,7 @@ impl Action {
             Self::Tool(Tool::Align) => t.tool_align.into(),
             Self::Tool(Tool::Box) => t.tool_box.into(),
             Self::Tool(Tool::Transform) => t.tool_transform.into(),
+            Self::Tool(Tool::Panorama) => t.tool_panorama.into(),
             Self::Shortcuts => t.shortcuts.into(),
             Self::About => t.about.into(),
         }
@@ -232,6 +247,7 @@ impl Workbench {
             | Action::ClearSelection
             | Action::ToggleEdl
             | Action::ToggleOrtho
+            | Action::ToggleTree
             | Action::Tool(_)
             | Action::Shortcuts
             | Action::About => true,
@@ -266,11 +282,12 @@ impl Workbench {
         if !typing && ctx.input(|i| i.key_pressed(Key::Enter)) {
             self.selection.close_polygon();
         }
-        if !typing
-            && self.selection.tool == Tool::Align
-            && ctx.input(|i| i.key_pressed(Key::Backspace))
-        {
-            self.align_undo_pick();
+        if !typing && ctx.input(|i| i.key_pressed(Key::Backspace)) {
+            match self.selection.tool {
+                Tool::Align => self.align_undo_pick(),
+                Tool::Panorama => self.panorama_undo_pick(),
+                _ => {}
+            }
         }
     }
     pub(super) fn perform(&mut self, ctx: &egui::Context, action: Action) {
@@ -285,7 +302,12 @@ impl Workbench {
             Action::OpenRecent(path) => self.open_project(&path),
             Action::Import => {
                 if let Some(files) = rfd::FileDialog::new()
+                    .add_filter(
+                        "E57 / LAS / LAZ / JPEG / PNG",
+                        &["e57", "las", "laz", "jpg", "jpeg", "png"],
+                    )
                     .add_filter("E57 / LAS / LAZ", &["e57", "las", "laz"])
+                    .add_filter("JPEG / PNG", &["jpg", "jpeg", "png"])
                     .pick_files()
                 {
                     self.import(ctx, files);
@@ -308,6 +330,9 @@ impl Workbench {
                 if self.selection.tool == Tool::Align {
                     self.align.clear();
                 }
+                if self.selection.tool == Tool::Panorama {
+                    self.panorama_clear();
+                }
                 self.gizmo.cancel();
                 self.crop.cancel();
             }
@@ -326,6 +351,7 @@ impl Workbench {
             Action::FitView => self.fit_view(),
             Action::View(preset) => self.view_preset(preset),
             Action::ToggleEdl => self.settings.edl = !self.settings.edl,
+            Action::ToggleTree => self.settings.tree_collapsed = !self.settings.tree_collapsed,
             Action::ToggleOrtho => {
                 self.camera.ortho = !self.camera.ortho;
                 self.dirty = true;
@@ -411,6 +437,9 @@ impl Workbench {
         }
     }
     pub(super) fn set_tool(&mut self, tool: Tool) {
+        if tool != Tool::Panorama {
+            self.leave_panorama();
+        }
         self.crop.cancel();
         self.selection.tool = tool;
         if tool != Tool::Measure {
@@ -555,7 +584,11 @@ impl Workbench {
         let mut project = (**project).clone();
         self.start(ctx, true, move |job| {
             for file in files {
-                project.import_file(&file, ImportOptions::default(), &job)?;
+                if is_photo(&file) {
+                    project.import_panorama(&file)?;
+                } else {
+                    project.import_file(&file, ImportOptions::default(), &job)?;
+                }
             }
             Ok(project)
         });

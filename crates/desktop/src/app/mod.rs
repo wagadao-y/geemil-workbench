@@ -10,6 +10,7 @@ mod layers;
 mod measure;
 mod menu;
 mod navigation;
+mod panorama;
 mod registrations;
 mod revisions;
 mod selection;
@@ -92,6 +93,8 @@ pub(super) struct Settings {
     filter_memory_mib: usize,
     /// The window's last size and place while not maximized.
     normal_window: Option<window::NormalWindow>,
+    /// The project tree folded to a strip.
+    tree_collapsed: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -124,6 +127,7 @@ impl Default for Settings {
             outlier_reach: 0.5,
             filter_memory_mib: 768,
             normal_window: None,
+            tree_collapsed: false,
         }
     }
 }
@@ -186,6 +190,7 @@ pub struct Workbench {
     selection: selection::SelectionState,
     measure: measure::Measure,
     align: align::Align,
+    panorama: panorama::PanoramaTool,
     crop: crop::Crop,
     gizmo: gizmo::Gizmo,
     transform_edit: tree::TransformEdit,
@@ -254,6 +259,7 @@ impl Workbench {
             selection: Default::default(),
             measure: Default::default(),
             align: Default::default(),
+            panorama: Default::default(),
             crop: Default::default(),
             gizmo: Default::default(),
             transform_edit: Default::default(),
@@ -292,6 +298,7 @@ impl Workbench {
             .iter()
             .copied()
             .chain(project.groups().iter().map(|g| g.id))
+            .chain(project.panoramas().map(|p| p.id))
             .collect();
         carry_scan_state(&mut self.visible, previous.as_deref(), &scans);
         if previous.is_none() {
@@ -332,7 +339,7 @@ impl Workbench {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_lowercase();
-                    matches!(ext.as_str(), "e57" | "las" | "laz")
+                    matches!(ext.as_str(), "e57" | "las" | "laz") || actions::is_photo(p)
                 })
                 .collect()
         });
@@ -368,6 +375,7 @@ impl eframe::App for Workbench {
         self.poll_job();
         self.poll_view();
         self.align_update();
+        self.panorama_update(&ctx);
         // While the right button flies, its keys are not shortcuts. Releasing
         // it ends flying at once, even where no viewport is drawn.
         self.flying &= ctx.input(|i| i.pointer.secondary_down());
@@ -385,6 +393,7 @@ impl eframe::App for Workbench {
         self.side_panel(ui);
         self.align_panel(ui);
         self.crop_panel(ui);
+        self.panorama_panels(ui);
         if self.project.is_some() || self.smoke.colors {
             self.viewport(ui, frame);
         } else {

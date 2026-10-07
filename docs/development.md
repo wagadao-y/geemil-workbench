@@ -34,6 +34,7 @@ cargo run -p geemil-core --release -- reduce-overlap work-data/trimble-copy 0.1
 cargo run -p geemil-core --release -- export work-data/trimble work-data/trimble-roundtrip.e57
 cargo run -p geemil-core --release -- export-las work-data/trimble work-data/trimble.laz
 cargo run -p geemil-core -- demo work-data/demo.e57   # 小さな検証用E57を生成する
+cargo run -p geemil-core --release -- import work-data/manitou-pano photo.jpg   # JPEG/PNGはパノラマ写真として取り込む
 ```
 
 フィルターは、判定した点を「Subsampled」（間引き）か「Noise」（ノイズ除去・SOR）のレイヤーへ移す。`inspect`はレイヤーごとの点数も表示する。
@@ -67,6 +68,17 @@ cargo run -p geemil-core --release -- import work-data/syn100m-p (Get-ChildItem 
 ```
 
 回転方向の手がかりが少ないシーンなので、ICPの精度評価には向かない（ずれなしから始めても隅で最大1m動く）。精度は実データのmanitouで確認する。
+
+### 合成パノラマ（make_panorama）
+
+プロジェクトの点を、指定した位置から見た正距円筒図法のJPEGに描く。正解の位置が分かっているパノラマとして、配置の確認に使う。引数はプロジェクト、出力、撮影位置X Y Z、方位（度、+XからZ軸回りに左回り）、幅（既定4096）。プロジェクトだけを指定すると、スキャナー位置と範囲を表示する。
+
+```powershell
+cargo run -p geemil-core --release --example make_panorama -- work-data/manitou
+cargo run -p geemil-core --release --example make_panorama -- work-data/manitou work-data/pano-truth.jpg 8.0 -4.3 0.3 30 6144
+```
+
+manitouのコピーに6144×3072の合成パノラマを取り込み、下のスモークテストで正解の位置から8組の対応点を作ると、位置と方位は0.0001 mm・0.001°未満の差で戻った。12288×6144のJPEGは、デコード・縮小版の作成・テクスチャ転送まで約1秒で表示した（smokeプロファイル、2026-10-07）。
 
 ### 連続処理（workflow_bench）
 
@@ -166,6 +178,7 @@ cargo run -p geemil-desktop --profile smoke -- work-data/manitou-copy --smoke-te
 | 変換 | `preview`（最初のスキャンの変換を入力し、動いた表示点数を出力）、`apply-transform`、`transform`／`transform-folder`（最初のスキャン／フォルダーを選び「移動・回転」ツールにする）、`place-handles`（画面中央に取っ手を置き、前後の位置を出力） |
 | フィルター | `subsample`（5cm）、`noise`（半径0.1m・4点未満）、`sor`（6点・1σ）、`subsample-merged`（まとめて5cm）、`moving`（動体除去、既定値） |
 | 位置合わせ | `align-icp`（最初のスキャンをICPでプレビュー）、`align-pairs`（一致する4組の対応点で合わせ、動かないことを確認）、`align-global`、`align-list`（一覧の件数と全体最適化の前後のRMSを出力）、`align-switch`／`align-leave`（別のスキャンの選択／ツールの切り替えで、未適用の確認が出たかを出力）、`align-apply` |
+| パノラマ | `panorama`（最初のパノラマ写真で配置ツールを開く）、`panorama-pairs:X:Y:Z:HEADING`（その位置・方位で撮ったとして、表示中の点から方位の8方向に1点ずつ対応点を作って解き、正解との差を出力）、`panorama-apply`、`panorama-link`（左右の視点の連動と点の重ね合わせ）、`panorama-view:YAW:PITCH:FOV`（写真の表示方向と画角、度）、`panorama-view:flat`（全景）、`tree-fold`（プロジェクトツリーを閉じる） |
 | ボックス | `box`（中央の高さに2mの水平スライスを置いてハイライトし、箱の中の点数を出力）、`box-resize`（傾けた箱でサイズ変更の取っ手を表示）、`box-crop`（箱の外を「削除」へ移す） |
 | レイヤー | `show-layers`（すべて表示）、`solo-layer`（最も新しいレイヤーだけ表示）、`restore`（最も新しいレイヤーの点を「点群」へ戻す） |
 

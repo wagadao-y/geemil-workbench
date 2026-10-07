@@ -43,7 +43,12 @@ pub struct SmokeOptions {
     /// transform and transform-folder (the move and rotate tool on the first
     /// scan or folder), focus and focus-folder (frame the first scan or folder),
     /// show-layers (show every layer), restore (move every point of the newest
-    /// layer back to the default one), color-height and color-scan (colour modes).
+    /// layer back to the default one), color-height and color-scan (colour modes),
+    /// panorama (the panorama tool on the first panorama),
+    /// panorama-pairs:X:Y:Z:HEADING (pairs as seen from there, placed),
+    /// panorama-apply, panorama-link (linked camera and overlay) and
+    /// panorama-view:YAW:PITCH:FOV or panorama-view:flat (the photo viewer),
+    /// tree-fold (fold the project tree).
     pub script: Vec<String>,
 }
 
@@ -276,6 +281,7 @@ impl Workbench {
             ctx.request_repaint();
         }
         let shown = self.shown_count();
+        let photo_loading = self.panorama_loading();
         let smoke = &mut self.smoke;
         for event in ctx.input(|i| i.events.clone()) {
             if let egui::Event::Screenshot { image, .. } = event {
@@ -353,6 +359,7 @@ impl Workbench {
             && smoke.script.is_empty()
             && self.job.is_none()
             && !self.selection.preview_pending()
+            && !photo_loading
             && (!self.nodes.is_empty() || empty)
             && !self.renderer.as_ref().is_some_and(|r| r.pending())
             && smoke.started.elapsed() > smoke.orbit_duration + Duration::from_secs(1)
@@ -651,6 +658,42 @@ impl Workbench {
                 if let Some((id, pose)) = self.transform_preview() {
                     self.apply_edit(|p| p.set_transform(id, pose));
                 }
+            }
+            "tree-fold" => self.settings.tree_collapsed = true,
+            "panorama-link" => {
+                self.smoke_panorama_link();
+                eprintln!("Smoke panorama link: {}", self.panorama_summary());
+            }
+            "panorama-apply" => {
+                self.panorama_apply();
+                eprintln!("Smoke panorama apply: {}", self.panorama_summary());
+            }
+            other if other.starts_with("panorama-view:") => {
+                // panorama-view:YAW:PITCH:FOV in degrees, or panorama-view:flat.
+                let rest = &other["panorama-view:".len()..];
+                let values: Vec<f64> = rest.split(':').filter_map(|v| v.parse().ok()).collect();
+                self.smoke_panorama_view(rest == "flat", &values);
+            }
+            other if other.starts_with("panorama-pairs:") => {
+                // panorama-pairs:X:Y:Z:HEADING, where the photo was taken.
+                let values: Vec<f64> = other["panorama-pairs:".len()..]
+                    .split(':')
+                    .filter_map(|v| v.parse().ok())
+                    .collect();
+                match values[..] {
+                    [x, y, z, heading] => self.smoke_panorama_pairs(ctx, [x, y, z, heading]),
+                    _ => eprintln!("Smoke panorama: expected panorama-pairs:X:Y:Z:HEADING"),
+                }
+            }
+            "panorama" => {
+                // The panorama tool on the first panorama.
+                let first = self
+                    .project
+                    .as_ref()
+                    .and_then(|p| p.panoramas().next().map(|p| p.id));
+                self.set_tool(super::selection::Tool::Panorama);
+                self.select_tree_item(first);
+                self.panorama_update(ctx);
             }
             other => eprintln!("Unknown smoke step {other}"),
         }
