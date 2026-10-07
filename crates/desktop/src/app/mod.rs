@@ -16,6 +16,7 @@ mod revisions;
 mod selection;
 mod smoke;
 mod status;
+mod tour;
 mod tree;
 mod undo;
 mod view;
@@ -95,6 +96,8 @@ pub(super) struct Settings {
     normal_window: Option<window::NormalWindow>,
     /// The project tree folded to a strip.
     tree_collapsed: bool,
+    /// Markers where placed panoramas were taken.
+    show_panoramas: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -128,6 +131,7 @@ impl Default for Settings {
             filter_memory_mib: 768,
             normal_window: None,
             tree_collapsed: false,
+            show_panoramas: true,
         }
     }
 }

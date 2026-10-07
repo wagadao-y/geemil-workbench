@@ -19,7 +19,7 @@ use std::{
 use uuid::Uuid;
 
 /// The photo side of a correspondence, and the point side.
-const PHOTO: egui::Color32 = egui::Color32::from_rgb(255, 150, 40);
+pub(super) const PHOTO: egui::Color32 = egui::Color32::from_rgb(255, 150, 40);
 const POINT: egui::Color32 = egui::Color32::from_rgb(70, 170, 255);
 /// Overlaid points at most, each a small square.
 const OVERLAY_POINTS: usize = 120_000;
@@ -92,14 +92,14 @@ impl Work {
 
 /// Where the photo viewer looks, in the panorama's frame.
 #[derive(Clone, Copy, PartialEq)]
-struct View {
+pub(super) struct View {
     /// Azimuth, growing to the left.
-    yaw: f64,
-    pitch: f64,
+    pub(super) yaw: f64,
+    pub(super) pitch: f64,
     /// Vertical field of view.
-    fov: f64,
+    pub(super) fov: f64,
     /// The whole photo instead of a view from the centre.
-    flat: bool,
+    pub(super) flat: bool,
 }
 impl View {
     /// Turns so what is shown follows a drag over a view `height` points high.
@@ -153,7 +153,7 @@ struct Loading {
 
 pub(super) struct PanoramaTool {
     /// The panorama being placed; follows the tree selection.
-    item: Option<Uuid>,
+    pub(super) item: Option<Uuid>,
     works: HashMap<Uuid, Work>,
     photo: Option<Photo>,
     loading: Option<Loading>,
@@ -163,7 +163,9 @@ pub(super) struct PanoramaTool {
     level: bool,
     /// The point cloud camera follows the photo viewer.
     linked: bool,
-    overlay: bool,
+    pub(super) overlay: bool,
+    /// Viewing a placed panorama in the main view, if any.
+    pub(super) tour: Option<super::tour::Tour>,
     /// The overlay as last built, and what it was built for.
     overlay_mesh: Option<(OverlayKey, std::sync::Arc<egui::Mesh>)>,
     picks: u64,
@@ -191,6 +193,7 @@ impl Default for PanoramaTool {
             level: true,
             linked: false,
             overlay: false,
+            tour: None,
             overlay_mesh: None,
             picks: 0,
         }
@@ -203,7 +206,7 @@ impl PanoramaTool {
 }
 
 /// The direction of an azimuth and elevation.
-fn direction(yaw: f64, pitch: f64) -> DVec3 {
+pub(super) fn direction(yaw: f64, pitch: f64) -> DVec3 {
     DVec3::new(
         pitch.cos() * yaw.cos(),
         pitch.cos() * yaw.sin(),
@@ -212,7 +215,7 @@ fn direction(yaw: f64, pitch: f64) -> DVec3 {
 }
 
 /// A pinhole looking out from the centre of the photo's sphere.
-struct Lens {
+pub(super) struct Lens {
     forward: DVec3,
     right: DVec3,
     up: DVec3,
@@ -221,7 +224,7 @@ struct Lens {
     centre: egui::Pos2,
 }
 impl Lens {
-    fn new(view: &View, rect: egui::Rect) -> Self {
+    pub(super) fn new(view: &View, rect: egui::Rect) -> Self {
         let forward = direction(view.yaw, view.pitch);
         let right = forward.cross(DVec3::Z).normalize();
         Self {
@@ -233,21 +236,47 @@ impl Lens {
         }
     }
     /// Where a direction shows, if in front.
-    fn project(&self, d: DVec3) -> Option<egui::Pos2> {
+    pub(super) fn project(&self, d: DVec3) -> Option<egui::Pos2> {
         let z = d.dot(self.forward);
-        if z < 0.02 * d.length() {
+        if z <= 0. || z < 0.02 * d.length() {
             return None;
         }
         let s = self.focal / z;
         Some(self.centre + egui::vec2((d.dot(self.right) * s) as f32, (-d.dot(self.up) * s) as f32))
     }
     /// The direction shown at a screen position.
-    fn ray(&self, pos: egui::Pos2) -> DVec3 {
+    pub(super) fn ray(&self, pos: egui::Pos2) -> DVec3 {
         let d = pos - self.centre;
         (self.forward + self.right * (d.x as f64 / self.focal)
             - self.up * (d.y as f64 / self.focal))
             .normalize()
     }
+}
+
+/// Turns a view by a drag on `response` and zooms it by the wheel about the
+/// pointer, keeping the direction under it in place.
+pub(super) fn look_input(view: &mut View, response: &egui::Response) {
+    let rect = response.rect;
+    if response.dragged_by(egui::PointerButton::Primary)
+        || response.dragged_by(egui::PointerButton::Middle)
+    {
+        // The photo follows the pointer.
+        view.turn(response.drag_delta(), rect.height());
+    }
+    let Some(pos) = response.hover_pos() else {
+        return;
+    };
+    let scroll = response.ctx.input(|i| i.smooth_scroll_delta.y);
+    if scroll == 0. {
+        return;
+    }
+    let under = Lens::new(view, rect).ray(pos);
+    view.zoom(scroll);
+    let after = Lens::new(view, rect).ray(pos);
+    let (yaw_a, pitch_a) = (under.y.atan2(under.x), under.z.asin());
+    let (yaw_b, pitch_b) = (after.y.atan2(after.x), after.z.asin());
+    view.yaw = (view.yaw + yaw_a - yaw_b).rem_euclid(TAU);
+    view.pitch = (view.pitch + pitch_a - pitch_b).clamp(-FRAC_PI_2 + 0.01, FRAC_PI_2 - 0.01);
 }
 
 /// Where the whole photo shows in the overview: as large as fits, 2:1.
@@ -373,7 +402,7 @@ fn distance_color(d: f64) -> egui::Color32 {
 }
 
 /// Draws a numbered marker.
-fn marker(painter: &egui::Painter, at: egui::Pos2, color: egui::Color32, number: usize) {
+pub(super) fn marker(painter: &egui::Painter, at: egui::Pos2, color: egui::Color32, number: usize) {
     painter.circle(at, 6., color, egui::Stroke::new(1.5, egui::Color32::BLACK));
     let text = number.to_string();
     let font = egui::FontId::proportional(14.);
@@ -433,8 +462,14 @@ impl Workbench {
     pub(super) fn panorama_update(&mut self, ctx: &egui::Context) {
         let Some(p) = self.project.clone() else {
             self.panorama.item = None;
+            self.panorama.tour = None;
             return;
         };
+        self.poll_photo();
+        if self.panorama.tour.is_some() {
+            self.tour_update(ctx, &p);
+            return;
+        }
         if !self.placing_panorama() {
             return;
         }
@@ -449,6 +484,20 @@ impl Workbench {
         tool.works.retain(|id, _| p.panorama(*id).is_some());
         let Some(id) = tool.item else { return };
         tool.works.entry(id).or_insert_with(|| Work::saved(&p, id));
+        if self.want_photo(ctx, &p, id) {
+            self.panorama.view = View::default();
+        }
+        let tool = &mut self.panorama;
+        if tool.works.get(&id).is_some_and(|w| w.stale) {
+            self.panorama_solve(&p, id);
+        }
+        if self.panorama.linked {
+            self.link_camera(&p, id);
+        }
+    }
+    /// Takes a photo that finished loading.
+    fn poll_photo(&mut self) {
+        let tool = &mut self.panorama;
         if let Some(Loading {
             panorama: loading,
             result,
@@ -469,34 +518,136 @@ impl Workbench {
                 Err(e) => tool.load_error = Some((loading, e)),
             }
         }
+    }
+    /// Starts loading a panorama's photo unless it is shown, loading or
+    /// failed. One photo is kept at a time. Returns whether it started.
+    pub(super) fn want_photo(&mut self, ctx: &egui::Context, p: &Project, id: Uuid) -> bool {
+        let tool = &mut self.panorama;
         let shown = tool.photo.as_ref().map(|photo| photo.panorama);
         let failed = tool.load_error.as_ref().map(|(id, _)| *id);
-        if shown != Some(id) && tool.loading.is_none() && failed != Some(id) {
-            let panorama = p.panorama(id).unwrap();
-            match p.path(&panorama.file) {
-                Ok(path) => {
-                    let (tx, rx) = mpsc::channel();
-                    let side = ctx.input(|i| i.max_texture_side).min(4096) as u32;
-                    let ctx = ctx.clone();
-                    std::thread::spawn(move || {
-                        let _ = tx.send(load_photo(&ctx, &path, id, side));
-                    });
-                    tool.loading = Some(Loading {
-                        panorama: id,
-                        result: rx,
-                        started: Instant::now(),
-                    });
-                    tool.view = View::default();
-                }
-                Err(e) => tool.load_error = Some((id, e.to_string())),
+        if shown == Some(id) || tool.loading.is_some() || failed == Some(id) {
+            return false;
+        }
+        let Some(panorama) = p.panorama(id) else {
+            return false;
+        };
+        match p.path(&panorama.file) {
+            Ok(path) => {
+                let (tx, rx) = mpsc::channel();
+                let side = ctx.input(|i| i.max_texture_side).min(4096) as u32;
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(load_photo(&ctx, &path, id, side));
+                });
+                tool.loading = Some(Loading {
+                    panorama: id,
+                    result: rx,
+                    started: Instant::now(),
+                });
+                true
+            }
+            Err(e) => {
+                tool.load_error = Some((id, e.to_string()));
+                false
             }
         }
-        if tool.works.get(&id).is_some_and(|w| w.stale) {
-            self.panorama_solve(&p, id);
+    }
+    /// Draws a panorama's photo as seen through `lens`, or says why it cannot.
+    /// Returns whether the photo is shown.
+    pub(super) fn draw_sphere(
+        &self,
+        painter: &egui::Painter,
+        panorama: &Panorama,
+        view: &View,
+        lens: &Lens,
+    ) -> bool {
+        let rect = painter.clip_rect();
+        let Some(photo) = self.photo_of(panorama.id, painter) else {
+            return false;
+        };
+        // The smallest level with pixels no larger than the screen's.
+        let pixels = painter.ctx().pixels_per_point();
+        let screen = view.fov / (rect.height() * pixels) as f64;
+        let level = photo
+            .levels
+            .iter()
+            .rev()
+            .find(|l| TAU / l.width as f64 <= screen)
+            .unwrap_or(&photo.levels[0]);
+        painter.extend(sphere_shapes(panorama, level, lens, rect));
+        true
+    }
+    /// A panorama's photo if loaded; else writes that it is loading or why
+    /// it failed.
+    fn photo_of(&self, id: Uuid, painter: &egui::Painter) -> Option<&Photo> {
+        let photo = self
+            .panorama
+            .photo
+            .as_ref()
+            .filter(|photo| photo.panorama == id);
+        if photo.is_none() {
+            let t = self.t;
+            let text = match &self.panorama.load_error {
+                Some((failed, e)) if *failed == id => (t.panorama_load_failed)(e),
+                _ => t.panorama_loading.into(),
+            };
+            painter.text(
+                painter.clip_rect().center(),
+                egui::Align2::CENTER_CENTER,
+                text,
+                egui::FontId::proportional(15.),
+                egui::Color32::from_gray(160),
+            );
         }
-        if self.panorama.linked {
-            self.link_camera(&p, id);
-        }
+        photo
+    }
+    /// The shown points overlaid on a photo at `world`, as `project` puts
+    /// what the photo sees on screen; cached until the view, the placement
+    /// or the points change.
+    pub(super) fn overlay_shape(
+        &mut self,
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        view: View,
+        world: DMat4,
+        project: impl Fn(DVec3) -> Option<egui::Pos2>,
+    ) -> egui::Shape {
+        let key = OverlayKey {
+            view,
+            rect,
+            world,
+            points: self.points_generation,
+            shown: self.shown_count(),
+            // A quarter while a button is held, then the full count.
+            depth_points: if ui.input(|i| i.pointer.any_down()) {
+                DEPTH_POINTS / 4
+            } else {
+                DEPTH_POINTS
+            },
+        };
+        let cached = self.panorama.overlay_mesh.take().filter(|(k, _)| *k == key);
+        let mesh = cached.map_or_else(
+            || {
+                let started = Instant::now();
+                let mesh = std::sync::Arc::new(self.overlay_mesh(
+                    rect,
+                    (key.shown, key.depth_points),
+                    project,
+                    world.inverse(),
+                ));
+                if self.smoke.active() {
+                    eprintln!(
+                        "Smoke panorama overlay: {} points in {:.1} ms",
+                        mesh.vertices.len() / 4,
+                        started.elapsed().as_secs_f64() * 1000.
+                    );
+                }
+                mesh
+            },
+            |(_, mesh)| mesh,
+        );
+        self.panorama.overlay_mesh = Some((key, mesh.clone()));
+        egui::Shape::Mesh(mesh)
     }
     /// Places the panorama from its complete pairs, or drops the preview
     /// with too few.
@@ -937,23 +1088,7 @@ impl Workbench {
         let size = ui.available_size().max(egui::vec2(1., 1.));
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
         let painter = ui.painter_at(rect);
-        let photo = self
-            .panorama
-            .photo
-            .as_ref()
-            .filter(|photo| photo.panorama == panorama.id);
-        let Some(photo) = photo else {
-            let text = match &self.panorama.load_error {
-                Some((id, e)) if *id == panorama.id => (t.panorama_load_failed)(e),
-                _ => t.panorama_loading.into(),
-            };
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                text,
-                egui::FontId::proportional(15.),
-                ui.visuals().weak_text_color(),
-            );
+        let Some(photo) = self.photo_of(panorama.id, &painter) else {
             return;
         };
         let view = self.panorama.view;
@@ -1007,15 +1142,7 @@ impl Workbench {
                 );
             }
         } else {
-            // The smallest level with pixels no larger than the screen's.
-            let screen = view.fov / (rect.height() * pixels) as f64;
-            let level = photo
-                .levels
-                .iter()
-                .rev()
-                .find(|l| TAU / l.width as f64 <= screen)
-                .unwrap_or(&photo.levels[0]);
-            painter.extend(sphere_shapes(&panorama, level, &lens, rect));
+            self.draw_sphere(&painter, &panorama, &view, &lens);
         }
         let world = self.panorama_world(p, panorama.id);
         let has_pose = self
@@ -1026,48 +1153,14 @@ impl Workbench {
             || p.registration(panorama.id).is_some();
         let to_photo = world.inverse();
         if self.panorama.overlay && has_pose {
-            let key = OverlayKey {
-                view,
-                rect,
-                world,
-                points: self.points_generation,
-                shown: self.shown_count(),
-                // A quarter while a button is held, then the full count.
-                depth_points: if ui.input(|i| i.pointer.any_down()) {
-                    DEPTH_POINTS / 4
+            let shape = self.overlay_shape(ui, rect, view, world, |seen| {
+                if view.flat {
+                    to_screen(panorama.pixel(seen))
                 } else {
-                    DEPTH_POINTS
-                },
-            };
-            let cached = self.panorama.overlay_mesh.take().filter(|(k, _)| *k == key);
-            let mesh = cached.map_or_else(
-                || {
-                    let started = Instant::now();
-                    let mesh = std::sync::Arc::new(self.overlay_mesh(
-                        rect,
-                        (key.shown, key.depth_points),
-                        |seen| {
-                            if view.flat {
-                                to_screen(panorama.pixel(seen))
-                            } else {
-                                lens.project(seen)
-                            }
-                        },
-                        to_photo,
-                    ));
-                    if self.smoke.active() {
-                        eprintln!(
-                            "Smoke panorama overlay: {} points in {:.1} ms",
-                            mesh.vertices.len() / 4,
-                            started.elapsed().as_secs_f64() * 1000.
-                        );
-                    }
-                    mesh
-                },
-                |(_, mesh)| mesh,
-            );
-            painter.add(egui::Shape::Mesh(mesh.clone()));
-            self.panorama.overlay_mesh = Some((key, mesh));
+                    lens.project(seen)
+                }
+            });
+            painter.add(shape);
         }
         if let Some(work) = self.panorama.works.get(&panorama.id) {
             for (i, pair) in work.pairs.iter().enumerate() {
@@ -1101,31 +1194,9 @@ impl Workbench {
             egui::Color32::from_white_alpha(150),
         );
         // Input, for the next frame.
-        let ctx = ui.ctx().clone();
         let view = &mut self.panorama.view;
         if !view.flat {
-            if response.dragged_by(egui::PointerButton::Primary)
-                || response.dragged_by(egui::PointerButton::Middle)
-            {
-                // The photo follows the pointer.
-                view.turn(response.drag_delta(), rect.height());
-            }
-            if response.hovered() {
-                let scroll = ctx.input(|i| i.smooth_scroll_delta.y);
-                if scroll != 0. {
-                    // Zoom about the pointer: the direction under it stays.
-                    let under = response.hover_pos().map(|pos| lens.ray(pos));
-                    view.zoom(scroll);
-                    if let (Some(under), Some(pos)) = (under, response.hover_pos()) {
-                        let after = Lens::new(view, rect).ray(pos);
-                        let (yaw_a, pitch_a) = (under.y.atan2(under.x), under.z.asin());
-                        let (yaw_b, pitch_b) = (after.y.atan2(after.x), after.z.asin());
-                        view.yaw = (view.yaw + yaw_a - yaw_b).rem_euclid(TAU);
-                        view.pitch = (view.pitch + pitch_a - pitch_b)
-                            .clamp(-FRAC_PI_2 + 0.01, FRAC_PI_2 - 0.01);
-                    }
-                }
-            }
+            look_input(view, &response);
         } else if response.double_clicked()
             && let Some(pixel) = response.interact_pointer_pos().and_then(to_pixel)
         {
@@ -1204,7 +1275,7 @@ impl Workbench {
             }
         }
     }
-    /// For smoke tests: picks correspondences of the first panorama as seen
+    /// For smoke tests: picks correspondences of the first unplaced panorama as seen
     /// from `truth` (x, y, z and heading in degrees): displayed points spread
     /// around it, their pixels computed. Then places it and reports how far
     /// the placement is from the truth.
@@ -1212,7 +1283,9 @@ impl Workbench {
         let Some(p) = self.project.clone() else {
             return;
         };
-        let Some(id) = p.panoramas().next().map(|pano| pano.id) else {
+        // The first not placed yet, else the first.
+        let unplaced = p.panoramas().find(|pano| p.registration(pano.id).is_none());
+        let Some(id) = unplaced.or(p.panoramas().next()).map(|pano| pano.id) else {
             eprintln!("Smoke panorama: no panorama");
             return;
         };
@@ -1267,7 +1340,10 @@ impl Workbench {
     }
     /// For smoke tests: the overview, or a view in degrees (yaw, pitch, fov).
     pub(super) fn smoke_panorama_view(&mut self, flat: bool, degrees: &[f64]) {
-        let view = &mut self.panorama.view;
+        let view = match &mut self.panorama.tour {
+            Some(tour) => tour.view_mut(),
+            None => &mut self.panorama.view,
+        };
         view.flat = flat;
         if let [yaw, pitch, fov] = degrees[..] {
             view.yaw = yaw.to_radians();

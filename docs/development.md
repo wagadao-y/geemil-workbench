@@ -178,7 +178,7 @@ cargo run -p geemil-desktop --profile smoke -- work-data/manitou-copy --smoke-te
 | 変換 | `preview`（最初のスキャンの変換を入力し、動いた表示点数を出力）、`apply-transform`、`transform`／`transform-folder`（最初のスキャン／フォルダーを選び「移動・回転」ツールにする）、`place-handles`（画面中央に取っ手を置き、前後の位置を出力） |
 | フィルター | `subsample`（5cm）、`noise`（半径0.1m・4点未満）、`sor`（6点・1σ）、`subsample-merged`（まとめて5cm）、`moving`（動体除去、既定値） |
 | 位置合わせ | `align-icp`（最初のスキャンをICPでプレビュー）、`align-pairs`（一致する4組の対応点で合わせ、動かないことを確認）、`align-global`、`align-list`（一覧の件数と全体最適化の前後のRMSを出力）、`align-switch`／`align-leave`（別のスキャンの選択／ツールの切り替えで、未適用の確認が出たかを出力）、`align-apply` |
-| パノラマ | `panorama`（最初のパノラマ写真で配置ツールを開く）、`panorama-pairs:X:Y:Z:HEADING`（その位置・方位で撮ったとして、表示中の点から方位の8方向に1点ずつ対応点を作って解き、正解との差を出力）、`panorama-apply`、`panorama-link`（左右の視点の連動と点の重ね合わせ）、`panorama-view:YAW:PITCH:FOV`（写真の表示方向と画角、度）、`panorama-view:flat`（全景）、`tree-fold`（プロジェクトツリーを閉じる） |
+| パノラマ | `panorama`（最初のパノラマ写真で配置ツールを開く）、`panorama-pairs:X:Y:Z:HEADING`（その位置・方位で撮ったとして、表示中の点から方位の8方向に1点ずつ対応点を作って解き、正解との差を出力）、`panorama-apply`、`panorama-link`（左右の視点の連動と点の重ね合わせ）、`panorama-view:YAW:PITCH:FOV`（写真の表示方向と画角、度。パノラマの表示中はその表示に効く）、`panorama-view:flat`（全景）、`tree-fold`（プロジェクトツリーを閉じる）、`navigate`（カメラ操作に切り替える）、`tour`（最初の配置済みパノラマを中央の画面で表示）、`tour-exit` |
 | ボックス | `box`（中央の高さに2mの水平スライスを置いてハイライトし、箱の中の点数を出力）、`box-resize`（傾けた箱でサイズ変更の取っ手を表示）、`box-crop`（箱の外を「削除」へ移す） |
 | レイヤー | `show-layers`（すべて表示）、`solo-layer`（最も新しいレイヤーだけ表示）、`restore`（最も新しいレイヤーの点を「点群」へ戻す） |
 

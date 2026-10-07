@@ -10,20 +10,27 @@ impl Workbench {
     pub(super) fn viewport(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let ctx = &ui.ctx().clone();
         egui::CentralPanel::no_frame().show(ui, |ui| {
+            if self.panorama.tour.is_some() {
+                self.tour_view(ui);
+                return;
+            }
             self.advance_flight(ctx);
             let size = ui.available_size().max(egui::vec2(1., 1.));
             let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
             // Picks read the last frame drawn, which is what was clicked.
-            if self.job.is_none() {
-                self.gizmo_input(&response);
-                self.crop_input(&response);
-            }
-            self.camera_input(ctx, &response);
-            if self.job.is_none() {
-                self.selection_input(&response);
-                self.measure_input(&response);
-                self.align_input(&response);
-                self.panorama_input(&response);
+            // A click on a panorama marker opens it and does nothing else.
+            if !self.panorama_marker_input(&response) {
+                if self.job.is_none() {
+                    self.gizmo_input(&response);
+                    self.crop_input(&response);
+                }
+                self.camera_input(ctx, &response);
+                if self.job.is_none() {
+                    self.selection_input(&response);
+                    self.measure_input(&response);
+                    self.align_input(&response);
+                    self.panorama_input(&response);
+                }
             }
             let aspect = (size.x / size.y) as f64;
             if (self.camera.aspect - aspect).abs() > 1e-6 {
@@ -76,6 +83,7 @@ impl Workbench {
             self.draw_measure(ui, rect);
             self.draw_align(ui, rect);
             self.draw_panorama(ui, rect);
+            self.draw_panorama_markers(ui, &response);
             self.draw_box(ui, rect);
             self.draw_gizmo(ui, rect);
             self.draw_pivot(ui, &response);

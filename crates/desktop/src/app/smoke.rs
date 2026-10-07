@@ -48,7 +48,8 @@ pub struct SmokeOptions {
     /// panorama-pairs:X:Y:Z:HEADING (pairs as seen from there, placed),
     /// panorama-apply, panorama-link (linked camera and overlay) and
     /// panorama-view:YAW:PITCH:FOV or panorama-view:flat (the photo viewer),
-    /// tree-fold (fold the project tree).
+    /// tree-fold (fold the project tree), navigate (camera mode), tour
+    /// (view the first placed panorama) and tour-exit.
     pub script: Vec<String>,
 }
 
@@ -660,6 +661,9 @@ impl Workbench {
                 }
             }
             "tree-fold" => self.settings.tree_collapsed = true,
+            "tour" => self.smoke_tour(),
+            "tour-exit" => self.exit_tour(),
+            "navigate" => self.set_tool(super::selection::Tool::Navigate),
             "panorama-link" => {
                 self.smoke_panorama_link();
                 eprintln!("Smoke panorama link: {}", self.panorama_summary());

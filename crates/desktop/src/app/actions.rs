@@ -51,6 +51,7 @@ pub(super) enum Action {
     ToggleEdl,
     ToggleOrtho,
     ToggleTree,
+    TogglePanoramas,
     Save,
     Revisions,
     Discard,
@@ -87,6 +88,7 @@ impl Action {
             Self::ToggleEdl => icon::CIRCLE_HALF,
             Self::ToggleOrtho => icon::PERSPECTIVE,
             Self::ToggleTree => icon::SIDEBAR_SIMPLE,
+            Self::TogglePanoramas => icon::MAP_PIN,
             Self::Save => icon::FLOPPY_DISK,
             Self::Revisions => icon::GIT_BRANCH,
             Self::Discard => icon::ARROW_COUNTER_CLOCKWISE,
@@ -131,6 +133,7 @@ impl Action {
             Self::ToggleEdl => t.edl.into(),
             Self::ToggleOrtho => t.ortho.into(),
             Self::ToggleTree => t.toggle_tree.into(),
+            Self::TogglePanoramas => t.toggle_panoramas.into(),
             Self::Save => t.save.into(),
             Self::Revisions => t.revisions.into(),
             Self::Discard => t.discard.into(),
@@ -248,6 +251,7 @@ impl Workbench {
             | Action::ToggleEdl
             | Action::ToggleOrtho
             | Action::ToggleTree
+            | Action::TogglePanoramas
             | Action::Tool(_)
             | Action::Shortcuts
             | Action::About => true,
@@ -324,6 +328,7 @@ impl Workbench {
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             Action::Undo => self.undo(),
             Action::Redo => self.redo(),
+            Action::ClearSelection if self.panorama.tour.is_some() => self.exit_tour(),
             Action::ClearSelection => {
                 self.selection.clear();
                 self.measure.clear();
@@ -352,6 +357,9 @@ impl Workbench {
             Action::View(preset) => self.view_preset(preset),
             Action::ToggleEdl => self.settings.edl = !self.settings.edl,
             Action::ToggleTree => self.settings.tree_collapsed = !self.settings.tree_collapsed,
+            Action::TogglePanoramas => {
+                self.settings.show_panoramas = !self.settings.show_panoramas;
+            }
             Action::ToggleOrtho => {
                 self.camera.ortho = !self.camera.ortho;
                 self.dirty = true;
@@ -440,6 +448,7 @@ impl Workbench {
         if tool != Tool::Panorama {
             self.leave_panorama();
         }
+        self.exit_tour();
         self.crop.cancel();
         self.selection.tool = tool;
         if tool != Tool::Measure {

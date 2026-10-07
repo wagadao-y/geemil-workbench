@@ -92,6 +92,7 @@ impl Workbench {
                     ui.separator();
                     self.menu_item(ui, Action::ToggleOrtho, &mut chosen);
                     self.menu_item(ui, Action::ToggleEdl, &mut chosen);
+                    self.menu_item(ui, Action::TogglePanoramas, &mut chosen);
                     ui.add_enabled(
                         self.settings.edl,
                         egui::Slider::new(&mut self.settings.edl_strength, 0.1..=5.0)
@@ -176,6 +177,8 @@ impl Workbench {
                 self.tool_button(ui, Action::ToggleOrtho, ortho, &mut chosen);
                 let edl = self.settings.edl;
                 self.tool_button(ui, Action::ToggleEdl, edl, &mut chosen);
+                let panoramas = self.settings.show_panoramas;
+                self.tool_button(ui, Action::TogglePanoramas, panoramas, &mut chosen);
                 ui.separator();
                 ui.label(t.point_budget);
                 let budget =
