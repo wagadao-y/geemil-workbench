@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: Windows checks and build
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        # rustup reads rust-toolchain.toml, including rustfmt and clippy.
+        run: rustup show
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --workspace --locked
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build release executables
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: cargo build --workspace --bins --release --locked
+
+      - name: Package executables and documentation
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: |
+          New-Item -ItemType Directory -Path dist/docs -Force | Out-Null
+          Copy-Item -LiteralPath target/release/geemil-desktop.exe, target/release/geemil.exe -Destination dist
+          Copy-Item -LiteralPath README.md, LICENSE -Destination dist
+          Copy-Item -Path docs/*.md -Destination dist/docs
+          @(
+            "Commit: $env:GITHUB_SHA"
+            "Run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            "Target: x86_64-pc-windows-msvc"
+            "Profile: release"
+          ) | Set-Content -LiteralPath dist/BUILD.txt -Encoding utf8
+          Get-ChildItem -Path dist/*.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object {
+            "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))"
+          } | Set-Content -LiteralPath dist/SHA256SUMS -Encoding utf8
+
+      - name: Upload Windows build
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: geemil-workbench-windows-x64-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30

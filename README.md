@@ -4,7 +4,15 @@ Windows向けのOSS点群編集アプリ。Rust / egui / wgpu製で、億点規�
 
 現在は初期プロトタイプ。プロジェクト形式は暫定版で、将来の版との互換性は保証しない。
 
-## 起動
+## 自動ビルドを使う
+
+`main`へのプッシュ・PRのマージ後に、GitHub Actionsでテスト・clippy・フォーマット検査を実行し、成功したらWindows x64向けのReleaseビルドを作る。
+
+[ActionsのCI](https://github.com/wagadao-y/geemil-workbench/actions/workflows/ci.yml)で成功した実行を開き、**Artifacts**の`geemil-workbench-windows-x64-<コミットSHA>`をダウンロードして展開する。GUIは`geemil-desktop.exe`、CLIは`geemil.exe`。Rustのインストールは不要。成果物にはライセンス・ドキュメント・ビルド情報・実行ファイルのSHA-256も含む。ダウンロードにはGitHubへのログインが必要で、保存期間は30日。
+
+自動ビルドは開発版で、プロジェクト形式の互換性は保証しない。既存のプロジェクトを新しいビルドで試す場合は、フォルダーをコピーして使う。
+
+## ソースから起動
 
 WindowsのRust MSVC環境とC++ Build Toolsが必要（Rustの版は`rust-toolchain.toml`で固定しており、rustupが自動で取得する）。
 

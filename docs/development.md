@@ -13,6 +13,24 @@
 
 ## テストと静的検査
 
+### GitHub Actions
+
+[CIワークフロー](../.github/workflows/ci.yml)はWindows Server 2025のx64ランナーで実行する。Rustと検査用コンポーネントは`rust-toolchain.toml`に従い、Cargoのテスト・検査・ビルドには`--locked`を指定する。
+
+| きっかけ | 実行内容 |
+| --- | --- |
+| `main`宛てのPR | フォーマット検査、ワークスペースのテスト、全ターゲットのclippy |
+| `main`へのプッシュ（PRのマージを含む） | 上記の検査に成功したら、GUI・CLIを`--release`でビルドして成果物を保存 |
+| Actionsの「Run workflow」 | 検査を実行。選択したブランチが`main`なら成果物も作成 |
+
+同じPR・ブランチに新しい更新が来ると、古い実行はキャンセルする。Rustの依存関係とビルドキャッシュは再利用し、キャッシュの保存は`main`だけで行う。
+
+成果物は`geemil-workbench-windows-x64-<コミットSHA>`という名前で30日間保存する。中身は`geemil-desktop.exe`・`geemil.exe`・`LICENSE`・`README.md`・`docs/`・`BUILD.txt`・`SHA256SUMS`。`BUILD.txt`には元のコミットとActions実行のURLが入る。[Actions](https://github.com/wagadao-y/geemil-workbench/actions/workflows/ci.yml)の成功した実行からArtifactsをダウンロードする（GitHubへのログインが必要）。GitHub Releasesへの公開は行わない。
+
+CIの検査はGPUを必要としないテストが対象。GUIのスモークテストと大規模データの性能計測は、下記の手順で別途実行する。
+
+### ローカル
+
 ```powershell
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
