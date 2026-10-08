@@ -600,6 +600,7 @@ impl Project {
     }
     /// Sets the additional transform of a scan or folder, relative to its folder.
     pub fn set_transform(&mut self, id: Uuid, pose: Pose) -> Result<()> {
+        pose.validate()?;
         self.edit(
             serde_json::json!({"kind": "transform", "id": id, "pose": pose}),
             |s| {

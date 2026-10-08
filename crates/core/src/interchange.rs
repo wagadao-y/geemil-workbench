@@ -528,6 +528,9 @@ fn import_e57(
             scan.stride <= 1_048_576,
             "Point attributes exceed record budget"
         );
+        if let Some(pose) = scan.original_pose {
+            pose.validate()?;
+        }
         let spool = stage.join(format!("{id}.spool"));
         let mut file = SpoolWriter::new(&spool, scan.records * scan.stride as u64, options)?;
         let mut bounds: Option<Bounds> = None;

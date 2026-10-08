@@ -24,6 +24,9 @@ pub(crate) fn now() -> u64 {
 /// exist, that its layers have distinct codes including the default one, and
 /// that folders form a tree.
 pub(crate) fn validate_state(manifest: &Manifest, state: &Revision) -> Result<()> {
+    for pose in state.transforms.values() {
+        pose.validate()?;
+    }
     for id in &state.scans {
         ensure!(
             manifest.scans.iter().any(|s| s.id == *id),

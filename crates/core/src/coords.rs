@@ -79,6 +79,33 @@ impl FieldEncoding {
 }
 
 impl Coordinates {
+    /// Validate untrusted metadata before any record slicing or size arithmetic.
+    pub(crate) fn validate_layout(&self, stride: usize) -> Result<()> {
+        let fits = |offset: usize, bytes: usize| {
+            offset >= HEAD && offset.checked_add(bytes).is_some_and(|end| end <= stride)
+        };
+        match self {
+            Self::Cartesian { fields } => {
+                for field in fields {
+                    ensure!(
+                        fits(field.offset, field.encoding.bytes()),
+                        "Invalid coordinate layout"
+                    );
+                    if let FieldEncoding::Integer { scale, offset } = field.encoding {
+                        ensure!(
+                            scale.is_finite() && offset.is_finite(),
+                            "Invalid coordinate encoding"
+                        );
+                    }
+                }
+            }
+            Self::Stored { offset } => {
+                ensure!(fits(*offset, 24), "Invalid coordinate layout");
+            }
+        }
+        Ok(())
+    }
+
     /// The position of a record in scan coordinates; the origin for an
     /// invalid point, which takes no part beyond where import places it.
     pub fn position(&self, record: &[u8]) -> [f64; 3] {

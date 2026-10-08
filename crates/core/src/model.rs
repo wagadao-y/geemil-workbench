@@ -59,6 +59,20 @@ impl Default for Pose {
     }
 }
 impl Pose {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let norm = DQuat::from_array(self.rotation_xyzw).length_squared();
+        ensure!(
+            self.translation
+                .iter()
+                .chain(&self.rotation_xyzw)
+                .all(|v| v.is_finite())
+                && norm.is_finite()
+                && norm > 0.,
+            "Invalid pose"
+        );
+        Ok(())
+    }
+
     pub fn matrix(&self) -> DMat4 {
         DMat4::from_rotation_translation(
             DQuat::from_array(self.rotation_xyzw).normalize(),
@@ -667,9 +681,33 @@ impl Project {
                 (crate::coords::HEAD..=1_048_576).contains(&s.stride),
                 "Invalid point stride"
             );
+            s.coordinates.validate_layout(s.stride)?;
+            if let Some(pose) = s.original_pose {
+                pose.validate()?;
+            }
+            // Display estimates descend in reverse index order. Every child
+            // must follow its one parent, so cycles and shared nodes are invalid.
+            let mut parents = vec![false; s.nodes.len()];
+            for (index, node) in s.nodes.iter().enumerate() {
+                for &child in &node.children {
+                    let child = child as usize;
+                    ensure!(
+                        child > index && child < s.nodes.len(),
+                        "Invalid display tree child"
+                    );
+                    ensure!(!parents[child], "Display node has multiple parents");
+                    parents[child] = true;
+                }
+                ensure!(
+                    node.chunks
+                        .iter()
+                        .all(|&(chunk, _)| (chunk as usize) < s.chunks.len()),
+                    "Display node refers to a missing chunk"
+                );
+            }
             ensure!(
-                s.coordinates.leading_bytes() <= s.stride,
-                "Coordinates lie outside the point record"
+                parents.iter().skip(1).all(|parent| *parent),
+                "Disconnected display tree"
             );
             if let Some(las) = &s.las {
                 let format = las.format()?;
@@ -782,7 +820,10 @@ impl Project {
             let _ = fs::remove_file(&tmp);
             return Err(e);
         }
-        fs::rename(tmp, self.root.join(path))?;
+        if let Err(error) = fs::rename(&tmp, self.root.join(path)) {
+            let _ = fs::remove_file(&tmp);
+            return Err(error.into());
+        }
         Ok(())
     }
     /// The state everything reads: the working state, else the current revision.
@@ -860,5 +901,34 @@ impl Project {
             .filter(|(_, s)| current.contains(&s.id))
             .map(|(i, s)| (s.id, i))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_atomic_write_preserves_the_previous_file_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = Project::create(&dir.path().join("project"), "Safety").unwrap();
+        let before = fs::read(p.root.join("project.json")).unwrap();
+        let error = p
+            .write_atomic(Path::new("project.json"), |file| {
+                file.write_all(b"incomplete replacement")?;
+                file.flush()?;
+                anyhow::bail!("Simulated write failure")
+            })
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Simulated write failure");
+        assert_eq!(fs::read(p.root.join("project.json")).unwrap(), before);
+        assert_eq!(Project::load(&p.root).unwrap().current().id, p.current().id);
+        assert!(!fs::read_dir(&p.root).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|e| e == "tmp")
+        }));
     }
 }

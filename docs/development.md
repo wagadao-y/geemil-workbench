@@ -55,6 +55,8 @@ cargo fmt --all -- --check
 
 結合テストは[crates/core/tests/](../crates/core/tests/)にある。
 
+安全性だけを確認するときは`cargo test -p geemil-core --test safety`を使う。128点の合成データで、不正なメタデータ・変換、途中キャンセル、保存・書き出し失敗、既存ファイルの保護を検証する。キャンセルは進捗通知から発生させ、待ち時間や大規模データを使わない。保存中の書き込み失敗はcoreの単体テスト、Undo/Redoの失敗時の復旧と履歴上限はdesktopの単体テストでも検証する。GPUは不要。
+
 ## CLI
 
 ```powershell

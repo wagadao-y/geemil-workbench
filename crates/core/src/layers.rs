@@ -2,7 +2,7 @@
 //! per point in label patches that never change once written. Moving points
 //! writes a patch of the chunks whose labels changed and lists it in the
 //! working state, so undo and revision switches only swap states.
-use crate::codec::{pack_labels, unpack_labels};
+use crate::codec::{MAX_BLOCK_BYTES, pack_labels, unpack_labels};
 use crate::parallel::for_each_unordered;
 use crate::{
     Bounds, DEFAULT_LAYER, JobControl, LabelBlock, LabelPatch, Layer, LayerTarget, Project,
@@ -120,6 +120,7 @@ impl Project {
             .get(chunk as usize)
             .ok_or_else(|| anyhow!("Invalid chunk"))?
             .count as usize;
+        ensure!(count <= MAX_BLOCK_BYTES, "Label block exceeds budget");
         let Some((file, block)) = self
             .label_block(scan.id, chunk)
             .filter(|(_, b)| b.bytes > 0)
@@ -127,9 +128,17 @@ impl Project {
             return Ok(vec![DEFAULT_LAYER; count]);
         };
         let mut f = File::open(self.path(&file)?)?;
+        let length = f.metadata()?.len();
         ensure!(
-            block.offset + block.bytes as u64 <= f.metadata()?.len(),
+            block
+                .offset
+                .checked_add(block.bytes as u64)
+                .is_some_and(|end| end <= length),
             "Truncated labels"
+        );
+        ensure!(
+            block.bytes as usize <= zstd::zstd_safe::compress_bound(count),
+            "Compressed labels exceed budget"
         );
         f.seek(SeekFrom::Start(block.offset))?;
         let mut bytes = vec![0; block.bytes as usize];
