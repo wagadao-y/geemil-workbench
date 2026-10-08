@@ -21,11 +21,27 @@
 | --- | --- |
 | `main`宛てのPR | フォーマット検査、ワークスペースのテスト、全ターゲットのclippy |
 | `main`へのプッシュ（PRのマージを含む） | 上記の検査に成功したら、GUI・CLIを`--release`でビルドして成果物を保存 |
-| Actionsの「Run workflow」 | 検査を実行。選択したブランチが`main`なら成果物も作成 |
+| タグのプッシュ | 上記の検査とReleaseビルドに成功したら、タグ名を含むZIPを作り、GitHub Releaseへ自動添付 |
+| Actionsの「Run workflow」 | 検査を実行。`main`なら成果物も作成。タグを指定して実行した場合はReleaseへの添付も実行 |
 
 同じPR・ブランチに新しい更新が来ると、古い実行はキャンセルする。Rustの依存関係とビルドキャッシュは再利用し、キャッシュの保存は`main`だけで行う。
 
-成果物は`geemil-workbench-windows-x64-<コミットSHA>`という名前で30日間保存する。中身は`geemil-desktop.exe`・`geemil.exe`・`LICENSE`・`README.md`・`docs/`・`BUILD.txt`・`SHA256SUMS`。`BUILD.txt`には元のコミットとActions実行のURLが入る。[Actions](https://github.com/wagadao-y/geemil-workbench/actions/workflows/ci.yml)の成功した実行からArtifactsをダウンロードする（GitHubへのログインが必要）。GitHub Releasesへの公開は行わない。
+`main`の成果物は`geemil-workbench-windows-x64-<コミットSHA>`という名前で30日間保存する。中身は`geemil-desktop.exe`・`geemil.exe`・`LICENSE`・`README.md`・`docs/`・`BUILD.txt`・`SHA256SUMS`。`BUILD.txt`には元のコミットとActions実行のURLが入る。[Actions](https://github.com/wagadao-y/geemil-workbench/actions/workflows/ci.yml)の成功した実行からArtifactsをダウンロードする（GitHubへのログインが必要）。
+
+### タグからのリリース
+
+リリースするコミットにタグを付けてプッシュする。タグ名は先頭を英数字とし、英数字・`.`・`_`・`-`を使う（例: `v0.0.2`）。CI設定を含むコミットに付けること。ローカルでタグを付けただけではCIは起動しない。
+
+```powershell
+git tag v0.0.2
+git push origin v0.0.2
+```
+
+タグが指すコミットをビルドし、`geemil-workbench-v0.0.2-windows-x64.zip`をReleaseへ添付する。ZIPの中身は`main`の成果物と同じで、`BUILD.txt`にはタグ名も記録する。タグ向けのZIPはActionsにも`release-windows-x64`として30日間保存する。
+
+Releaseが未作成なら、タグ名をタイトルとして変更内容を自動生成し、ZIPを添付して公開する。既存のReleaseがあればZIPだけを追加し、タイトル・説明・下書き状態などはそのまま保つ。同名のZIPが既に添付されている場合はスキップするので、CIを再実行しても添付済みのファイルは上書きしない。
+
+検査・ビルドのジョブは読み取り権限で実行し、その成功後に動くRelease用ジョブだけに`contents: write`を付与する。認証には自動発行される`GITHUB_TOKEN`を使い、追加のシークレット設定は不要。
 
 CIの検査はGPUを必要としないテストが対象。GUIのスモークテストと大規模データの性能計測は、下記の手順で別途実行する。
 

@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['**']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -20,8 +21,11 @@ env:
 jobs:
   windows:
     name: Windows checks and build
+    if: github.event_name != 'push' || !github.event.deleted
     runs-on: windows-2025
     timeout-minutes: 60
+    outputs:
+      release-asset: ${{ steps.release-archive.outputs.name }}
     defaults:
       run:
         shell: pwsh
@@ -50,11 +54,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Build release executables
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: (github.ref == 'refs/heads/main' || github.ref_type == 'tag') && github.event_name != 'pull_request'
         run: cargo build --workspace --bins --release --locked
 
       - name: Package executables and documentation
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: (github.ref == 'refs/heads/main' || github.ref_type == 'tag') && github.event_name != 'pull_request'
         run: |
           New-Item -ItemType Directory -Path dist/docs -Force | Out-Null
           Copy-Item -LiteralPath target/release/geemil-desktop.exe, target/release/geemil.exe -Destination dist
@@ -62,6 +66,7 @@ jobs:
           Copy-Item -Path docs/*.md -Destination dist/docs
           @(
             "Commit: $env:GITHUB_SHA"
+            if ($env:GITHUB_REF_TYPE -eq 'tag') { "Tag: $env:GITHUB_REF_NAME" }
             "Run: https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
             "Target: x86_64-pc-windows-msvc"
             "Profile: release"
@@ -69,6 +74,22 @@ jobs:
           Get-ChildItem -Path dist/*.exe | Get-FileHash -Algorithm SHA256 | ForEach-Object {
             "$($_.Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($_.Path))"
           } | Set-Content -LiteralPath dist/SHA256SUMS -Encoding utf8
+
+      - name: Create release ZIP
+        id: release-archive
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          # Keep the tag unchanged in the filename; reject tags that cannot be
+          # used safely as Windows filenames or GitHub CLI asset paths.
+          if ($env:RELEASE_TAG -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
+            throw 'Release tags must contain only ASCII letters, digits, dots, underscores, and hyphens.'
+          }
+          $archiveName = "geemil-workbench-$env:RELEASE_TAG-windows-x64.zip"
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          Compress-Archive -Path dist/* -DestinationPath (Join-Path release-assets $archiveName)
+          "name=$archiveName" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Upload Windows build
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
@@ -78,3 +99,55 @@ jobs:
           path: dist/
           if-no-files-found: error
           retention-days: 30
+
+      - name: Upload release ZIP
+        if: github.ref_type == 'tag'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: release-windows-x64
+          path: release-assets/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: windows
+    if: github.ref_type == 'tag'
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Download release ZIP
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          name: release-windows-x64
+          path: release-assets
+
+      - name: Create release or attach ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_ASSET: ${{ needs.windows.outputs.release-asset }}
+        run: |
+          $archive = Join-Path release-assets $env:RELEASE_ASSET
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "Release ZIP not found: $archive"
+          }
+          $releaseJson = gh release view "$env:RELEASE_TAG" --json assets 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $release = $releaseJson | ConvertFrom-Json
+            if ($release.assets.name -contains $env:RELEASE_ASSET) {
+              Write-Output "Release asset already exists: $env:RELEASE_ASSET"
+            } else {
+              gh release upload "$env:RELEASE_TAG" "$archive"
+              if ($LASTEXITCODE -ne 0) { throw 'Uploading the release ZIP failed.' }
+            }
+          } else {
+            gh release create "$env:RELEASE_TAG" "$archive" --verify-tag --title "$env:RELEASE_TAG" --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw 'Creating the GitHub Release failed.' }
+          }
