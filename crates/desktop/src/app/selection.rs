@@ -46,18 +46,11 @@ pub(super) const TOOLS: [Tool; 8] = [
     Tool::Align,
     Tool::Panorama,
 ];
+
 impl Tool {
-    /// Tools that pick points with a click leave the left drag for orbiting.
-    pub(super) fn orbits(self) -> bool {
-        matches!(
-            self,
-            Tool::Navigate
-                | Tool::Measure
-                | Tool::Align
-                | Tool::Box
-                | Tool::Transform
-                | Tool::Panorama
-        )
+    /// Point-picking tools leave the primary drag available for the camera.
+    pub(super) fn camera_on_left_drag(self) -> bool {
+        !matches!(self, Self::Rect | Self::Polygon)
     }
 }
 

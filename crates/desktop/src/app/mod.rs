@@ -67,6 +67,9 @@ pub(super) struct Settings {
     edl: bool,
     edl_strength: f32,
     color_mode: ColorMode,
+    /// Navigation is independent of the selected editing tool.
+    camera_mode: navigation::CameraMode,
+    move_speed: f64,
     /// Last filter parameters, offered again next time.
     subsample_size: f64,
     subsample_merged: bool,
@@ -110,6 +113,8 @@ impl Default for Settings {
             edl: true,
             edl_strength: 1.,
             color_mode: ColorMode::Rgb,
+            camera_mode: navigation::CameraMode::Orbit,
+            move_speed: 10.,
             subsample_size: 0.01,
             subsample_merged: false,
             overlap_size: 0.1,
@@ -187,9 +192,6 @@ pub struct Workbench {
     last_motion: Instant,
     refine_pending: bool,
     flight: Option<navigation::Flight>,
-    /// Whether the right button is held on the viewport, which lets WASD and
-    /// Q/E fly and holds back single-key shortcuts.
-    flying: bool,
     /// When the last frame that moved by the keys was, to time the next.
     fly_last: Option<Instant>,
 
@@ -261,7 +263,6 @@ impl Workbench {
             last_motion: Instant::now(),
             refine_pending: false,
             flight: None,
-            flying: false,
             fly_last: None,
             selection: Default::default(),
             measure: Default::default(),
@@ -386,18 +387,13 @@ impl eframe::App for Workbench {
         self.poll_view();
         self.align_update();
         self.panorama_update(&ctx);
-        // While the right button flies, its keys are not shortcuts. Releasing
-        // it ends flying at once, even where no viewport is drawn.
-        self.flying &= ctx.input(|i| i.pointer.secondary_down());
-        if self.dialog.is_none() && !self.flying {
+        if self.dialog.is_none() {
             self.keyboard(&ctx);
-        }
-        if self.project.is_some() {
-            self.fly_input(&ctx);
         }
         self.dropped_files(&ctx);
         self.menu_bar(ui);
         self.toolbar(ui);
+        self.camera_options(ui);
         self.tool_options(ui);
         self.status_bar(ui);
         self.side_panel(ui);
@@ -479,9 +475,23 @@ fn carry_scan_state(visible: &mut BTreeSet<Uuid>, previous: Option<&[Uuid]>, sca
 
 #[cfg(test)]
 mod tests {
-    use super::carry_scan_state;
+    use super::{Settings, carry_scan_state, navigation::CameraMode};
     use std::collections::BTreeSet;
     use uuid::Uuid;
+
+    #[test]
+    fn older_preferences_default_navigation_and_new_preferences_roundtrip() {
+        let mut settings: Settings = serde_json::from_str(r#"{"edl":false}"#).unwrap();
+        assert!(!settings.edl);
+        assert_eq!(settings.camera_mode, CameraMode::Orbit);
+        assert_eq!(settings.move_speed, 10.);
+        settings.camera_mode = CameraMode::Walk;
+        settings.move_speed = 1.5;
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: Settings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.camera_mode, CameraMode::Walk);
+        assert_eq!(loaded.move_speed, 1.5);
+    }
 
     #[test]
     fn import_keeps_hidden_scans() {

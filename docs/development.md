@@ -210,13 +210,16 @@ cargo run -p geemil-desktop --profile smoke -- work-data/manitou-copy --smoke-te
 | 分類 | 操作 |
 | --- | --- |
 | 編集と履歴 | `exclude`（選択した点を「削除」へ移す）、`undo`、`redo`、`save`、`folder`、`remove` |
+| カメラと作業ツール | `camera-orbit`・`camera-fly`・`camera-walk`（作業ツールを維持してカメラ方式を切り替える）、`camera-cycle`（次のカメラ方式へ）、`rect`（矩形選択ツール）、`navigate`（スキャン選択ツール） |
 | 計測と表示 | `measure`、`ortho`（平行投影の上面図）、`color-height`、`color-scan`、`adaptive`（点サイズを適応に）、`focus`／`focus-folder`（最初のスキャン／フォルダーにカメラを寄せる）、`zoom`（カメラ距離を1/8に） |
 | 変換 | `preview`（最初のスキャンの変換を入力し、動いた表示点数を出力）、`apply-transform`、`transform`／`transform-folder`（最初のスキャン／フォルダーを選び「移動・回転」ツールにする）、`place-handles`（画面中央に取っ手を置き、前後の位置を出力） |
 | フィルター | `subsample`（5cm）、`noise`（半径0.1m・4点未満）、`sor`（6点・1σ）、`subsample-merged`（まとめて5cm）、`moving`（動体除去、既定値） |
 | 位置合わせ | `align-icp`（最初のスキャンをICPでプレビュー）、`align-pairs`（一致する4組の対応点で合わせ、動かないことを確認）、`align-global`、`align-list`（一覧の件数と全体最適化の前後のRMSを出力）、`align-switch`／`align-leave`（別のスキャンの選択／ツールの切り替えで、未適用の確認が出たかを出力）、`align-apply` |
-| パノラマ | `panorama`（最初のパノラマ写真で配置ツールを開く）、`panorama-pairs:X:Y:Z:HEADING`（その位置・方位で撮ったとして、表示中の点から方位の8方向に1点ずつ対応点を作って解き、正解との差を出力）、`panorama-apply`、`panorama-link`（左右の視点の連動と点の重ね合わせ）、`panorama-view:YAW:PITCH:FOV`（写真の表示方向と画角、度。パノラマの表示中はその表示に効く）、`panorama-view:flat`（全景）、`tree-fold`（プロジェクトツリーを閉じる）、`navigate`（カメラ操作に切り替える）、`tour`（最初の配置済みパノラマを中央の画面で表示）、`tour-exit`、`hide-panorama`（最初のパノラマのマーカーを非表示） |
+| パノラマ | `panorama`（最初のパノラマ写真で配置ツールを開く）、`panorama-pairs:X:Y:Z:HEADING`（その位置・方位で撮ったとして、表示中の点から方位の8方向に1点ずつ対応点を作って解き、正解との差を出力）、`panorama-apply`、`panorama-link`（左右の視点の連動と点の重ね合わせ）、`panorama-view:YAW:PITCH:FOV`（写真の表示方向と画角、度。パノラマの表示中はその表示に効く）、`panorama-view:flat`（全景）、`tree-fold`（プロジェクトツリーを閉じる）、`tour`（最初の配置済みパノラマを中央の画面で表示）、`tour-exit`、`hide-panorama`（最初のパノラマのマーカーを非表示） |
 | ボックス | `box`（中央の高さに2mの水平スライスを置いてハイライトし、箱の中の点数を出力）、`box-resize`（傾けた箱でサイズ変更の取っ手を表示）、`box-crop`（箱の外を「削除」へ移す） |
 | レイヤー | `show-layers`（すべて表示）、`solo-layer`（最も新しいレイヤーだけ表示）、`restore`（最も新しいレイヤーの点を「点群」へ戻す） |
+
+カメラ入力の回帰テストは`cargo test -p geemil-desktop app::navigation::tests`で実行できる。小さなegui入力フレームを使い、ボタンなしのキー移動、Ctrl系ショートカットとの衝突、入力・メニュー・非アクティブ時の移動抑制、ウォークの水平移動、見回し時のカメラ位置、左ドラッグのカメラ操作と範囲・取っ手の編集の優先順位を検証する。GPUや大規模点群は不要。
 
 ## GUIの長時間計測
 

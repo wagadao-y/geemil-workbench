@@ -2,6 +2,7 @@
 use super::{
     Workbench,
     actions::{Action, ViewPreset},
+    navigation::CameraMode,
     selection::Tool,
 };
 use eframe::egui;
@@ -71,6 +72,12 @@ impl Workbench {
                 ui.menu_button(t.menu_view, |ui| {
                     self.menu_item(ui, Action::ToggleTree, &mut chosen);
                     ui.separator();
+                    ui.label(t.camera_navigation);
+                    for mode in CameraMode::ALL {
+                        ui.radio_value(&mut self.settings.camera_mode, mode, mode.label(t));
+                    }
+                    self.menu_item(ui, Action::CycleCameraMode, &mut chosen);
+                    ui.separator();
                     self.menu_item(ui, Action::FitView, &mut chosen);
                     for preset in [
                         ViewPreset::Top,
@@ -128,6 +135,58 @@ impl Workbench {
             let ctx = ui.ctx().clone();
             self.perform(&ctx, action);
         }
+    }
+    /// Navigation controls stay independent of the editing tool below them.
+    pub(super) fn camera_options(&mut self, ui: &mut egui::Ui) {
+        if self.project.is_none() {
+            return;
+        }
+        let t = self.t;
+        let movable = self.panorama.tour.is_none() && !self.panorama_camera_linked();
+        egui::Panel::top("camera options").show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(movable, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(t.camera_navigation);
+                        egui::ComboBox::from_id_salt("camera mode")
+                            .selected_text(self.settings.camera_mode.label(t))
+                            .show_ui(ui, |ui| {
+                                for mode in CameraMode::ALL {
+                                    ui.selectable_value(
+                                        &mut self.settings.camera_mode,
+                                        mode,
+                                        mode.label(t),
+                                    );
+                                }
+                            });
+                        ui.label(t.camera_speed);
+                        if self.settings.camera_mode == CameraMode::Orbit {
+                            let speed = self
+                                .settings
+                                .camera_mode
+                                .move_speed(self.camera, self.settings.move_speed);
+                            ui.label(format!("{speed:.3} m/s"))
+                                .on_hover_text(t.camera_speed_auto);
+                            ui.weak(t.camera_speed_auto);
+                        } else {
+                            ui.add(
+                                egui::DragValue::new(&mut self.settings.move_speed)
+                                    .range(0.001..=1e6)
+                                    .speed(0.1)
+                                    .suffix(" m/s"),
+                            );
+                        }
+                    });
+                });
+                ui.weak(if !movable {
+                    t.hint_camera_fixed
+                } else if self.settings.camera_mode == CameraMode::Orbit {
+                    t.hint_camera_orbit
+                } else {
+                    t.hint_camera_fly
+                });
+            });
+        });
     }
 
     /// An icon button with the action's name and shortcut as tooltip.

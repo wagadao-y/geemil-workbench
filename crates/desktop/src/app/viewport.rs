@@ -11,6 +11,7 @@ impl Workbench {
         let ctx = &ui.ctx().clone();
         egui::CentralPanel::no_frame().show(ui, |ui| {
             if self.panorama.tour.is_some() {
+                self.fly_last = None;
                 self.tour_view(ui);
                 return;
             }
@@ -24,6 +25,7 @@ impl Workbench {
                     self.gizmo_input(&response);
                     self.crop_input(&response);
                 }
+                self.fly_input(ctx, &response);
                 self.camera_input(ctx, &response);
                 if self.job.is_none() {
                     self.selection_input(&response);

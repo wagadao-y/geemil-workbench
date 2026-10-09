@@ -48,7 +48,9 @@ pub struct SmokeOptions {
     /// panorama-pairs:X:Y:Z:HEADING (pairs as seen from there, placed),
     /// panorama-apply, panorama-link (linked camera and overlay) and
     /// panorama-view:YAW:PITCH:FOV or panorama-view:flat (the photo viewer),
-    /// tree-fold (fold the project tree), navigate (camera mode), tour
+    /// tree-fold (fold the project tree), navigate (scan selection), rect
+    /// (rectangle tool), camera-orbit/camera-fly/camera-walk (navigation),
+    /// camera-cycle (cycle navigation without changing the tool), tour
     /// (view the first placed panorama), tour-exit and hide-panorama (hide
     /// the first panorama's marker).
     pub script: Vec<String>,
@@ -679,6 +681,20 @@ impl Workbench {
             }
             "tour-exit" => self.exit_tour(),
             "navigate" => self.set_tool(super::selection::Tool::Navigate),
+            "rect" => self.set_tool(super::selection::Tool::Rect),
+            "camera-cycle" => {
+                self.perform(ctx, Action::CycleCameraMode);
+                eprintln!("Smoke camera mode: {:?}", self.settings.camera_mode);
+            }
+            "camera-orbit" | "camera-fly" | "camera-walk" => {
+                use super::navigation::CameraMode;
+                self.settings.camera_mode = match step {
+                    "camera-fly" => CameraMode::Fly,
+                    "camera-walk" => CameraMode::Walk,
+                    _ => CameraMode::Orbit,
+                };
+                eprintln!("Smoke camera mode: {:?}", self.settings.camera_mode);
+            }
             "panorama-link" => {
                 self.smoke_panorama_link();
                 eprintln!("Smoke panorama link: {}", self.panorama_summary());

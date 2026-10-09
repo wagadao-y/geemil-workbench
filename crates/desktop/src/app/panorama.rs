@@ -444,6 +444,9 @@ impl Workbench {
     pub(super) fn placing_panorama(&self) -> bool {
         self.selection.tool == Tool::Panorama && self.project.is_some()
     }
+    pub(super) fn panorama_camera_linked(&self) -> bool {
+        self.placing_panorama() && self.panorama.linked
+    }
     /// The panorama the tool works on, if it is in the project.
     fn panorama_item<'a>(&self, p: &'a Project) -> Option<&'a Panorama> {
         p.panorama(self.panorama.item?)

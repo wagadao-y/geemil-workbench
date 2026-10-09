@@ -57,6 +57,9 @@ impl Crop {
     pub(super) fn dragging(&self) -> bool {
         self.drag.is_some()
     }
+    pub(super) fn on_handle(&self) -> bool {
+        self.hover.is_some() || self.drag.is_some()
+    }
     pub(super) fn cancel(&mut self) {
         if let Some(drag) = self.drag.take() {
             self.region = Some(drag.original);

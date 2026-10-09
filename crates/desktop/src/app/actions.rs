@@ -48,6 +48,7 @@ pub(super) enum Action {
     NewFolder,
     FitView,
     View(ViewPreset),
+    CycleCameraMode,
     ToggleEdl,
     ToggleOrtho,
     ToggleTree,
@@ -81,6 +82,7 @@ impl Action {
             Self::Exclude => icon::ERASER,
             Self::NewFolder => icon::FOLDER_SIMPLE_PLUS,
             Self::FitView => icon::CORNERS_OUT,
+            Self::CycleCameraMode => icon::ARROW_CLOCKWISE,
             Self::View(ViewPreset::Top) => icon::ARROW_LINE_DOWN,
             Self::View(ViewPreset::Front) => icon::ARROW_FAT_DOWN,
             Self::View(ViewPreset::Side) => icon::ARROW_RIGHT,
@@ -126,6 +128,7 @@ impl Action {
             Self::Exclude => t.exclude_selection.into(),
             Self::NewFolder => t.new_folder.into(),
             Self::FitView => t.fit_view.into(),
+            Self::CycleCameraMode => t.cycle_camera_mode.into(),
             Self::View(ViewPreset::Top) => t.view_top.into(),
             Self::View(ViewPreset::Front) => t.view_front.into(),
             Self::View(ViewPreset::Side) => t.view_side.into(),
@@ -177,17 +180,18 @@ impl Action {
             Self::Tool(Tool::Rect) => Key::R,
             Self::Tool(Tool::Polygon) => Key::P,
             Self::Tool(Tool::Measure) => Key::M,
-            Self::Tool(Tool::Align) => Key::A,
+            Self::Tool(Tool::Align) => Key::L,
             Self::Tool(Tool::Box) => Key::B,
             Self::Tool(Tool::Transform) => Key::T,
             Self::Exclude => Key::Delete,
             Self::ClearSelection => Key::Escape,
             Self::FitView => Key::F,
+            Self::CycleCameraMode => Key::C,
             Self::View(ViewPreset::Top) => Key::Num7,
             Self::View(ViewPreset::Front) => Key::Num1,
             Self::View(ViewPreset::Side) => Key::Num3,
             Self::View(ViewPreset::Iso) => Key::Num5,
-            Self::ToggleEdl => Key::E,
+            Self::ToggleEdl => Key::F6,
             Self::ToggleOrtho => Key::O,
             _ => return None,
         })
@@ -217,6 +221,7 @@ const KEYED: &[Action] = &[
     Action::Exclude,
     Action::ClearSelection,
     Action::FitView,
+    Action::CycleCameraMode,
     Action::View(ViewPreset::Top),
     Action::View(ViewPreset::Front),
     Action::View(ViewPreset::Side),
@@ -246,6 +251,9 @@ impl Workbench {
             }
             Action::ReduceOverlap | Action::RemoveMoving => idle && self.visible.len() > 1,
             Action::FitView | Action::View(_) => project.is_some(),
+            Action::CycleCameraMode => {
+                project.is_some() && self.panorama.tour.is_none() && !self.panorama_camera_linked()
+            }
             Action::Quit
             | Action::ClearSelection
             | Action::ToggleEdl
@@ -272,7 +280,9 @@ impl Workbench {
             self.perform(ctx, Action::Redo);
         }
         for action in KEYED {
-            let pressed = if let Some(command) = action.command() {
+            let pressed = if *action == Action::CycleCameraMode {
+                super::navigation::camera_cycle_key(ctx, self.dialog.is_some())
+            } else if let Some(command) = action.command() {
                 ctx.input_mut(|i| i.consume_shortcut(&command))
             } else if let Some(key) = action.key().filter(|_| !typing) {
                 ctx.input(|i| i.key_pressed(key) && i.modifiers.is_none())
@@ -354,6 +364,9 @@ impl Workbench {
                 }
             }
             Action::FitView => self.fit_view(),
+            Action::CycleCameraMode => {
+                self.settings.camera_mode = self.settings.camera_mode.next();
+            }
             Action::View(preset) => self.view_preset(preset),
             Action::ToggleEdl => self.settings.edl = !self.settings.edl,
             Action::ToggleTree => self.settings.tree_collapsed = !self.settings.tree_collapsed,
@@ -757,5 +770,23 @@ impl Workbench {
         self.flight = None;
         self.dirty = true;
         self.selection.camera_moved();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Action, KEYED, Key, Tool};
+
+    #[test]
+    fn shortcuts_leave_movement_keys_free() {
+        let reserved = [Key::W, Key::A, Key::S, Key::D, Key::Q, Key::E];
+        let mut keys = std::collections::HashSet::new();
+        for key in KEYED.iter().filter_map(Action::key) {
+            assert!(!reserved.contains(&key), "{key:?} is a movement key");
+            assert!(keys.insert(key), "duplicate shortcut: {key:?}");
+        }
+        assert_eq!(Action::Tool(Tool::Align).key(), Some(Key::L));
+        assert_eq!(Action::ToggleEdl.key(), Some(Key::F6));
+        assert_eq!(Action::CycleCameraMode.key(), Some(Key::C));
     }
 }
